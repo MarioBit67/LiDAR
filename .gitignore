@@ -1,4 +1,8 @@
+capTestSession/
 build/
 *.pcd
 .vs/
 keys/
+*.jpg
+*.jpeg
+*.png
