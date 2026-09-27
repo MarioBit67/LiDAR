@@ -11,3 +11,4 @@ A pasta principal guarda só os índices; toda submemória vive em `slices/`.
 - [Missão](slices/projeto/missao.md) - giro 360 por cômodo com bússola/GPS; Android primeiro, iOS adiado
 - [Planta global](slices/projeto/plantaGlobal.md) - PENDENTE: fundir os cômodos na planta do imóvel (portas, paredes, editor)
 - [Monorepo Claude](slices/referencia/monorepoClaude.md) - shared/ replicável; third-party/ livre sem confirmação; resto só com consentimento
+- [Wish list](slices/projeto/wishlist.md) - passos futuros do produto (vista sintética, filtro de móveis, planta global...)

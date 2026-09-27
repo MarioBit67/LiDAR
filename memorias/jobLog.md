@@ -864,3 +864,61 @@ Entradas mais novas no fim.
     barrado; o vão (306-604) segue; as fotos 37/38/53 continuam com o vão.
 - APK instalado.
 - VISÃO (usuário): metadado por foto -> filtro de móveis (imóvel cru) -> filme -> camadas de mobiliário (do simples ao luxuoso). Registrado em slices/projeto/missao.md.
+- SALA 150306 (em L, 3 portas; conferida e apagada do celular). Planta de 6 cantos, 8 estações, área 6,52 x 6,76.
+  - CANTO PEDIDO DUAS VEZES: a estação 2 começou "canto 1 -> 4" e terminou "canto 3 -> 5". deduceCorner leu a
+    mira do canto reflexo como a diagonal de outro canto; o canto 1 ficou pendente e foi pedido de novo. CORREÇÃO:
+    com planta, vale a estação indicada pelo olho do mapa; a dedução pela diagonal só vale no esboço sem planta.
+  - PORTA QUE NÃO COMPLETOU: a fase de portas só disparava com a mira no rumo previsto a partir da cruz; o operador
+    estava em outro lugar e só saíram 2 fotos. CORREÇÃO: dispara sempre que firme e na faixa de inclinação; decide
+    o detector (porta no centro). No sprite, a parte que falta (pé ou linha do teto) pisca em amarelo grosso.
+  - DUAS PORTAS PERDIDAS (a 6-7 m das estações): com a vista de 1600 linhas, o mínimo de batente (20% = 320 px)
+    passava do tamanho de uma porta distante (~265 px). CORREÇÃO: cJambMinPx = 150 fixo. Com isso saem as portas
+    nos frames 63 e 64 (estação 4), além de 51/53/54/58.
+- APK instalado; capTest 0 falhas.
+- PORTA VISTA DE VIÉS (usuário: "me posicionei no olho e mirei a porta; o ângulo não é perpendicular"; "o olho se
+  torna meu guia dentro do cômodo"): cada porta ganha um ponto de pé (TPlanDoor.stand) na normal da parede dela,
+  para dentro do cômodo:
+  - a cDoorStandM = 2,5 m (porta e moldura cabem numa foto nivelada);
+  - ou até a parede oposta menos 0,4 m;
+  - no mínimo 1 m.
+  planRayHit, o raio contra o polígono, virou auxiliar (posição da porta e espaço à frente). nextDoor leva o olho
+  do mapa ao ponto da porta da vez. Dica: "No olho laranja, de frente para a porta amarela: mire (n)".
+- APK instalado.
+- PORTA NO WIREFRAME + CONFIRMAÇÃO POR ENCAIXE (usuário: "a escala do wireframe da porta deve ser encaixada na porta
+  vista na câmera, certificando a detecção"):
+  - na fase de portas, cada porta da planta é desenhada no wireframe em escala real (vão de 2 x 0,4 m até a verga
+    de 2,10, sobre a parede, TPlanDoor.along): a atual em amarelo, as confirmadas em verde;
+  - a confirmação exige que a porta detectada encaixe: rumo do centro a até 6 graus do previsto a partir do olho e
+    largura entre 0,55 e 1,15 m (colunas da vista frontal x distância olho-parede / focal). Substitui o "centro da
+    imagem" (cDoorCenterDeg removido).
+- APK instalado.
+- 153013 (conferida e apagada do celular): porta confirmada e MEDIDA, mas errada. Razão 1,535 (linha do teto 3,22 m)
+  e a planta reescalada +15%. Causa (foto 102): o detector enquadrou a PORTA DO CORREDOR vista através do vão (o
+  batente e a verga dela, bem mais baixa); rumo e largura batiam por coincidência. CORREÇÕES:
+  - encaixe de PROFUNDIDADE: a distância da porta detectada, pela verga ((2,10 - h)/tan e_verga) e pelo pé
+    (h/tan e_pé), precisa estar a ±25% da distância olho-parede (cDoorFitDepthFrac);
+  - régua PLAUSÍVEL: só vira escala uma linha do teto entre 2,35 e 3,05 m (cRulerMinM/MaxM); fora disso a porta
+    fica confirmada, sem medida.
+  - A porta próxima, nessa foto, não foi achada; fica em aberto.
+- APK instalado.
+- BORRÃO ALTO em 153013 (usuário): o giro do piso saiu todo desfocado, média de 6,4 px no centro, visível até na
+  miniatura. CAUSA: o refoco da troca de faixa (teto -> piso) disparava NA HORA, com o celular ainda apontado para o
+  teto; a lente travava ali e o piso inteiro ficava fora de foco. O mesmo valia no início das estações.
+  CORREÇÃO: wantFocus deixa o foco PENDENTE; ele só roda quando a pose entra na faixa guiada e fica firme
+  (PoseAllowed e sem svTooFast; na fase de portas, dentro de ±35 e firme). Enquanto pende, nenhum quadro é
+  guardado; a dica "Focando: segure firme" aparece quando a pose já está certa.
+- APK instalado.
+- PORTA ABERTA COM A DO CORREDOR ATRÁS (usuário: "sei que estou forçando o teste com a porta aberta, porém essa
+  robustez é necessária"). 153013 foto 102: a porta próxima (batentes 224/531) caía na regra do pé. A borda de
+  baixo da foto é inclinada na vista frontal, e o pé dos dois batentes era testado na linha do mais baixo.
+  CORREÇÕES:
+  - cada batente é julgado na PRÓPRIA coluna: pé visível (a foto continua abaixo) ou cortado (termina na borda);
+  - um pé visível ACIMA de um batente cortado mais abaixo é outra coisa, mais distante (a porta do corredor, a
+    borda da folha), e não o piso: a porta vira só candidata, sem medida;
+  - doorMaxTried passa a 256.
+  Resultados:
+  - 153013 foto 102: a porta próxima com a verga dela (545);
+  - 132058 foto 37: sem medida (antes inventava 3,11 m);
+  - 150306 inalterada.
+- APK instalado.
+- WISH LIST criada (slices/projeto/wishlist.md): 1o item = VISTA SINTÉTICA no lugar da câmera, a partir das 4 imagens de referência (vistas retificadas agrupadas por parede) e da posição (giroscópio + teto). Usuário: não precisa ser agora; futuro próximo.

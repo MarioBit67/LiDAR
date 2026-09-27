@@ -8,7 +8,7 @@ enum {
 
 static const float cViewFocal = 0.3f,     // view focal over the frame's: the whole frame fits, a door keeps ~150 px
                    cEdgeMin = 48.f,       // Sobel magnitude of an edge on the view luma
-                   cJambMinFrac = 0.2f,   // a jamb run spans at least this share of the view height
+                   cJambMinPx = 150.f,    // a jamb run spans at least this (a door 7 m away stands ~265 px tall)
                    cAspectMin = 0.25f,    // opening width over height: 0.6-0.9 m over ~2.1 m, casing included
                    cAspectMax = 0.55f,
                    cHeadMinFrac = 0.5f,   // columns between the jambs that see the head edge
@@ -402,7 +402,7 @@ int doorDetect(const TDoorView &view, TDoor *doors, int cap, TDoorStats *stats)
       int len = colBot[c] - colTop[c];
       bool peak = true;
 
-      if ((float)len < cJambMinFrac*(float)h)
+      if ((float)len < cJambMinPx)
          continue;
       for (int d = -3; d <= 3; d++)
          if (d && colBot[c + d] - colTop[c + d] > len)
@@ -490,31 +490,54 @@ int doorDetect(const TDoorView &view, TDoor *doors, int cap, TDoorStats *stats)
                floorRow = (float)jb.bottom;
          }
 
-         /* a door shows its own foot: just below it the view still has the frame. A tall window seen from the ceiling
-            band has "jambs" cut by the edge of the photo, no floor (124744 frame 1) */
-         int  below = (int)floorRow + 12;
-         bool footSeen = below < h - 2 && a.col >= 0 && b.col < w && view.valid[(size_t)below*w + a.col]
-                         && view.valid[(size_t)below*w + b.col],
-              footCut = false;
+         /* a door shows its foot. Each jamb is judged in its own column, since the photo's bottom edge runs slanted
+            across the frontal view (153013 frame 102: the near door's left jamb ended at the photo's edge, its right
+            one below it): seen - the photo goes on below it; cut - it ends where the photo does. A tall window from
+            the ceiling band has both cut with the photo barely below the horizon (124744 frame 1). A door with both
+            feet cut is taken when the photo reaches well below the horizon (a door close by), as a candidate only */
+         bool  footSeen = false,
+               footCut = false,
+               cutFar = false,
+               anyCut = false;
+         float seenFloor = 0.f,
+               cutBottom = 0.f;
 
-         /* a foot cut by the photo's own bottom edge: a door close by, when the photo reaches well below the horizon
-            (124744 frame 37: a level frame, the door ~2 m away); a photo of the ceiling band barely does (frame 1:
-            the window). A cut door is a candidate only: without its foot nothing is measured on it */
-         if (!footSeen)
+         for (int k = 0; k < 2; k++)
          {
-            int lowest = -1;
+            const TDoorJamb &jb = k == 0 ? a : b;
+            int              lowest = -1;
 
-            for (int r = h - 1; r > (int)floorRow && lowest < 0; r--)
-               if (view.valid[(size_t)r*w + a.col] && view.valid[(size_t)r*w + b.col])
+            for (int r = h - 1; r >= jb.bottom && lowest < 0; r--)
+               if (view.valid[(size_t)r*w + jb.col])
                   lowest = r;
-            footCut = lowest >= 0 && (float)lowest - floorRow < 16.f
-                      && atan2f(view.horizonRow - (float)lowest, view.focalPx)*57.29578f <= -cCutFootMinDeg;
-            if (!footCut)
-            {
-               st.shape++;
-               doorTried(st, a.col, b.col, 2);
+            if (lowest < 0)
                continue;
+            if (lowest - jb.bottom >= 12) // the photo goes on below this foot
+            {
+               footSeen = true;
+               seenFloor = fmaxf(seenFloor, (float)jb.bottom);
             }
+            else
+            {
+               anyCut = true;
+               cutBottom = fmaxf(cutBottom, (float)jb.bottom);
+               cutFar = cutFar || atan2f(view.horizonRow - (float)lowest, view.focalPx)*57.29578f <= -cCutFootMinDeg;
+            }
+         }
+
+         /* a foot seen above a jamb cut lower by the photo's edge is something farther ending there - a door in the
+            hall seen through the opening, a leaf's edge (153013 frame 102, 132058 frame 37) - not this door's floor */
+         if (footSeen && anyCut && seenFloor < cutBottom - 12.f)
+            footSeen = false;
+         if (footSeen)
+            floorRow = seenFloor; // the foot seen is the floor (a cut jamb only reaches the photo's edge)
+         else if (cutFar)
+            footCut = true;
+         else
+         {
+            st.shape++;
+            doorTried(st, a.col, b.col, 2);
+            continue;
          }
 
          // from here the opening itself: head to floor (the runs may reach past both)

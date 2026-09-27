@@ -24,7 +24,7 @@ enum {
    doorViewH   = 1600, // tall enough for the whole frame: a door's foot must not fall off the view
    doorMaxDoors = 4,
    doorMaxJambs = 96,
-   doorMaxTried = 64
+   doorMaxTried = 256
 };
 
 // A frontal, level view of one wall (caller buffers: doorViewW*doorViewH bytes each)
