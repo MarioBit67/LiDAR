@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+          package="io.aeroblox.lidar"
+          android:versionCode="1"
+          android:versionName="0.1.0">
+
+   <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="30" />
+
+   <uses-permission android:name="android.permission.CAMERA" />
+   <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+   <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+   <uses-permission android:name="android.permission.VIBRATE" />
+
+   <uses-feature android:name="android.hardware.camera" android:required="true" />
+
+   <application android:label="LiDAR Captura"
+                android:hasCode="false"
+                android:extractNativeLibs="true"
+                android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+      <activity android:name="android.app.NativeActivity"
+                android:label="LiDAR Captura"
+                android:exported="true"
+                android:screenOrientation="portrait"
+                android:configChanges="orientation|keyboardHidden|screenSize">
+         <meta-data android:name="android.app.lib_name" android:value="lidar" />
+         <intent-filter>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+         </intent-filter>
+      </activity>
+   </application>
+</manifest>
