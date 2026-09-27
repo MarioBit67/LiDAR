@@ -22,7 +22,10 @@ enum {
    layoutMaxStations = 8,
    layoutMaxWalls    = 24,
    layoutMaxFrames   = 160,
-   layoutDriftWindow = 5     // recent accepted keyframe axes the drift reference is the median of
+   layoutDriftWindow = 5,    // recent accepted keyframe axes the drift reference is the median of
+   layoutMaxCreases  = 256,  // diagnostics: creases the walls were clustered from
+   layoutMaxOpenDoors = 4,
+   layoutMaxCenters  = 16   // centers of the room: one per rectangle of its decomposition (an L has three)
 };
 
 // Why a plan could not be made (shown to the operator, logged)
@@ -36,6 +39,17 @@ enum TPlanFailure {
    pfNoStations = 6
 };
 
+// One crease the walls were clustered from (diagnostics): seen by a keyframe, rewritten from the spin point
+struct TPlanCrease {
+   int   frame;   // layout keyframe (stored order)
+   BYTE  half,    // kind*2 + (offset < 0)
+         station; // 0: the spin point saw it; k: corner station k
+   float dist,    // distance from the spin point
+         a0,      // along range
+         a1,
+         weight;
+};
+
 struct TPlanPoint {
    float u, w;
 };
@@ -44,11 +58,13 @@ struct TLayoutPlan {
    bool       valid,
               complete,      // the walls cover (nearly) every heading around the spin point
               heightSolved,  // floor creases paired with ceiling creases; else the default height
-              doorFound;     // door / window heads found: the plan is scaled by them (2.10 m)
+              doorFound,     // door / window heads found (2.10 m): they measure the ceiling height
+              ceilingSnapped; // the heads put the ceiling on a typical height (2.70 / 2.80): the plan is scaled to it
    float      axisDeg,       // world heading of plan axis u
-              ceilingM,      // ceiling height: measured when doorFound, else the assumption
+              ceilingM,      // ceiling height the plan uses: the typical one the door heads chose, else the assumption
               assumedCeilingM,
               doorScale,     // 2.10 / head height in the assumed scale (1 without doors)
+              impliedCeilingM, // ceiling height the door heads imply (assumption x doorScale)
               cameraHeightM,
               extentU,       // bounding box of the polygon
               extentW,
@@ -59,6 +75,7 @@ struct TLayoutPlan {
               wallA0[layoutMaxWalls],
               wallA1[layoutMaxWalls],
               wallWeight[layoutMaxWalls];
+   int        wallViews[layoutMaxWalls];
    int        heightCorners, // room corners (floor-to-ceiling edges) the camera height was measured on (0: floor lines)
               stationLines,  // creases the corner stations added (placed by the walls the spin point saw)
               wallCount,
@@ -68,6 +85,13 @@ struct TLayoutPlan {
    int        stationCount;
    BYTE       stationVertex[layoutMaxStations], // corner stations in walking order
               targetVertex[layoutMaxStations];  // corner each station aims at
+   int         centerCount;       // middles of the room: a rectangle has one, an L one per arm and one where they meet
+   TPlanPoint  centers[layoutMaxCenters];
+   int         openDoors,         // open door leaves found (worth closing: a closed door is a better ruler)
+               openDoorWall[layoutMaxOpenDoors];
+   float       openDoorAt[layoutMaxOpenDoors]; // along that wall
+   int         creaseCount;
+   TPlanCrease creases[layoutMaxCreases];
 };
 
 class TRoomLayout
@@ -78,7 +102,7 @@ class TRoomLayout
    void  Reset(void);
    void  AddFrame(const TMat4 &cameraToWorld, const TVanishResult &r, const TVanishEdges &edges,
                  const TVec3 &tiltBias, int station); // tiltBias: TTiltBias::Bias(); station 0: the center spin
-   bool  Solve(float axisDeg, float ceilingM, TLayoutPlan &out) const;
+   bool  Solve(float axisDeg, float ceilingM, TLayoutPlan &out) const; // ceilingM: the assumption; door heads may snap it
    DWORD Count(void) const { return Pcount; }
    float AnchorDeg(void) const; // plan axis: the median of the stored frames' room axes
 
@@ -87,6 +111,7 @@ class TRoomLayout
 
  private:
    bool FrameKept(int f) const; // its axis agrees with its neighbors on both sides
+   bool solveAt(float axisDeg, float ceilingM, TLayoutPlan &out) const;
 
    TBlock<float> Pdata; // per edge: world ray x, y, z and the world heading of its 3D line, [0, 180)
    DWORD         Pcount,

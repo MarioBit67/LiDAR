@@ -35,7 +35,7 @@ SRCS=(
    shared/src/abNew.cpp shared/src/abPool.cpp shared/src/thread.cpp shared/src/fault.cpp shared/src/sha256.cpp
    core/src/capGeom.cpp core/src/capOrient.cpp core/src/capSpin.cpp core/src/capBuf.cpp core/src/capRecord.cpp
    core/src/capLog.cpp core/src/capSession.cpp core/src/capJPEG.cpp core/src/capFrameMeta.cpp core/src/capEXIF.cpp
-   core/src/capVanish.cpp core/src/capLayout.cpp
+   core/src/capVanish.cpp core/src/capLayout.cpp core/src/capBlur.cpp core/src/capDoor.cpp
    mobile/app/capCanvas.cpp mobile/app/capApp.cpp
    mobile/android/capJNI.cpp mobile/android/TAndroid.cpp mobile/android/androidMain.cpp
 )

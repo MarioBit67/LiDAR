@@ -308,3 +308,330 @@ Entradas mais novas no fim.
 - Achado de ferramenta: o capTest usa o cache do abtestcache (build/Release/.abtestcache); para ver o detalhe de
   uma falha, apague o cache e rode de novo.
 - APK instalado. PRÓXIMO: recapturar a sala em L com os cantos inclinados e medir quantas estações se localizam.
+
+## 2026-09-27 - CORES DA COBERTURA SIMPLIFICADAS
+- Usuário: "três cores no preenchimento é bem confuso; qual a razão do cinza?". O cinza era o quadro VAZIO: branco
+  quase transparente sobre o fundo escurecido.
+- Agora:
+  - Vazio.
+  - VERDE = capturado, inclusive sem linhas.
+  - LARANJA só para quadros a mais de 8 graus do eixo (cOffAxisShowDeg: piso diagonal, linha espúria).
+  - Amarelo = processando.
+  - A legenda saiu. O veredito fino (±2 graus, sem linhas) continua nos registros.
+- Na interface, isso substitui o "verde só depois da checagem de coerência": o operador não pode refazer um
+  quadro, então só o que falta fotografar importa para ele.
+- Usuário: "existe o quadro vazado e existe também o preenchido com cinza".
+  - VAZADO: com 2 faixas, o desenho pintava do teto até yCeil e de yFloor até o piso; a faixa do horizonte nunca
+    tinha cor. Agora as duas faixas se encontram no horizonte (inner = cy).
+  - CINZA: era o quadro ainda não fotografado (branco translúcido sobre o fundo escuro). Agora aparece só com
+    CONTORNO.
+  - Na tela: contorno = falta, verde = capturado, laranja raro, amarelo = segure.
+- Usuário: "as fotos em laranja podem ser recapturadas, e se o novo snap der verde ele substitui o anterior".
+  - TSpinTracker::Reopen(band, bin): o bin continua contando como preenchido, mas a próxima vista firme dele é
+    guardada (svKeep).
+  - O app reabre um bin quando o veredito sai a mais de 8 graus do eixo (binOffAxis), até appMaxRetakes = 2 vezes
+    por bin, para um piso diagonal não gerar fotos sem fim.
+  - A cor e o eixo do bin seguem sempre a foto mais recente.
+  - A foto antiga continua no arquivo da sessão (append-only), fora da planta (FrameKept) e das paredes (> 12 graus).
+- Usuário (versão adaptativa): "o verde é definitivo; o laranja é sempre passível de atualização, mas permite ao
+  operador encerrar a fase se desistir".
+  - PbinOrange guarda o veredito NA CHEGADA: verde nunca muda depois, mesmo que o eixo do cômodo se mova.
+  - Laranja reabre o bin SEM limite (appMaxRetakes removido).
+  - checkComplete: a estação só fecha sozinha com todos os bins capturados, todos os vereditos chegados e nenhum
+    laranja. Chamado no OnFrame e no worker, depois de gravar a imagem.
+  - Com laranja sobrando, a dica diz "N em laranja: aponte para refazer ou toque em <botão>", e o operador aceita
+    como está pelo botão.
+
+## 2026-09-27 - O "DENTE" DE 070542, O MAPA COM OLHO E ALVO
+- 070542 (L com cantos inclinados): a planta do app tinha 8 cantos. O usuário: "um dente que não existe no canto
+  oposto ao convexo".
+  - Diagnóstico com `capInspect --creases` (novo: TLayoutPlan.creases lista cada vinco com quadro, estação,
+    lado, distância, faixa e peso). O dente era u = 2,25, vindo de UM quadro (quadro 1, peso 75).
+  - "Dois quadros por parede" DESCARTADO: apagou paredes distantes reais, vistas por um quadro só (003708 perdeu
+    o L; 070542 perdeu o fundo do braço).
+  - Regra final: uma parede que não é a mais forte do seu lado precisa de >= 2 vistas OU de
+    peso x distância >= 250 (cLoneWallWeightM). Dente: 169; paredes reais sozinhas: >= 367.
+  - 070542 agora: L limpo com 6 cantos (completo), 6,78 x 7,19, vão 3,23 x 3,72. As medidas estão infladas em
+    relação a 003708 (5,94 x 5,85); a escala e a vertical seguem pendentes. Demais sessões inalteradas.
+- Estações de canto em 070542: 0 vincos aproveitados (a resseção ainda não localiza as estações).
+- Mapa dos cantos (usuário, com o olho.png): OLHO LARANJA onde ficar, desenhado em vetor (drawEye) e girado para
+  o alvo, com tracejado laranja fino; CÍRCULO AMARELO grande e vazado no canto a fotografar.
+  - O ponto do giro virou uma cruz branca (o amarelo é do alvo).
+  - Estações feitas em verde, pendentes em branco; a atual é desenhada por cima.
+  - Dicas: "Vá ao olho laranja e mire o círculo amarelo (k de n)" / "Mire o círculo amarelo do mapa e pare".
+
+## 2026-09-27 - DEGRAU SÓ CONFIRMADO; CANTOS NA HORIZONTAL
+- Origem do dente de 070542: quadro 2 da sessão (planta 1). A moldura da parede u+ foi vista de viés perto do
+  canto, e só uma linha fraca (peso 75) foi detectada, com elevação 30 graus. Se a parede está a 1,51 m, como os
+  quadros 6-9 mostram de frente, deveria ser ~41 graus. Essa leitura deu 2,25 m.
+  O teto desmente: o vinco forte w+ termina em u = 1,73, junto da parede verdadeira.
+- Princípio do usuário: "um dente é confirmado em múltiplas capturas do mesmo acidente; todo outro caso é
+  descartado". Regra final para a parede SECUNDÁRIA de um lado (a mais forte sempre fica); ela fica se:
+  - foi vista por >= 2 keyframes (layoutMinWallViews); OU
+  - um único keyframe viu >= 1,5 m dela (cLoneWallLenM: paredes do fundo, vistas de longe uma vez); OU
+  - um vinco perpendicular termina nela, a menos de 0,35 m (cCornerMeetM: os vincos do teto se encontram nos cantos).
+- Tentativas descartadas no caminho:
+  - só 2 vistas: apagou as paredes do fundo;
+  - só o encontro dos vincos: apagou o vão de 070542 (0,43 m de folga, contra 0,52 m do dente);
+  - peso x distância: heurística sem física.
+- Resultados:
+  - 070542: L limpo com 6 cantos, completo, 6,78 x 7,19.
+  - 003708: L intacto, 5,94 x 5,85.
+  - 010618: perdeu o falso vão pequeno.
+  - 012809: ainda com um degrau de 0,22 m (parede vista em trecho longo). Pendente.
+  - 202726 e 200900 inalterados.
+- Diagnóstico: capInspect --creases lista os vincos. As paredes mostram "views" (TLayoutPlan.wallViews, creases[]).
+- Cantos de volta à HORIZONTAL (usuário: "pose natural, visada frontal do canto, sem teto nem piso"):
+  - cCornerPitchDeg = 0.
+  - Ao inclinar, a grade da vista fica VERMELHA e a dica diz "Deixe a câmera na horizontal, de frente para o canto".
+  - A grade volta ao normal ao nivelar.
+- Usuário: as visadas horizontais dos cantos dão perspectiva de pé-direito e verga (topo de porta, 2,10 m) para um
+  refinamento milimétrico. É o caminho de escala até o LiDAR do iOS. PRÓXIMO candidato: medir pé-direito e
+  vergas pelas estações de canto.
+
+## 2026-09-27 - PÉ-DIREITO PELO CRUZAMENTO DE HIPÓTESES (verga 2,10 x típicos 2,70 / 2,80)
+- Usuário: "um pé-direito típico tem 2,80 (no meu apartamento 2,70) e uma verga tem 2,10; essas hipóteses podem ser
+  cruzadas".
+- TRoomLayout::Solve = solveAt na suposição, depois o cruzamento. Se as vergas medem um pé-direito implícito
+  (impliedCeilingM = suposição x doorScale), o candidato mais próximo entre {suposição, 2,70, 2,80}, dentro de 6%
+  (cCeilingSnapFrac), vence.
+  - Se vencer um típico diferente da suposição, a planta é ESCALADA (f = novo/suposto: vértices, paredes, vincos,
+    altura da câmera, área x f^2). Nunca é refeita: refazer em 191624 mudou a altura da câmera e a forma.
+  - Verga longe de todos (200900: 3,07) não muda nada.
+- Resultados:
+  - 202726 (real 3,00 x 3,20): 2,98 x 3,14 (-0,7% / -1,9%), o melhor até agora.
+  - 203334 e 191624 foram para 2,70.
+  - 175043 fica em 2,80 (verga 2,79).
+  - As capturas da sala em L não acharam verga.
+  - capTest: sala de 2,60 com suposição 2,60 fica; suposição 2,80 é escalada para 2,70. 0 falhas.
+- PASSO FUTURO (usuário): mesas criam uma falsa linha de piso, paralela à verdadeira mas defasada na altura
+  (estantes criam falso teto, e esse caso já é resolvido pela linha mais alta). Confirmar o vinco do piso pela
+  consistência do PADRÃO DE AZULEJOS do piso (juntas, módulo) para desempatar.
+
+## 2026-09-27 - AVISO DE PORTA ABERTA (recomendação)
+- Usuário: "uma porta aberta cria ruído; fechada, a verga fica mais realista. Se detectar uma porta aberta, oriente
+  a fechá-la. Não é erro, é recomendação".
+- layoutOpenDoors (Solve): cada aresta acima do horizonte é posta na altura da verga (a medida, ou 2,10). Vota se:
+  - cai numa faixa de 0,3-1,0 m saindo de uma parede de orientação perpendicular;
+  - não está sobre outra parede (0,15 m);
+  - fica dentro da extensão da parede.
+  O pico precisa de >= 40 votos e de 5x o fundo de arestas soltas da parede (sem o contraste, todas as sessões
+  davam 4 portas). plan.openDoors / openDoorWall / openDoorAt.
+- Resultado: 2 alarmes em 10 sessões.
+  - 002325: parece real (quadro 6, passagem com a porta aberta).
+  - 012809: parede da TV, provável barra da persiana (falso).
+- App: faixa laranja "Porta aberta? Feche-a para uma captura melhor" nas fases de caminhar e cantos.
+- PRÓXIMOS critérios (usuário), para filtrar a folha:
+  - BATENTE: a folha aberta nasce num batente (vertical do vão).
+  - MAÇANETA: fechada, fica dentro do retângulo da verga, sem ortogonal; aberta, fica perpendicular ao batente,
+    oposta à dobradiça.
+  O layout hoje só guarda arestas horizontais; os dois critérios pedem as verticais (batentes) por quadro.
+
+## 2026-09-27 - ATITUDE POR QUADRO, RESOLUÇÃO MÁXIMA, LIMPEZA
+- Usuário: "cada frame deve registrar o vetor perpendicular da tela que fez a captura e a rotação em torno dele,
+  com a gravidade como zero".
+  - TFrameMeta (LIDARCAP no JPEG) cresceu de 300 para 320 bytes: forward[3] (mundo, y para cima) + rollDeg.
+  - geomRollDeg: ângulo de "cima do mundo" (projetado no plano da imagem) até o +y da câmera; horário visto pela
+    câmera; NaN a menos de ~8 graus do zênite ou do nadir.
+  - Decode aceita os blocos v1 de 300 bytes e deriva os dois valores da pose.
+  - capInspect: colunas fwdX, fwdY, fwdZ, rollDeg no frames.csv. 070542: roll -82..-94 (celular em pé; o sensor é
+    deitado), fwdY = sen(pitch) confere.
+- Usuário: "a maior resolução possível da câmera".
+  - Moto g(9) play: sensor principal 4016 x 3016; a maior saída YUV (e RAW) é 4000 x 3000, que o app já usava.
+  - appMaxPixels 12,6 MP -> 50 MP para outros aparelhos pegarem o maior 4:3.
+- Usuário pediu para esvaziar as capturas antigas. As 14 sessões do celular (1,0 GB, 26/09 17:32 a 27/09 07:05)
+  foram APAGADAS com `rm -rf .../files/imovel_*`. O usuário esvazia as do PC.
+
+## 2026-09-27 - MÉTRICA PRINCIPAL: ÁREA DE VASSOURA
+- Usuário: a distância até o piso (LiDAR) desempata falsos positivos como a mesa da sala; a área de vassoura é a
+  informação mais desejada do imóvel, e quanto mais precisa, mais robusta no mercado. Registrado em
+  slices/projeto/missao.md como critério de decisão.
+
+## 2026-09-27 - PASSO FUTURO: GRADE DE AZULEJOS (FFT) E REMOÇÃO DE MÓVEIS
+- Ideia do usuário: os azulejos formam uma grade identificável por FFT; com o padrão, fazer um "flood fill"
+  estendendo o piso e as paredes para remover os móveis do ambiente.
+- Plano:
+  1. Ortofoto do PISO (vista de cima), pela mesma retificação das paredes: pontos de fuga + altura da câmera.
+  2. FFT 2D: os picos dão o módulo (45/60/80 cm) e a orientação da grade. O piso diagonal a 45 graus, que hoje
+     engana os pontos de fuga, vira informação.
+  3. Ganhos:
+     - a linha do piso é confirmada pelas juntas que terminam na parede (desempate da mesa);
+     - o módulo padrão do azulejo é uma régua a mais para a escala e a área de vassoura;
+     - onde a grade quebra, há um móvel ou tapete: mapa de oclusão.
+  4. Remoção dos móveis:
+     - piso: síntese periódica a partir de um trecho limpo, preenchendo as oclusões;
+     - paredes: tinta uniforme já equalizada;
+     - as vistas dos cantos cobrem a paralaxe.
+
+## 2026-09-27 - VISTA DO PISO EM CADA CANTO, CENTROS ADAPTATIVOS
+- Usuário: em cada canto, depois das três poses do canto oposto (horizontais), capturar também o centro do cômodo
+  NITIDAMENTE PARA O PISO: a malha de ladrilhos vista de cada canto (base para remover os móveis) e um fator a
+  mais de conferência.
+- Implementação:
+  - TSpinConfig::ForFloorView: 1 bin, faixa de pitch -35 ±17, largura de meio quadro. TSpinTracker::AimFan
+    prefixa o centro do leque.
+  - App: checkComplete, depois do leque do canto, chama beginFloorView: mesmo canto, rastreador novo mirando o
+    alvo; os quadros levam spinBand = appFloorBand (1).
+  - Os vereditos do leque e da vista do piso não se misturam (floorFrame == PfloorView). A vista do piso nunca
+    fica laranja (um piso diagonal a encheria).
+  - Dicas: "Agora mire o centro do cômodo, olhando para o piso" / "Incline mais para o piso". A grade vermelha
+    só vale para o leque nivelado.
+  - O mapa põe o círculo amarelo no centro-alvo.
+- Usuário: "o centro é adaptativo: um retângulo tem um centro, o L três ou mais (um por perna e o cruzamento)".
+  - layoutCenters: as coordenadas das paredes cortam a planta em células; cada célula dentro do cômodo tem um
+    centro. plan.centers; o esboço tem o centro (0,0).
+  - Cada canto mira o centro MAIS PRÓXIMO (usuário: não todos; um fica atrás da parede saliente).
+  - capTest: retângulo 1 centro, L 3. 0 falhas.
+  - OPÇÃO FUTURA (usuário): vista extra para o CRUZAMENTO, visível de quase todos os cantos.
+
+## 2026-09-27 - DORMITÓRIO 081054, MAPA DE NAVEGADOR, ALERTAS NA GRADE
+- 081054 (dormitório, porta aberta de propósito):
+  - planta 2,98 x 3,21 m com 4 cantos, 4 estações (altura da câmera 1,52 solved);
+  - a verga implica 2,52: longe de 2,70 e 2,80, nada muda;
+  - piso em DIAGONAL (45 graus).
+- Achado 1: o piso diagonal dava laranja na faixa de baixo. Com a retomada automática, o mesmo bin foi
+  fotografado ~9 vezes (quadros 15-26). binOffAxis agora trata um eixo a 45 ±6 graus (cDiagonalTolDeg) como padrão
+  diagonal do piso: fica verde.
+- Achado 2: o detector de porta aberta NÃO serve sem as verticais. No 081054, todo pico fica só ~1,8x acima do
+  fundo (700-1400 votos por posição); a porta real não se destaca. O aviso foi RETIRADO da tela. layoutOpenDoors
+  segue como diagnóstico no capInspect até os critérios de batente e maçaneta (tarefa pendente) usarem arestas
+  verticais.
+- Mapa: o olho fica fixo embaixo (85% da altura), no meio; a planta gira em volta dele (heading-up) e escala pela
+  maior distância do olho até um canto. As linhas são recortadas na caixa (clipToBox, Cohen-Sutherland). O olho
+  mantém sempre a mesma cor e posição (usuário).
+- Alertas de pose SÓ na grade de captura (usuário: "a grade é bem ruidosa e serve para isso"):
+  - o leque aceita ±10 graus do nível (cCornerLevelHalfDeg);
+  - fora disso, fundo e painéis ficam VERMELHOS;
+  - na vista do piso a regra se inverte: vermelho quando o celular NÃO está inclinado para o piso.
+  - A borda vermelha do mapa foi retirada.
+
+## 2026-09-27 - ALERTA DE POSE TAMBÉM NO GIRO CENTRAL
+- Queda de energia às ~08:25: nada perdido (APK de 08:23 já instalado; 13 arquivos sem commit intactos).
+- Usuário: em vermelho, NENHUMA captura é registrada; o giro central segue a mesma regra dos cantos.
+  - TSpinTracker::GuidedBand = a faixa mais alta com bin vazio (teto primeiro); Offer devolve svOffBand fora
+    dela (antes da checagem de velocidade). No Moto as faixas se encontram no horizonte: no giro do teto o
+    celular vai no máximo à horizontal, sem apontar para o chão; no giro do piso, o oposto.
+  - Com todos os bins preenchidos, qualquer faixa vale (o laranja pode ser refeito onde estiver).
+  - PoseAllowed() (última inclinação dentro da faixa guiada) pinta a grade de vermelho no centro e nos cantos.
+  - Nos cantos, o MAPA também fica vermelho (fundo e paredes); o OLHO continua laranja e fixo embaixo.
+  - Dica no centro: "Incline para cima (linha do teto)" / "Incline para baixo (linha do piso)".
+- capTest: novo caso da ordem das faixas (headPitchPose subiu para o topo do arquivo). 0 falhas. APK instalado.
+- Porta aberta: o falso negativo do 081054 SEGUE PENDENTE (critérios de batente e maçaneta pedem as arestas verticais).
+- CAPTURA 083920 (usuário: "os alertas em vermelho foram incisivamente PERFEITOS"): 45 imagens em 230 s. Giro do
+  teto: 14 quadros, pitch +11,7 a +26,9. Giro do piso: 15 quadros, -10,3 a -35,8. Nenhum quadro na faixa errada.
+  4 cantos com leque nivelado (-3,7 a -9,1) + vista do piso (-31,9 a -43,9).
+  - Planta ao vivo: flags 7, 4 cantos e 4 estações. capInspect: 3,74 x 3,46 m, 12,91 m2, câmera a 1,52 m.
+  - Verga implica 2,51 m: nada muda.
+  - Os 13 laranjas são o piso diagonal: o eixo cai em ~10 graus, 55 - 45, e a tela mostra verde.
+  - Estações de canto: 0 vincos. Os leques são nivelados, então isso é esperado.
+  - O bin 7 do piso foi guardado 2 vezes: quadros 14 (-10,3) e 15 (-24,8), ambos alinhados. A causa não foi
+    investigada.
+
+## 2026-09-27 - BORRÃO PELA FFT (capBlur)
+- Usuário: "FFT na imagem evidencia o grau de borrão... registrado no metadado; nova captura (mesmo verde) com
+  borrão menor substitui a anterior; um piso de borrão deixa a captura em laranja". O autofoco leva um tempo
+  para convergir.
+- core/capBlur:
+  - A luma é reduzida 4x por média de blocos. Em resolução plena, o grão e o sharpening do ISP (1 a 2 px)
+    enchiam a banda alta, e o frame 44, fora de foco, lia 0.
+  - Grade de 3x3 blocos de 256 px, cada um com janela de Hann e FFT 2D radix-2.
+  - Potência média na banda baixa (0,03-0,06 c/px) e na alta (0,10-0,20), descontado o piso de grão
+    (0,40-0,50).
+  - A razão entre as bandas, comparada à de uma cena 1/f², dá o sigma gaussiano equivalente.
+  - Blocos lisos (desvio < 6) ficam fora. A medida do quadro é a MEDIANA dos blocos: com o mínimo, uma única
+    aresta forte dava 0.
+- Calibração em 083920, pelo julgamento do usuário:
+  - 42 excelente: 0,0.
+  - 32 quase bom: 2,6.
+  - 44 e 15 fora de foco: 5,7 e 6,3.
+  - Sintético: 3 caixas de 13 px (sigma 6,5) medem 6,44.
+- LIDARCAP: blurPx (mediana) e blurMinPx em 2 WORDs (centipixels + 1; 0 = não medido) nos 4 últimos bytes do
+  bloco de 320.
+- App (worker, na luma crua antes do JPEG):
+  - Acima de cBlurMaxPx 4,0: LARANJA, reabre sem limite. Vale também na vista do piso.
+  - Verde acima de cBlurGoodPx 2,0: reabre até appBlurTries = 2 vezes. A nova foto só substitui (eixo,
+    borrão, cor) se for mais nítida.
+- capInspect: `--blur` mede no JPEG e imprime por bloco. frames.csv ganhou blurPx, blurMinPx e blurTextured.
+- PENDENTE: nas retomadas, o arquivo guarda todas as fotos (append-only). A etapa offline deve escolher a mais
+  nítida por bin.
+- CMake/VS: o `build/norm.sh` regravava o CMakeLists a cada checagem, e o Visual Studio (Abrir Pasta) reconfigurava
+  e abria a janela de saída. Agora o script pula o CMakeLists e só regrava arquivo que precisa de CRLF.
+- capTest 0 falhas; APK instalado.
+
+## 2026-09-27 - PORTAS COMO RÉGUA (capDoor), BOTÕES PROTEGIDOS
+- Usuário: pé-direito típico 2,80 (no apartamento dele 2,70), verga 2,10; as medidas saem um pouco acima do real.
+  Diagnóstico:
+  - o cruzamento de hipóteses (Solve) existia, mas a "verga" do histograma dava pé-direito implícito de 2,51-2,52
+    (081054, 083920), fora da janela de 6%, então ficava 2,80;
+  - em 083920 a linha vencedora era a divisória do armário embutido, não a porta.
+- Critérios do usuário para a porta:
+  - acima da verga, a cor é a da parede (não a do armário);
+  - maçaneta e batente desempatam;
+  - a porta quase sempre fica perto de um canto;
+  - batente e verga medem na mesma vertical, sem escala.
+- core/capDoor:
+  - doorFrontal: rotação pura para a vista frontal nivelada da parede, a partir do YUV do quadro. Numa vertical da
+    parede, as alturas ficam proporcionais às linhas da imagem, se a vista estiver nivelada.
+  - doorDetect: batentes = corridas verticais longas.
+  - Par de batentes: verga = o topo mais baixo, piso = o pé mais alto. A folha aberta, mais perto, sobe acima da
+    verga e desce abaixo do pé (frame 30).
+  - A verga precisa atravessar o vão. Rejeita se:
+    - a linha continua ao lado do alizar (divisória);
+    - os dois batentes seguem acima dela (frestas do armário);
+    - há arestas na parede acima;
+    - a cor difere da parede ao lado.
+  - Maçaneta e canto próximo entram como bônus.
+  - Saída: vinco/verga e câmera/verga. TDoorStats conta as rejeições e lista os batentes.
+- capInspect `--doors`: door_NNN_paredeK.bmp com as marcas; imprime candidatos e batentes.
+- 083920:
+  - a porta foi achada nos frames 30 e 31 (mesma porta, estação 1): vinco/verga 1,409 e 1,404; câmera/verga 0,645 e
+    0,668;
+  - com a verga em 2,10: linha mais alta da moldura ~2,96 m, borda de baixo ~2,89, câmera 1,35-1,40;
+  - isso NÃO bate com o pé-direito de 2,70 (a medida à mão só com o pitch dava 1,307 para a borda de baixo): falta a
+    verdade de trena deste cômodo;
+  - o armário (frame 41) ainda passa como candidato; sem vinco visível, não dá razão.
+- Fluxo decidido pelo usuário:
+  - a pré-análise gera candidatas;
+  - depois dos cantos, uma estação de PORTAS: o operador fotografa cada candidata de frente e confirma ou descarta;
+  - vale a porta no CENTRO da imagem (as vizinhas ficam de fora);
+  - o quarto tem 1 porta, a sala 3.
+  - Implementação: PENDENTE.
+- App:
+  - "Concluir cômodo" (logo acima de "Cheguei") desabilitado até todas as estações entrarem;
+  - voltar do sistema exige 2 toques em 3 s, com faixa vermelha "Voltar de novo encerra o cômodo/imóvel". A captura
+    não é retomável.
+- Maçaneta (usuário: "estando aberta, a maçaneta ficou na folha perpendicular"): cada batente é procurado dos dois
+  lados, na faixa de altura da própria corrida (a folha aberta, mais perto, aparece mais alta e mais baixa que o vão).
+  Para fora do vão, a busca vai até 1 largura (a maçaneta fica na borda livre). doorKnob agora recorta os limites.
+  083920: frames 30 e 31 com knob 1; o frame 31 também com canto.
+- APK instalado com as travas de botão e do voltar.
+- Trena (usuário): folha da porta com 2,10; o batente sobe mais ~5 cm (topo do batente ~2,15). O detector mede o
+  topo do VÃO (a borda de baixo do batente), então o 2,10 da folha é a referência certa.
+- Sensibilidade à inclinação (capInspect --door-tilt): o eixo x da câmera no retrato é quase vertical, então girar
+  nele mexe pouco. Pela conta, 3 graus de pitch mudam a razão vinco/verga em ~1,4%. A inclinação residual NÃO explica
+  1,409 contra ~1,31 (2,70 + moldura). Sobram:
+  (a) o pé-direito deste cômodo é maior que 2,70 (a moldura estaria a ~2,9);
+  (b) o piso achado no pé do batente (linha 858) está alto;
+  (c) a planta está errada na altura da câmera: a razão câmera/linha do teto dá 0,456 pela porta e 0,543 pela planta
+      (1,52/2,80).
+  Com (a), as medidas da planta cresceriam, e o usuário diz que já estão acima do real. Falta o pé-direito de trena.
+- Trena: pé-direito do apartamento 2,70; folha 2,10 (batente +5 cm). ERRO ACHADO: o piso vinha do pé mais alto dos
+  dois batentes. No frame 30, a borda do alizar perde contraste em 858 (fundo escuro do corredor, depois o piso
+  claro dele); a borda da dobradiça da folha aberta está no plano da parede e vai até o piso verdadeiro (1002).
+- Regra nova:
+  - verga = o topo mais baixo do par;
+  - piso = o pé mais baixo de um batente que nasce na verga;
+  - daí em diante as proporções usam o VÃO (piso - verga);
+  - a caixa "acima da verga" fica abaixo da moldura;
+  - doorRunGap passa de 8 para 24;
+  - plausibilidade: câmera entre 0,45 e 0,95 vão, linha do teto entre 1,1 e 1,8 vão.
+- 083920:
+  - frame 30: linha do teto 2,78, câmera 1,51;
+  - frame 31: 2,77 e 1,55 (esperado ~2,75 = 2,70 + projeção da moldura; câmera da planta 1,52);
+  - frame 29: 3,03 (bordas curtas nos dois batentes, piso alto);
+  - REGRA DE TRÊS (usuário): a mesma porta em vários quadros; a mediana descarta o ruim (1,322 -> 2,78 m).
+- DIRETIVA (usuário): pé-direito único no imóvel (exceção: banheiro rebaixado, sala com mezanino), registrado em
+  slices/projeto/missao.md. Mezanino adiado.
+- PRÓXIMO:
+  (1) Solve: com portas, linha do teto = 2,10 x mediana(vinco/verga); valor do IMÓVEL para cômodos sem porta;
+  (2) portas no worker do app (quadros de canto nivelados) + estação de portas com confirmação pelo centro da imagem.

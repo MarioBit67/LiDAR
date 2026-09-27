@@ -1,7 +1,9 @@
 #include "capSpin.h"
 #include "libDiscipline.h"
 
-static const float cCornerPitchDeg = 12.f; // corner fans: ceiling creases of the far walls mid-picture, the floor still in view
+static const float cCornerPitchDeg = 0.f,     // corner fans: a natural level pose, a frontal view of the corner
+                   cCornerLevelHalfDeg = 10.f, // the corner fan accepts this far from level
+                   cFloorViewPitchDeg = -35.f; // the floor view from a corner: the middle of the room, tiles in perspective
 
 //--------------------------------------------------------------------------------
 TSpinConfig TSpinConfig::UltraWide(void)
@@ -71,14 +73,39 @@ TSpinConfig TSpinConfig::ForCorner(float hfovDeg, float vfovDeg)
    TSpinConfig c = UltraWide();
 
    c.bandCount = 1;
-   c.bandPitchDeg[0] = cCornerPitchDeg; // aimed a little up: the far creases (and the notch of an L) mid-picture
-   c.bandHalfDeg = 0.25f*vfovDeg;
+   c.bandPitchDeg[0] = cCornerPitchDeg;
+   c.bandHalfDeg = cCornerLevelHalfDeg; // level means level: beyond this the app turns the view red
    c.fanDeg = 60.f;
    c.headingBins = (int)ceilf(c.fanDeg/(0.5f*hfovDeg)); // bins no wider than half a frame
    if (c.headingBins < 3)
       c.headingBins = 3;
    c.maxRateDps = 0.5f*hfovDeg;
    return c;
+}
+
+/*--------------------------------------------------------------------------------
+   From a corner, one view toward the middle of the room tilted down to the floor: every corner sees
+   the floor tiles in its own perspective (the grid behind furniture removal - user, 2026-09-27).
+   A single bin half a frame wide, centered by AimFan on the heading toward the spin point.
+  --------------------------------------------------------------------------------*/
+TSpinConfig TSpinConfig::ForFloorView(float hfovDeg, float vfovDeg)
+{
+   TSpinConfig c = UltraWide();
+
+   c.bandCount = 1;
+   c.bandPitchDeg[0] = cFloorViewPitchDeg;
+   c.bandHalfDeg = 0.25f*vfovDeg;
+   c.fanDeg = 0.5f*hfovDeg;
+   c.headingBins = 1;
+   c.maxRateDps = 0.5f*hfovDeg;
+   return c;
+}
+
+//--------------------------------------------------------------------------------
+void TSpinTracker::AimFan(float headingDeg)
+{
+   PfanCenter = headingDeg;
+   PfanSet = true;
 }
 
 //--------------------------------------------------------------------------------
@@ -102,6 +129,7 @@ void TSpinTracker::Reset(void)
       for (int bin = 0; bin < spinMaxBins; bin++)
       {
          Pbin[band][bin] = false;
+         Pretake[band][bin] = false;
          Pkept[band][bin] = 0.f;
       }
    PhasLast = false;
@@ -145,6 +173,37 @@ int TSpinTracker::bandOf(float pitchDeg) const
       if (fabsf(pitchDeg - Pcfg.bandPitchDeg[band]) <= Pcfg.bandHalfDeg)
          return band;
    return -1;
+}
+
+/*--------------------------------------------------------------------------------
+   One band at a time, ceiling first (user, 2026-09-27): the highest band with an empty bin. On
+   the Moto the two bands meet at the horizon, so the ceiling spin allows the camera level at most,
+   never down to the floor, and the floor spin the opposite. Once every bin is in, any band (an
+   orange bin can be retaken wherever it lies).
+  --------------------------------------------------------------------------------*/
+int TSpinTracker::GuidedBand(void) const
+{
+   for (int band = Pcfg.bandCount - 1; band >= 0; band--)
+      if (BandFilled(band) < Pcfg.headingBins)
+         return band;
+   return -1;
+}
+
+//--------------------------------------------------------------------------------
+int TSpinTracker::allowedBand(float pitchDeg) const
+{
+   int band = bandOf(pitchDeg),
+       guided = GuidedBand();
+
+   if (guided >= 0 && band != guided)
+      return -1;
+   return band;
+}
+
+//--------------------------------------------------------------------------------
+bool TSpinTracker::PoseAllowed(void) const
+{
+   return !PhasLast || allowedBand(PlastPitch) >= 0;
 }
 
 //--------------------------------------------------------------------------------
@@ -234,13 +293,13 @@ TSpinVerdict TSpinTracker::Offer(QWORD stampNs, const TMat4 &cameraToWorld, floa
    }
    if (accuracyDeg == accuracyDeg && accuracyDeg > Pcfg.maxAccuracyDeg) // NaN = unknown, accepted
       return svBadCompass;
-   if (rate > Pcfg.maxRateDps)
-      return svTooFast;
 
-   int band = bandOf(pitch);
+   int band = allowedBand(pitch); // a pose off the guided band is red on screen: never kept
 
    if (band < 0)
       return svOffBand;
+   if (rate > Pcfg.maxRateDps)
+      return svTooFast;
 
    if (Pcfg.fanDeg > 0.f && !PfanSet) // the first steady frame is the aim at the target corner
    {
@@ -252,6 +311,14 @@ TSpinVerdict TSpinTracker::Offer(QWORD stampNs, const TMat4 &cameraToWorld, floa
 
    if (bin < 0)
       return svOutside;
+   if (Pbin[band][bin] && Pretake[band][bin] && allowKeep) // a frame found wrong: this steady view replaces it
+   {
+      Pretake[band][bin] = false;
+      Pkept[band][bin] = heading;
+      PkeptBand = band;
+      PkeptBin = bin;
+      return svKeep;
+   }
    if (Pbin[band][bin] || nearKept(band, bin, heading) || !allowKeep)
       return svCovered;
    Pbin[band][bin] = true;
@@ -260,6 +327,13 @@ TSpinVerdict TSpinTracker::Offer(QWORD stampNs, const TMat4 &cameraToWorld, floa
    PkeptBin = bin;
    Pfilled++;
    return svKeep;
+}
+
+//--------------------------------------------------------------------------------
+void TSpinTracker::Reopen(int band, int bin)
+{
+   if (band >= 0 && band < Pcfg.bandCount && bin >= 0 && bin < Pcfg.headingBins && Pbin[band][bin])
+      Pretake[band][bin] = true;
 }
 
 //--------------------------------------------------------------------------------

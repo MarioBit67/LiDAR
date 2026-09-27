@@ -14,7 +14,8 @@
 enum {
    frameMetaVersion = 1,
    frameMetaIdLen   = 9, // "LIDARCAP\0"
-   frameMetaSize    = 300
+   frameMetaSize    = 320, // grew from 300 (v1 blocks of 300 bytes still decode)
+   frameMetaSizeV1  = 300
 };
 
 enum THeadingRef {
@@ -56,6 +57,10 @@ struct TFrameMeta {
                orthoErrCdeg;        // orthogonality error, centidegrees (0xFFFF unknown)
    BYTE        vanishFlags,         // TVanishFlag bits; 0 = not measured (older blocks)
                axisVerdict;         // TAxisVerdict
+   float       forward[3],          // gyroscope attitude: world direction the camera looks at (normal to the screen;
+               rollDeg;             // y up) and its roll about it, gravity as zero (NaN straight up/down)
+   float       blurPx,              // FFT blur (capBlur): median Gaussian sigma over the textured tiles, pixels
+               blurMinPx;           // and the sharpest tile alone (NaN: not measured, plain image)
 
    void Encode(TByteBuf &out) const;           // exactly frameMetaSize bytes
    bool Decode(LPCBYTE p, size_t n);

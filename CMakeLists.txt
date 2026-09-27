@@ -36,7 +36,9 @@ add_library(lidarCore STATIC
    core/src/capFrameMeta.cpp
    core/src/capEXIF.cpp
    core/src/capVanish.cpp
-   core/src/capLayout.cpp)
+   core/src/capLayout.cpp
+   core/src/capBlur.cpp
+   core/src/capDoor.cpp)
 target_include_directories(lidarCore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/core/include)
 target_compile_definitions(lidarCore PRIVATE SHARED_LIBRARY_BUILD)
 target_link_libraries(lidarCore PUBLIC lidarShared)

@@ -96,6 +96,32 @@ float geomPitchDeg(const TVec3 &dir)
    return atan2f(dir.y, horiz)*cRadToDeg;
 }
 
+/*--------------------------------------------------------------------------------
+   Roll of the camera about its forward axis, gravity as zero: the angle from world up (projected
+   onto the image plane) to the camera's up axis, positive clockwise as the camera sees it. NaN
+   when the camera looks almost straight up or down (world up has no image-plane direction).
+  --------------------------------------------------------------------------------*/
+float geomRollDeg(const TMat4 &cameraToWorld)
+{
+   TVec3 f = cameraToWorld.Forward(),
+         cy = { 0.f, 1.f, 0.f },
+         up = cameraToWorld.RotateVector(cy);
+   float d = f.y; // world up . forward
+   TVec3 ref = { -d*f.x, 1.f - d*f.y, -d*f.z };
+   float len = sqrtf(ref.x*ref.x + ref.y*ref.y + ref.z*ref.z);
+
+   if (len < 0.14f) // within ~8 degrees of the zenith or nadir
+      return NAN;
+   ref.x /= len;
+   ref.y /= len;
+   ref.z /= len;
+
+   // sin from (ref x up) . forward, cos from ref . up; forward points away from the viewer
+   TVec3 c = { ref.y*up.z - ref.z*up.y, ref.z*up.x - ref.x*up.z, ref.x*up.y - ref.y*up.x };
+
+   return atan2f(-(c.x*f.x + c.y*f.y + c.z*f.z), ref.x*up.x + ref.y*up.y + ref.z*up.z)*cRadToDeg;
+}
+
 //--------------------------------------------------------------------------------
 float geomHeadingDiffDeg(float a, float b)
 {

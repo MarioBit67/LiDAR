@@ -5,6 +5,8 @@
 #include "capEXIF.h"
 #include "capVanish.h"
 #include "capLayout.h"
+#include "capBlur.h"
+#include "capDoor.h"
 #include "capMosaic.h"
 #include "alloc.h"
 #include "json.h"
@@ -19,7 +21,7 @@
 
 /* capInspect - desktop inspection of a capture session.
  *
- *   capInspect <sessionDir> <outDir> [--vanish] [--ceiling meters] [--mingrad n] [--edges] [--rectify] [--walls]
+ *   capInspect <sessionDir> <outDir> [--vanish] [--ceiling meters] [--mingrad n] [--edges] [--rectify] [--walls] [--blur] [--doors]
  *
  * Extracts every keyframe JPEG (with its embedded LIDARCAP block) to outDir, writes frames.csv with the
  * per-frame correlation metadata and poses.csv with the attitude stream, and prints a summary. Frames
@@ -412,6 +414,161 @@ static void inspectFrontal(const TImageRecord &img, LPCBYTE bgr, const TVec3 &up
    fclose(bmp);
 }
 
+static float inspectDoorTiltDeg = 0.f; // --door-tilt deg
+static bool  inspectRectOut = false, // --rectify: write the frontal views
+             inspectDoors = false;   // --doors: look for doors in them
+
+/*--------------------------------------------------------------------------------
+   Doors on one frontal view (--doors): the view is built from the frame's YUV (BGR converted, chroma
+   halved like the camera's), searched, printed and written as door_NNN_paredeK.bmp - gray view, jambs
+   and head in green, the ceiling line in yellow, the horizon in blue.
+  --------------------------------------------------------------------------------*/
+static void inspectDoorView(const TImageRecord &img, LPCBYTE bgr, const TVec3 &up, const TVec3 &n, LPCSTR outDir,
+                            int index, int wall)
+{
+   const int    w = (int)img.width,
+                h = (int)img.height,
+                cw = w/2,
+                ch = h/2,
+                vw = doorViewW,
+                vh = doorViewH,
+                rowBytes = (vw*3 + 3) & ~3;
+   TAlloc<BYTE> y((size_t)w*h),
+                u((size_t)cw*ch),
+                v((size_t)cw*ch),
+                vy((size_t)vw*vh),
+                vu((size_t)vw*vh),
+                vv((size_t)vw*vh),
+                valid((size_t)vw*vh),
+                out((size_t)rowBytes*vh);
+
+   for (int r = 0; r < h; r++)
+      for (int c = 0; c < w; c++)
+      {
+         LPCBYTE p = bgr + ((size_t)r*w + c)*3u;
+         float   b = (float)p[0],
+                 g = (float)p[1],
+                 rr = (float)p[2],
+                 yy = 0.299f*rr + 0.587f*g + 0.114f*b;
+
+         y[(size_t)r*w + c] = (BYTE)(yy + 0.5f);
+         if (r%2 == 0 && c%2 == 0 && r/2 < ch && c/2 < cw)
+         {
+            u[(size_t)(r/2)*cw + c/2] = (BYTE)fmaxf(0.f, fminf(255.f, 128.f + 0.564f*(b - yy)));
+            v[(size_t)(r/2)*cw + c/2] = (BYTE)fmaxf(0.f, fminf(255.f, 128.f + 0.713f*(rr - yy)));
+         }
+      }
+
+   TYUVImage yuv = { w, h, y(), w, u(), v(), cw, 1 };
+   TDoorView view = { vy(), vu(), vv(), valid(), 0.f, 0.f, 0.f };
+   TDoor     doors[doorMaxDoors];
+   TVec3     upT = up; // --door-tilt: the vertical turned about the camera x axis (sensitivity to a tilt error)
+
+   if (inspectDoorTiltDeg != 0.f)
+   {
+      float t = inspectDoorTiltDeg*0.01745329f,
+            c = cosf(t),
+            s = sinf(t);
+
+      upT.y = up.y*c - up.z*s;
+      upT.z = up.y*s + up.z*c;
+   }
+   doorFrontal(yuv, img.intr, upT, n, view);
+
+   TDoorStats stats = {};
+   int        found = doorDetect(view, doors, doorMaxDoors, &stats);
+
+   printf("  doors frame %03d wall %d: %d jambs, %d pairs; rejected shape %d head %d overrun %d above %d color %d; %d found\n",
+          index, wall, stats.jambs, stats.pairs, stats.shape, stats.head, stats.overrun, stats.above, stats.color, found);
+   for (int i = 0; i < stats.jambs; i++)
+      printf("    jamb col %d rows %d-%d\n", stats.jambCol[i], stats.jambTop[i], stats.jambBottom[i]);
+   for (int i = 0; i < found; i++)
+   {
+      const TDoor &d = doors[i];
+
+      printf("  door frame %03d wall %d: cols %.0f-%.0f head %.0f floor %.0f crease %.0f -> crease/head %.3f camera/head %.3f"
+             " (crease %.2f m, camera %.2f m at 2.10) color %.1f knob %d corner %d score %.2f\n", index, wall, d.leftCol,
+             d.rightCol, d.headRow, d.floorRow, d.creaseRow, d.creaseOverHead, d.cameraOverHead, 2.1f*d.creaseOverHead,
+             2.1f*d.cameraOverHead, d.colorGap, d.knob ? 1 : 0, d.nearCorner ? 1 : 0, d.score);
+   }
+   for (int r = 0; r < vh; r++)
+   {
+      LPBYTE row = out() + (size_t)(vh - 1 - r)*rowBytes; // bottom-up
+
+      for (int c = 0; c < vw; c++)
+      {
+         BYTE g = vy[(size_t)r*vw + c];
+
+         row[c*3] = g;
+         row[c*3 + 1] = g;
+         row[c*3 + 2] = g;
+      }
+   }
+
+   // marks: 0 green (door), 1 yellow (ceiling line), 2 blue (horizon)
+   for (int i = 0; i < found; i++)
+      for (int m = 0; m < 5; m++)
+      {
+         const TDoor &d = doors[i];
+         bool         rowMark = m >= 2;
+         float        at = m == 0 ? d.leftCol : (m == 1 ? d.rightCol : (m == 2 ? d.headRow : (m == 3 ? d.creaseRow
+                                                                                                  : view.horizonRow)));
+         BYTE         color[3] = { 0u, 255u, 0u };
+
+         if (isnan(at))
+            continue;
+         if (m == 3)
+         {
+            color[0] = 0u;
+            color[1] = 255u;
+            color[2] = 255u;
+         }
+         if (m == 4)
+         {
+            color[0] = 255u;
+            color[1] = 0u;
+            color[2] = 0u;
+         }
+         for (int t = 0; t < (rowMark ? vw : vh); t++)
+         {
+            int r = rowMark ? (int)at : t,
+                c = rowMark ? t : (int)at;
+
+            if (rowMark && m != 4 && (c < (int)d.leftCol - 40 || c > (int)d.rightCol + 40))
+               continue;
+            if (!rowMark && (r < (int)d.headRow || r > (int)d.floorRow))
+               continue;
+            if (r < 0 || r >= vh || c < 0 || c >= vw)
+               continue;
+
+            LPBYTE p = out() + (size_t)(vh - 1 - r)*rowBytes + c*3;
+
+            p[0] = color[0];
+            p[1] = color[1];
+            p[2] = color[2];
+         }
+      }
+
+   char path[sessionPathMax];
+
+   snprintf(path, sizeof(path), "%s/door_%03d_parede%d.bmp", outDir, index, wall);
+
+   FILE *bmp = fopen(path, "wb");
+
+   if (!bmp)
+      return;
+
+   DWORD imageBytes = (DWORD)rowBytes*(DWORD)vh,
+         header[13] = { 54u + imageBytes, 0u, 54u, 40u, (DWORD)vw, (DWORD)vh, 0x00180001u, 0u, imageBytes, 2835u, 2835u,
+                        0u, 0u };
+   BYTE  magic[2] = { 'B', 'M' };
+
+   fwrite(magic, 1u, 2u, bmp);
+   fwrite(header, 4u, 13u, bmp);
+   fwrite(out(), 1u, imageBytes, bmp);
+   fclose(bmp);
+}
+
 /*--------------------------------------------------------------------------------
    Frontal views of one keyframe (--rectify). The room axes in camera axes come from the frame's
    own vanishing points (vertical measured or tilt-calibrated; A measured, or B turned about the
@@ -493,7 +650,10 @@ static void inspectRectify(const TImageRecord &img, const TVanishResult &vr, flo
       char  path[sessionPathMax];
 
       snprintf(path, sizeof(path), "%s/rect_%03d_parede%d.bmp", outDir, index, wall);
-      inspectFrontal(img, bgr(), up, n, path);
+      if (inspectRectOut)
+         inspectFrontal(img, bgr(), up, n, path);
+      if (inspectDoors)
+         inspectDoorView(img, bgr(), up, n, outDir, index, wall);
       if (pass == 0 && atan2f(across, along) < 25.f*0.01745329f)
          break; // aimed at this wall: one frontal view
    }
@@ -571,9 +731,11 @@ static void inspectMeasure(const TImageRecord &img, const TFrameMeta &meta, bool
 static void inspectWalls(const TLayoutPlan &plan)
 {
    for (int i = 0; i < plan.wallCount && i < layoutMaxWalls; i++)
-      printf("    wall %c = %.2f along %.2f..%.2f weight %.0f\n", plan.wallKind[i] ? 'w' : 'u', plan.wallOffset[i],
-             plan.wallA0[i], plan.wallA1[i], plan.wallWeight[i]);
+      printf("    wall %c = %.2f along %.2f..%.2f weight %.0f views %d\n", plan.wallKind[i] ? 'w' : 'u', plan.wallOffset[i],
+             plan.wallA0[i], plan.wallA1[i], plan.wallWeight[i], plan.wallViews[i]);
 }
+
+static bool inspectShowCreases = false; // --creases: list every crease the walls were clustered from
 
 /*--------------------------------------------------------------------------------
    Floor plan of the finished room: printed and drawn as plan_room<N>.svg (u up, w right, 50 px
@@ -598,10 +760,20 @@ static bool inspectPlan(LPCSTR outDir, DWORD room, const TRoomLayout &layout, co
    printf("  plan room %lu: %.2f x %.2f m, area %.2f m2, camera height %.2f m (%s), ceiling %.2f m, %d corners%s\n",
           (unsigned long)room, plan.extentU, plan.extentW, plan.areaM2, plan.cameraHeightM,
           plan.heightSolved ? "solved" : "default", plan.ceilingM, plan.vertexCount, plan.complete ? "" : " (incomplete)");
-   printf("    door head: %s, scale %.3f (assumed ceiling %.2f m)\n", plan.doorFound ? "found" : "none", plan.doorScale,
-          plan.assumedCeilingM);
+   printf("    door head: %s, scale %.3f (assumed ceiling %.2f m, implied %.2f m)%s\n", plan.doorFound ? "found" : "none",
+          plan.doorScale, plan.assumedCeilingM, plan.impliedCeilingM,
+          plan.ceilingSnapped ? " - plan scaled to the typical ceiling" : "");
+   for (int i = 0; i < plan.centerCount; i++)
+      printf("    center %d: u %.2f w %.2f\n", i, plan.centers[i].u, plan.centers[i].w);
+   for (int i = 0; i < plan.openDoors; i++)
+      printf("    open door: wall %d (%c = %.2f) at %.2f\n", plan.openDoorWall[i], plan.wallKind[plan.openDoorWall[i]] ? 'w' : 'u',
+             plan.wallOffset[plan.openDoorWall[i]], plan.openDoorAt[i]);
    printf("    camera height from %d room corners; %d creases from the corner stations\n", plan.heightCorners,
           plan.stationLines);
+   for (int i = 0; inspectShowCreases && i < plan.creaseCount; i++)
+      printf("    crease: frame %d station %u side %u dist %.2f along %.2f..%.2f weight %.0f\n", plan.creases[i].frame,
+             (unsigned)plan.creases[i].station, (unsigned)plan.creases[i].half, plan.creases[i].dist, plan.creases[i].a0,
+             plan.creases[i].a1, plan.creases[i].weight);
    for (int i = 0; i < plan.vertexCount; i++)
       printf("    corner %d: u %.2f w %.2f %s\n", i, plan.verts[i].u, plan.verts[i].w, plan.convex[i] ? "" : "(reflex)");
    for (int i = 0; i < plan.stationCount; i++)
@@ -1000,7 +1172,7 @@ int main(int argc, LPSTR *argv)
    abSetIdlePriority();
    if (argc < 3)
    {
-      fprintf(stderr, "usage: capInspect <sessionDir> <outDir> [--vanish] [--ceiling meters] [--mingrad n] [--edges] [--rectify]\n");
+      fprintf(stderr, "usage: capInspect <sessionDir> <outDir> [--vanish] [--ceiling meters] [--mingrad n] [--edges] [--rectify] [--blur]\n");
       return 2;
    }
 
@@ -1024,7 +1196,8 @@ int main(int argc, LPSTR *argv)
                   edgeImages = false,
                   rectify = false,
                   walls = false,
-                  overlay = false;
+                  overlay = false,
+                  measureBlur = false;
    DWORD          statRoom = ~0ul;
    TRoomLayout    layout;
    TTiltBias      tilt;
@@ -1053,8 +1226,16 @@ int main(int argc, LPSTR *argv)
          edgeImages = true;
       else if (!strcmp(argv[i], "--rectify"))
          rectify = true;
+      else if (!strcmp(argv[i], "--doors"))
+         inspectDoors = true;
+      else if (!strcmp(argv[i], "--door-tilt") && i + 1 < argc)
+         inspectDoorTiltDeg = (float)atof(argv[++i]);
       else if (!strcmp(argv[i], "--walls"))
          walls = true;
+      else if (!strcmp(argv[i], "--creases"))
+         inspectShowCreases = true;
+      else if (!strcmp(argv[i], "--blur"))
+         measureBlur = true;
       else if (!strcmp(argv[i], "--overlay"))
          overlay = true;
       else if (!strcmp(argv[i], "--refine") && i + 1 < argc)
@@ -1066,6 +1247,7 @@ int main(int argc, LPSTR *argv)
       else if (!strcmp(argv[i], "--spin-radius") && i + 1 < argc)
          spinRadiusM = (float)atof(argv[++i]);
 
+   inspectRectOut = rectify;
 #ifdef _WIN32
    CoInitializeEx(NULL, COINIT_MULTITHREADED);
 #endif
@@ -1091,7 +1273,7 @@ int main(int argc, LPSTR *argv)
    }
    fprintf(frames, "seq,room,station,kind,corner,target,band,bin,headingDeg,pitchDeg,sensorNs,width,height,fx,fy,cx,cy,"
                    "jpegBytes,file,vanishFlags,axisVerdict,roomAxisDeg,axisDevDeg,tiltErrDeg,orthoErrDeg,supV,supA,supB,"
-                   "edges\r\n");
+                   "edges,fwdX,fwdY,fwdZ,rollDeg,blurPx,blurMinPx,blurTextured\r\n");
    fprintf(poses, "sensorNs,headingDeg,pitchDeg,tracking\r\n");
    while (reader.Next(v))
    {
@@ -1202,7 +1384,7 @@ int main(int argc, LPSTR *argv)
          }
          snprintf(path, sizeof(path), "%s/edges_%03d.bmp", argv[2], images);
          inspectMeasure(img, meta, hasMeta, hasAppVanish ? &appVanish : NULL, force, vcfg, axis, edges, layout,
-                        tilt, edgeImages ? path : NULL, rectify ? argv[2] : NULL, images, vm,
+                        tilt, edgeImages ? path : NULL, rectify || inspectDoors ? argv[2] : NULL, images, vm,
                         images < inspectMaxFrames ? frameVr[images] : scratchVr);
          if (images < inspectMaxFrames)
             frameInfo[images] = (DWORD)(hasMeta ? meta.roomIndex : 0u)*inspectStations + (hasMeta ? meta.stationIndex : 0u);
@@ -1217,9 +1399,44 @@ int main(int argc, LPSTR *argv)
                  geomHeadingDeg(img.cameraToWorld.Forward()), geomPitchDeg(img.cameraToWorld.Forward()),
                  (unsigned long long)v.stampNs, (unsigned long)img.width, (unsigned long)img.height, img.intr.fx,
                  img.intr.fy, img.intr.cx, img.intr.cy, (unsigned long)img.pixelBytes, images);
-         fprintf(frames, "%u,%u,%.2f,%.2f,%.2f,%.2f,%lu,%lu,%lu,%lu\r\n", (unsigned)vm.flags, (unsigned)vm.verdict,
+         fprintf(frames, "%u,%u,%.2f,%.2f,%.2f,%.2f,%lu,%lu,%lu,%lu,", (unsigned)vm.flags, (unsigned)vm.verdict,
                  vm.roomAxisDeg, vm.deviationDeg, vm.tiltErrDeg, vm.orthoErrDeg, (unsigned long)vm.support[0],
                  (unsigned long)vm.support[1], (unsigned long)vm.support[2], (unsigned long)vm.edges);
+
+         // the gyroscope attitude as the frame recorded it (older blocks: derived from their pose)
+         TVec3 fwd = img.cameraToWorld.Forward();
+         float roll = geomRollDeg(img.cameraToWorld);
+
+         if (hasMeta)
+         {
+            fwd.x = meta.forward[0];
+            fwd.y = meta.forward[1];
+            fwd.z = meta.forward[2];
+            roll = meta.rollDeg;
+         }
+         fprintf(frames, "%.5f,%.5f,%.5f,%.2f,", fwd.x, fwd.y, fwd.z, roll);
+
+         // blur as the app measured it on the raw luma, or (--blur) measured here on the decoded JPEG
+         TBlurResult br = {};
+
+         br.sharpPx = hasMeta ? meta.blurMinPx : NAN;
+         br.medianPx = hasMeta ? meta.blurPx : NAN;
+         br.textured = -1;
+         if (measureBlur)
+         {
+            TAlloc<BYTE> luma((size_t)img.width*img.height);
+
+            if (inspectDecode(img.pixels, img.pixelBytes, img.width, img.height, false, luma))
+            {
+               blurMeasure(luma(), (int)img.width, (int)img.height, (int)img.width, br);
+               printf("  blur frame %03d: %5.2f px (median %5.2f, %d/%d textured) tiles", images, br.sharpPx,
+                      br.medianPx, br.textured, br.tiles);
+               for (int t = 0; t < blurGridSide*blurGridSide; t++)
+                  printf(" %5.2f", br.tilePx[t]);
+               printf("\n");
+            }
+         }
+         fprintf(frames, "%.2f,%.2f,%d\r\n", br.medianPx, br.sharpPx, br.textured);
          images++;
       }
       else if (v.type == rtVanish)

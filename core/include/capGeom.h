@@ -36,6 +36,9 @@ float geomHeadingDeg(const TVec3 &dir);
 // Elevation of a world direction above the horizon, [-90, 90]
 float geomPitchDeg(const TVec3 &dir);
 
+// Roll about the camera forward axis, gravity as zero: degrees, clockwise as the camera sees it (NaN straight up/down)
+float geomRollDeg(const TMat4 &cameraToWorld);
+
 // Smallest absolute difference between two headings, [0, 180]
 float geomHeadingDiffDeg(float a, float b);
 

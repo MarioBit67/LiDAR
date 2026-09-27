@@ -19,7 +19,7 @@ enum TSpinVerdict {
    svKeep,        // new viewpoint, stored
    svCovered,     // bin already filled
    svTooFast,     // turning too fast, motion blur likely
-   svOffBand,     // camera pitch outside every band
+   svOffBand,     // camera pitch outside the guided band (outside every band once all are in)
    svBadCompass,  // heading accuracy too poor
    svDrifted,     // operator walked away from the spin center
    svOutside      // heading outside the aimed fan (corner stations)
@@ -48,6 +48,7 @@ struct TSpinConfig {
     * corner's floor and ceiling creases both fit a normal lens) and a 60-degree fan so both walls
     * meeting at the target corner are seen. */
    static TSpinConfig ForCorner(float hfovDeg, float vfovDeg);
+   static TSpinConfig ForFloorView(float hfovDeg, float vfovDeg); // one view down to the floor, aimed with AimFan
 };
 
 class TSpinTracker
@@ -74,6 +75,10 @@ class TSpinTracker
    float BinWidthDeg(void) const { return binWidthDeg(); }
    float BinCenterDeg(int bin, float aimDeg) const; // heading of a bin center; a fan not yet aimed centers on aimDeg
    bool  AimedEmpty(int &band, int &bin) const;       // the bin the camera aims at now is still empty
+   void  Reopen(int band, int bin); // its frame turned out wrong: the next steady view replaces it (still counts)
+   void  AimFan(float headingDeg);  // a fan centered on this heading instead of the first steady aim
+   int   GuidedBand(void) const;    // the band to hold now (ceiling first); -1 once every bin is in
+   bool  PoseAllowed(void) const;   // the last pitch lies in the guided band: false = red view, nothing kept
 
    TSpinTracker(const TSpinTracker &) = delete;
    TSpinTracker &operator=(const TSpinTracker &) = delete;
@@ -82,12 +87,14 @@ class TSpinTracker
 
  private:
    int  bandOf(float pitchDeg) const;
+   int  allowedBand(float pitchDeg) const; // bandOf, but -1 outside the guided band
    bool nearKept(int band, int bin, float headingDeg) const;
    int  binOf(float headingDeg) const; // -1 outside the fan
    float binWidthDeg(void) const;
 
    TSpinConfig Pcfg;
    bool        Pbin[spinMaxBands][spinMaxBins],
+               Pretake[spinMaxBands][spinMaxBins], // kept, but its frame may be replaced (far off the room axes)
                PhasLast,
                PhasOrigin,
                PfanSet;

@@ -1,7 +1,8 @@
 #include "capFrameMeta.h"
 #include "libDiscipline.h"
 
-static const BYTE cMetaId[frameMetaIdLen] = { 'L', 'I', 'D', 'A', 'R', 'C', 'A', 'P', 0 };
+static const BYTE cMetaId[frameMetaIdLen] = { 'L', 'I', 'D', 'A', 'R', 'C', 'A', 'P', 0 },
+                  cPad[4] = { 0, 0, 0, 0 }; // the reserved tail of the 300-byte blocks
 
 //--------------------------------------------------------------------------------
 static void metaPutMat(TByteBuf &out, const TMat4 &m)
@@ -18,6 +19,21 @@ static TMat4 metaGetMat(TByteReader &r)
    for (int i = 0; i < 16; i++)
       m.m[i] = r.GetFloat();
    return m;
+}
+
+//--------------------------------------------------------------------------------
+// Blur in centipixels plus one: 0 is "not measured" (NaN), so the zeros of older blocks read right
+static WORD metaBlurWord(float px)
+{
+   if (isnan(px) || px < 0.f)
+      return 0u;
+   return px >= 655.f ? (WORD)0xFFFFu : (WORD)(px*100.f + 1.5f);
+}
+
+//--------------------------------------------------------------------------------
+static float metaBlurPx(WORD w)
+{
+   return w ? (float)(w - 1u)/100.f : NAN;
 }
 
 //--------------------------------------------------------------------------------
@@ -67,6 +83,12 @@ void TFrameMeta::Encode(TByteBuf &out) const
    out.PutWord(orthoErrCdeg);
    out.PutByte(vanishFlags);
    out.PutByte(axisVerdict);
+   out.PutBytes(cPad, 4u);
+   for (int i = 0; i < 3; i++)
+      out.PutFloat(forward[i]);
+   out.PutFloat(rollDeg);
+   out.PutWord(metaBlurWord(blurPx)); // the last 4 bytes of the block
+   out.PutWord(metaBlurWord(blurMinPx));
    while (out.Ok() && out.Size() - start < (size_t)frameMetaSize)
       out.PutByte(0u); // reserved
 }
@@ -77,7 +99,8 @@ bool TFrameMeta::Decode(LPCBYTE p, size_t n)
    TByteReader r(p, n);
    BYTE        id[frameMetaIdLen];
 
-   if (n != (size_t)frameMetaSize || !r.GetBytes(id, frameMetaIdLen) || memcmp(id, cMetaId, frameMetaIdLen))
+   if ((n != (size_t)frameMetaSize && n != (size_t)frameMetaSizeV1) || !r.GetBytes(id, frameMetaIdLen)
+       || memcmp(id, cMetaId, frameMetaIdLen))
       return false;
    if (r.GetWord() != frameMetaVersion)
       return false;
@@ -121,6 +144,29 @@ bool TFrameMeta::Decode(LPCBYTE p, size_t n)
    orthoErrCdeg = r.GetWord();
    vanishFlags = r.GetByte();
    axisVerdict = r.GetByte();
+   if (n == (size_t)frameMetaSize)
+   {
+      BYTE pad[4];
+
+      r.GetBytes(pad, 4u);
+      for (int i = 0; i < 3; i++)
+         forward[i] = r.GetFloat();
+      rollDeg = r.GetFloat();
+      blurPx = metaBlurPx(r.GetWord()); // zeros in blocks written before the blur
+      blurMinPx = metaBlurPx(r.GetWord());
+   }
+   else
+   {
+      // a 300-byte block: the same attitude from its pose
+      TVec3 f = cameraToWorld.Forward();
+
+      forward[0] = f.x;
+      forward[1] = f.y;
+      forward[2] = f.z;
+      rollDeg = geomRollDeg(cameraToWorld);
+      blurPx = NAN;
+      blurMinPx = NAN;
+   }
    return r.Ok();
 }
 

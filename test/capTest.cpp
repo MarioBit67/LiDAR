@@ -11,6 +11,7 @@
 #include "capEXIF.h"
 #include "capVanish.h"
 #include "capLayout.h"
+#include "capBlur.h"
 #ifdef _WIN32
 #include <direct.h>
 #endif
@@ -48,6 +49,29 @@ static TMat4 yawPose(float hDeg)
    m.m[2] = -s;
    m.m[8] = s;
    m.m[10] = c;
+   return m;
+}
+
+//--------------------------------------------------------------------------------
+// Camera at heading hDeg, pitch pDeg, no roll (camera x right, y up, looking down -z)
+static TMat4 headPitchPose(float hDeg, float pDeg)
+{
+   float h = hDeg*0.01745329252f,
+         p = pDeg*0.01745329252f;
+   TVec3 f = { cosf(p)*sinf(h), sinf(p), -cosf(p)*cosf(h) },
+         r = { cosf(h), 0.f, sinf(h) },
+         u = { r.y*f.z - r.z*f.y, r.z*f.x - r.x*f.z, r.x*f.y - r.y*f.x };
+   TMat4 m = TMat4::Identity();
+
+   m.m[0] = r.x;
+   m.m[1] = r.y;
+   m.m[2] = r.z;
+   m.m[4] = u.x;
+   m.m[5] = u.y;
+   m.m[6] = u.z;
+   m.m[8] = -f.x;
+   m.m[9] = -f.y;
+   m.m[10] = -f.z;
    return m;
 }
 
@@ -128,6 +152,25 @@ static void testSpin(void)
    checkThat(moto.bandCount == 2 && moto.headingBins == 14);
    checkThat(closeTo(moto.bandPitchDeg[0], -20.75f, 0.01f) && closeTo(moto.bandPitchDeg[1], 20.75f, 0.01f));
    checkThat(ultra.bandCount == 1 && ultra.headingBins == 12);
+
+   // one band at a time, ceiling first: down while the ceiling is due is red and never kept, then the opposite
+   TSpinTracker guided(moto);
+   QWORD        gns = 1000000000u;
+
+   checkThat(guided.GuidedBand() == 1);
+   checkThat(guided.Offer(gns, headPitchPose(0.f, -10.f), NAN) == svOffBand && !guided.PoseAllowed());
+   gns += 1000000000u;
+   checkThat(guided.Offer(gns, headPitchPose(0.f, 10.f), NAN) == svKeep && guided.PoseAllowed());
+   for (int bin = 1; bin < moto.headingBins; bin++)
+   {
+      gns += 2000000000u; // 26-degree bins, 2 s apart: slower than the blur limit
+      guided.Offer(gns, headPitchPose(((float)bin + 0.5f)*360.f/(float)moto.headingBins, 10.f), NAN);
+   }
+   checkThat(guided.BandFilled(1) == moto.headingBins && guided.GuidedBand() == 0);
+   gns += 1000000000u;
+   checkThat(guided.Offer(gns, headPitchPose(0.f, 10.f), NAN) == svOffBand && !guided.PoseAllowed());
+   gns += 1000000000u;
+   checkThat(guided.Offer(gns, headPitchPose(0.f, -10.f), NAN) == svKeep);
 
    // corner station: the first steady frame sets the aim; only a 60-degree fan around it counts
    TSpinTracker corner(TSpinConfig::ForCorner(54.f, 68.5f));
@@ -432,29 +475,6 @@ static void testJPEG(void)
 }
 
 //--------------------------------------------------------------------------------
-// Camera at heading hDeg, pitch pDeg, no roll (camera x right, y up, looking down -z)
-static TMat4 headPitchPose(float hDeg, float pDeg)
-{
-   float h = hDeg*0.01745329252f,
-         p = pDeg*0.01745329252f;
-   TVec3 f = { cosf(p)*sinf(h), sinf(p), -cosf(p)*cosf(h) },
-         r = { cosf(h), 0.f, sinf(h) },
-         u = { r.y*f.z - r.z*f.y, r.z*f.x - r.x*f.z, r.x*f.y - r.y*f.x };
-   TMat4 m = TMat4::Identity();
-
-   m.m[0] = r.x;
-   m.m[1] = r.y;
-   m.m[2] = r.z;
-   m.m[4] = u.x;
-   m.m[5] = u.y;
-   m.m[6] = u.z;
-   m.m[8] = -f.x;
-   m.m[9] = -f.y;
-   m.m[10] = -f.z;
-   return m;
-}
-
-//--------------------------------------------------------------------------------
 // Tile grid (0.5 m) on a surface: dark lines along both in-plane room directions
 static int roomShade(float s, float t, int base)
 {
@@ -682,7 +702,7 @@ static void testLayout(void)
    printPlan("rectangle", plan);
    checkThat(plan.heightSolved && closeTo(plan.cameraHeightM, 1.4f, 0.06f));
    checkThat(closeTo(plan.extentU, 4.4f, 0.15f) && closeTo(plan.extentW, 3.2f, 0.15f));
-   checkThat(plan.vertexCount == 4 && plan.stationCount == 4);
+   checkThat(plan.vertexCount == 4 && plan.stationCount == 4 && plan.centerCount == 1);
    for (int i = 0; i < plan.stationCount; i++)
       checkThat(plan.targetVertex[i] == (BYTE)((plan.stationVertex[i] + 2)%4)); // the opposite corner
 
@@ -692,14 +712,16 @@ static void testLayout(void)
    /* five convex corners plus the reflex one; the corner facing it aims at both arms and back at it (user's map,
       2026-09-27) */
    checkThat(plan.vertexCount == 6 && plan.stationCount == 8);
+   checkThat(plan.centerCount == 3); // one middle per arm of the L and one where they meet
 
    // a wrong ceiling assumption (2.80 for a 2.60 room): the 2.10 m door head measures the scale error
    checkThat(spinLayout(rect, 4, 17.f, 2.8f, plan));
    printPlan("rectangle, ceiling assumed 2.80", plan);
    printf("capTest: layout door: found %d scale %.3f ceiling measured %.2f\n", (int)plan.doorFound, plan.doorScale,
           plan.ceilingM);
-   checkThat(plan.doorFound && closeTo(plan.doorScale, 2.6f/2.8f, 0.03f)); // measured (reported, not applied)
-   checkThat(closeTo(plan.ceilingM, 2.8f, 1e-4f));
+   checkThat(plan.doorFound && closeTo(plan.doorScale, 2.6f/2.8f, 0.03f));
+   // the heads imply 2.60: nearer the typical 2.70 than the assumed 2.80, the plan is scaled to 2.70 (error 8% -> 4%)
+   checkThat(plan.ceilingSnapped && closeTo(plan.ceilingM, 2.7f, 1e-4f));
 }
 
 //--------------------------------------------------------------------------------
@@ -776,8 +798,11 @@ static void testVanish(void)
    meta.orthoErrCdeg = 0xFFFFu;
    meta.vanishFlags = r.flags;
    meta.axisVerdict = (BYTE)avAligned;
+   meta.blurPx = 2.37f;
+   meta.blurMinPx = NAN;
    meta.Encode(buf);
    checkThat(buf.Size() == (size_t)frameMetaSize && back.Decode(buf.Data(), buf.Size()));
+   checkThat(closeTo(back.blurPx, 2.37f, 0.01f) && isnan(back.blurMinPx));
    checkThat(closeTo(back.roomAxisDeg, r.roomAxisDeg, 1e-4f) && back.tiltErrCdeg == 37u && back.orthoErrCdeg == 0xFFFFu);
    checkThat(back.vanishFlags == r.flags && back.axisVerdict == (BYTE)avAligned);
 
@@ -791,6 +816,79 @@ static void testVanish(void)
    rec.support[2] = r.support[2];
    rec.Encode(recBuf);
    checkThat(recBack.Decode(recBuf.Data(), recBuf.Size()) && recBack.seq == 9u && recBack.support[2] == r.support[2]);
+}
+
+/*--------------------------------------------------------------------------------
+   Blur: random gray blocks over several octaves (sharp steps at every scale, like tile joints and
+   furniture edges, with the 1/f^2 spectrum of a scene) against the same image through three box passes (close to a Gaussian of sigma ~6 px) and a
+   plain gray image (no texture: no verdict).
+  --------------------------------------------------------------------------------*/
+static void testBlur(void)
+{
+   const int    side = 1200;
+   TAlloc<BYTE> sharp((size_t)side*side),
+                soft((size_t)side*side),
+                line((size_t)side);
+   DWORD        seed = 12345u;
+   TBlurResult  r = {};
+
+   memset(sharp(), 128, (size_t)side*side);
+   for (int block = 150; block >= 3; block /= 2) // octaves 150..4 px, the same amplitude each: 1/f^2
+   {
+      int amp = 14;
+
+      for (int by = 0; by*block < side; by++)
+         for (int bx = 0; bx*block < side; bx++)
+         {
+            seed = seed*1664525u + 1013904223u;
+
+            int delta = (int)((seed >> 16)%(DWORD)(2*amp + 1)) - amp;
+
+            for (int y = by*block; y < (by + 1)*block && y < side; y++)
+               for (int x = bx*block; x < (bx + 1)*block && x < side; x++)
+               {
+                  int v = (int)sharp[(size_t)y*side + x] + delta;
+
+                  sharp[(size_t)y*side + x] = (BYTE)(v < 0 ? 0 : (v > 255 ? 255 : v));
+               }
+         }
+   }
+   memcpy(soft(), sharp(), (size_t)side*side);
+   for (int pass = 0; pass < 6; pass++) // three box passes of radius 6 in each direction
+      for (int row = 0; row < side; row++)
+      {
+         bool   across = pass%2 == 0;
+         LPBYTE p = soft();
+
+         for (int i = 0; i < side; i++)
+         {
+            int sum = 0,
+                n = 0;
+
+            for (int d = -6; d <= 6; d++)
+               if (i + d >= 0 && i + d < side)
+               {
+                  sum += across ? p[(size_t)row*side + i + d] : p[(size_t)(i + d)*side + row];
+                  n++;
+               }
+            line[i] = (BYTE)(sum/n);
+         }
+         for (int i = 0; i < side; i++)
+            if (across)
+               p[(size_t)row*side + i] = line[i];
+            else
+               p[(size_t)i*side + row] = line[i];
+      }
+
+   checkThat(blurMeasure(sharp(), side, side, side, r) && r.textured == r.tiles);
+
+   float sharpPx = r.medianPx;
+
+   checkThat(blurMeasure(soft(), side, side, side, r));
+   printf("capTest: blur sharp %.2f px, box-blurred %.2f px\n", sharpPx, r.medianPx);
+   checkThat(sharpPx < 3.f && r.medianPx > 5.f && r.medianPx < 8.f); // three boxes of 13: sigma 6.5
+   memset(sharp(), 128, (size_t)side*side);
+   checkThat(!blurMeasure(sharp(), side, side, side, r) && isnan(r.medianPx) && !r.textured);
 }
 
 //--------------------------------------------------------------------------------
@@ -811,6 +909,7 @@ int main(int argc, LPSTR *argv)
    testJPEG();
    testVanish();
    testLayout();
+   testBlur();
    printf("capTest: %d failure(s)\n", gFailures);
    return tc.commit(gFailures ? 1 : 0);
 }

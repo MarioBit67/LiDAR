@@ -18,11 +18,22 @@ static const float cDegToRad = 0.01745329252f,
                    cMinCeilPitchDeg = 5.f,   // frames aimed at the ceiling band give creases at any elevation
                    cCreaseViewDeg = 25.f,    // level frames: up to this above their aim (half the view less a margin)
                    cMaxAimDeg = 35.f,        // corner station aim: at most this off the corner bisector (the diagonal)
+                   cCornerMeetM = 0.35f,     // a perpendicular crease ending this close to a wall meets it at a corner
+                   cLoneWallLenM = 1.5f,     // one keyframe seeing this much of a wall confirms it by itself
+                   cCornerReachM = 0.5f,     // perpendicular walls this far past a wall's ends still bear on it
                    cResectTolM = 0.15f,      // a station crease matches a known wall within this (or this share of
                    cResectTolFrac = 0.06f,   // its distance)
                    cSecondAimDeg = 25.f,     // a second aim from the same corner: at least this apart from the first
                    cMinAreaM2 = 1.f,
                    cDoorHeadM = 2.10f,       // door and window heads: the most reliable height of a building
+                   cCeilingSnapFrac = 0.06f, // door heads choose a typical ceiling only this close to it
+                   cOpenDoorSpanM = 8.f,     // open doors: leaf positions searched along +-this
+                   cOpenDoorBinM = 0.05f,
+                   cOpenDoorOffWallM = 0.15f, // an edge this close to a wall of its own orientation lies on that wall
+                   cOpenDoorMinM = 0.3f,     // a leaf top reaches from its wall this far into the room ...
+                   cOpenDoorMaxM = 1.f,      // ... and no farther (door widths 0.6-0.9 m)
+                   cOpenDoorGapM = 0.6f,     // two leaves on one wall are at least this apart
+                   cOpenDoorContrast = 5.f,  // a leaf stands this far above the stray edges of its wall
                    cMinHeadM = 1.6f,
                    cHeadBinM = 0.01f,
                    cMoldingM = 0.15f,        // crown molding band below the ceiling crease
@@ -39,12 +50,16 @@ enum {
    layoutElevBins   = 450,    // 0..90 degrees
    layoutMinLinePts = 25,     // edge pixels of one line in one frame
    layoutMaxLines   = 8000,
-   layoutMinCornerPairs = 3   // consistent floor-crease pairs needed to trust the corner height
+   layoutMinCornerPairs = 3,  // consistent floor-crease pairs needed to trust the corner height
+   layoutMinWallViews = 2,    // keyframes that confirm a weaker wall by themselves (the same step seen again)
+   layoutMinLeafPts   = 40    // edge votes for an open door leaf
 };
 
 // One wall: axis-aligned segment. kind 0: constant u (runs along w); kind 1: constant w (runs along u)
 struct TPlanWall {
-   int   kind;
+   int   kind,
+         views;   // creases (one per keyframe and side) it was clustered from
+   bool  primary; // the strongest wall of its side
    float offset,
          a0,
          a1,
@@ -573,6 +588,8 @@ static int layoutLineWalls(const TPlanLine *lines, int n, float ceilingM, float 
             cl[k].a0 = a0[i];
             cl[k].a1 = a1[i];
             cl[k].midAngle = 0.f;
+            cl[k].views = 0;
+            cl[k].primary = false;
             k++;
          }
 
@@ -580,6 +597,7 @@ static int layoutLineWalls(const TPlanLine *lines, int n, float ceilingM, float 
 
          c.offset += d[i]*w[i];
          c.weight += w[i];
+         c.views++;
          c.a0 = a0[i] < c.a0 ? a0[i] : c.a0;
          c.a1 = a1[i] > c.a1 ? a1[i] : c.a1;
          lastD = d[i];
@@ -594,6 +612,8 @@ static int layoutLineWalls(const TPlanLine *lines, int n, float ceilingM, float 
       }
 
       // strongest first; a weaker wall only where no stronger wall of the same side is
+      int accepted = 0;
+
       for (int pass = 0; pass < k && found < cap; pass++)
       {
          int best = -1;
@@ -616,11 +636,42 @@ static int layoutLineWalls(const TPlanLine *lines, int n, float ceilingM, float 
             if (walls[i].kind == c.kind && (walls[i].offset < 0.f) == (c.offset < 0.f) && hi - lo > 0.2f*(c.a1 - c.a0))
                shadowed = true;
          }
+         c.primary = accepted == 0;
+
          if (!shadowed)
+         {
             walls[found++] = c;
+            accepted++;
+         }
       }
    }
-   return found;
+
+   /* a step is real only when confirmed (user, 2026-09-27: "a tooth is confirmed by several captures of the same
+      feature; any other case is discarded"). A weaker wall stays when seen again by another keyframe, when one
+      view covers a long stretch of it, or when a perpendicular crease ends at it - ceiling creases meet at the
+      corners. Otherwise it is a misread crease (070542: one short grazing molding edge at 2.25 m made a tooth;
+      the w+ crease ended at 1.73, at the true wall 1.51) */
+   int kept = 0;
+
+   for (int i = 0; i < found; i++)
+   {
+      const TPlanWall &w = walls[i];
+      bool             crossed = false,
+                       met = false;
+
+      for (int j = 0; j < found && !w.primary; j++)
+      {
+         const TPlanWall &p = walls[j];
+
+         if (p.kind == w.kind || p.offset < w.a0 - cCornerReachM || p.offset > w.a1 + cCornerReachM)
+            continue;
+         crossed = true;
+         met = met || fabsf(p.a0 - w.offset) < cCornerMeetM || fabsf(p.a1 - w.offset) < cCornerMeetM;
+      }
+      if (w.primary || w.views >= layoutMinWallViews || w.a1 - w.a0 >= cLoneWallLenM || !crossed || met)
+         walls[kept++] = w;
+   }
+   return kept;
 }
 
 //--------------------------------------------------------------------------------
@@ -819,6 +870,141 @@ static bool layoutDoorHead(const float *data, DWORD count, float axisDeg, float 
       return false;
    headM = cMinHeadM + ((float)bestBin + 0.5f)*cHeadBinM;
    return true;
+}
+
+/*--------------------------------------------------------------------------------
+   Open doors: the leaf of a door swung open stands across its wall, and its top edge is a
+   horizontal line at door-head height running the OTHER way, from the wall into the room for
+   0.3-1 m. Every edge above the horizon is placed at head height; one that lands in such a band
+   off a wall, not on another wall of the room, votes for the leaf's position along that wall.
+   A strong position is an open door - worth closing: a closed door is a clean rectangle and its
+   head a better ruler (user, 2026-09-27). Returns the doors found (wall index, along position).
+  --------------------------------------------------------------------------------*/
+static int layoutOpenDoors(const float *data, DWORD count, float axisDeg, float heightM, float headM,
+                           const TPlanWall *walls, int n, int *doorWall, float *doorAt, int cap)
+{
+   const int     bins = (int)(2.f*cOpenDoorSpanM/cOpenDoorBinM);
+   TAlloc<float> votes((size_t)n*bins);
+   float         e = headM - heightM;
+   int           found = 0;
+
+   if (e <= 0.1f || n <= 0)
+      return 0;
+   memset(votes(), 0, sizeof(float)*(size_t)n*bins);
+   for (DWORD d = 0; d < count; d++)
+   {
+      int   kind;
+      float q,
+            p;
+      bool  onCeiling;
+
+      if (!layoutEdge(data + 4u*d, axisDeg, kind, q, p, onCeiling) || !onCeiling)
+         continue;
+
+      float s = e*q,     // the leaf's plane: this edge's own coordinate
+            along = e*p; // how far along the leaf, measured on the wall's axis
+      bool  onWall = false;
+
+      for (int i = 0; i < n && !onWall; i++)
+         onWall = walls[i].kind == kind && fabsf(walls[i].offset - s) < cOpenDoorOffWallM;
+      if (onWall)
+         continue;
+      for (int i = 0; i < n; i++)
+      {
+         const TPlanWall &w = walls[i];
+         float            sign = w.offset < 0.f ? -1.f : 1.f,
+                          inward = (w.offset - along)*sign; // from the wall into the room
+         int              bin = (int)((s + cOpenDoorSpanM)/cOpenDoorBinM);
+
+         if (w.kind == kind || inward < cOpenDoorMinM || inward > cOpenDoorMaxM || s < w.a0 || s > w.a1 || bin < 0
+             || bin >= bins)
+            continue;
+         votes[(size_t)i*bins + bin] += 1.f;
+      }
+   }
+   for (int i = 0; i < n && found < cap; i++)
+   {
+      // a leaf is one sharp line: its bin must stand well above the wall's background of stray edges
+      const float *v = votes() + (size_t)i*bins;
+      float        sum = 0.f;
+      int          used = 0;
+
+      for (int b = 0; b < bins; b++)
+         if (v[b] > 0.f)
+         {
+            sum += v[b];
+            used++;
+         }
+
+      float background = used ? 3.f*sum/(float)used : 0.f;
+
+      for (int b = 1; b + 1 < bins && found < cap; b++)
+      {
+         float s = v[b - 1] + v[b] + v[b + 1];
+
+         if (s < (float)layoutMinLeafPts || s < cOpenDoorContrast*background || v[b] < v[b - 1] || v[b] <= v[b + 1])
+            continue;
+         doorWall[found] = i;
+         doorAt[found] = ((float)b + 0.5f)*cOpenDoorBinM - cOpenDoorSpanM;
+         found++;
+         b += (int)(cOpenDoorGapM/cOpenDoorBinM); // one leaf, one door
+      }
+   }
+   return found;
+}
+
+/*--------------------------------------------------------------------------------
+   The middles of the room (user, 2026-09-27: "the center is adaptive"): the walls' coordinates cut
+   the plan into a grid, and every grid cell inside the room is one rectangle of it - a rectangle
+   has one middle, an L three (one per arm and one where they meet). Their centers are where the
+   floor views from the corners aim.
+  --------------------------------------------------------------------------------*/
+static void layoutCenters(TLayoutPlan &plan)
+{
+   float us[layoutMaxVerts],
+         ws[layoutMaxVerts];
+   int   nu = 0,
+         nw = 0;
+
+   plan.centerCount = 0;
+   for (int i = 0; i < plan.vertexCount; i++)
+   {
+      bool haveU = false,
+           haveW = false;
+
+      for (int k = 0; k < nu; k++)
+         haveU = haveU || fabsf(us[k] - plan.verts[i].u) < cMinWallM;
+      for (int k = 0; k < nw; k++)
+         haveW = haveW || fabsf(ws[k] - plan.verts[i].w) < cMinWallM;
+      if (!haveU)
+         us[nu++] = plan.verts[i].u;
+      if (!haveW)
+         ws[nw++] = plan.verts[i].w;
+   }
+   for (int i = 1; i < nu; i++) // sort both cut lists
+      for (int k = i; k > 0 && us[k - 1] > us[k]; k--)
+      {
+         float t = us[k];
+
+         us[k] = us[k - 1];
+         us[k - 1] = t;
+      }
+   for (int i = 1; i < nw; i++)
+      for (int k = i; k > 0 && ws[k - 1] > ws[k]; k--)
+      {
+         float t = ws[k];
+
+         ws[k] = ws[k - 1];
+         ws[k - 1] = t;
+      }
+   for (int a = 0; a + 1 < nu; a++)
+      for (int b = 0; b + 1 < nw && plan.centerCount < layoutMaxCenters; b++)
+      {
+         TPlanPoint c = { 0.5f*(us[a] + us[a + 1]), 0.5f*(ws[b] + ws[b + 1]) };
+
+         if (layoutInside(plan, c))
+            plan.centers[plan.centerCount++] = c;
+      }
 }
 
 //--------------------------------------------------------------------------------
@@ -1087,10 +1273,78 @@ bool TRoomLayout::FrameKept(int f) const
 }
 
 /*--------------------------------------------------------------------------------
+   The plan at the assumed ceiling, then the hypotheses crossed (user, 2026-09-27): a door head is
+   2.10 m and a ceiling is typically 2.70 or 2.80 m. When the heads imply a ceiling within
+   cCeilingSnapFrac of a typical one, the plan is scaled to it - every distance scales with the
+   ceiling above the camera. A head far from every typical height is a misread (a cabinet top, a
+   trim) and changes nothing.
+  --------------------------------------------------------------------------------*/
+bool TRoomLayout::Solve(float axisDeg, float ceilingM, TLayoutPlan &out) const
+{
+   bool ok = solveAt(axisDeg, ceilingM, out);
+
+   if (!out.doorFound)
+      return ok;
+
+   // the assumption is a candidate too: heads that agree with it change nothing
+   const float candidates[3] = { ceilingM, 2.70f, 2.80f };
+   float       best = 0.f,
+               bestErr = cCeilingSnapFrac;
+
+   for (int i = 0; i < 3; i++)
+   {
+      float err = fabsf(out.impliedCeilingM - candidates[i])/candidates[i];
+
+      if (err <= bestErr)
+      {
+         bestErr = err;
+         best = candidates[i];
+      }
+   }
+   if (best <= 0.f || fabsf(best - ceilingM) < 0.005f)
+      return ok;
+
+   // every length of the model is proportional to the ceiling (the camera height is a ratio of it): scale, not redo
+   float f = best/ceilingM;
+
+   out.ceilingM = best;
+   out.cameraHeightM *= f;
+   out.extentU *= f;
+   out.extentW *= f;
+   out.areaM2 *= f*f;
+   for (int i = 0; i < out.vertexCount; i++)
+   {
+      out.verts[i].u *= f;
+      out.verts[i].w *= f;
+   }
+   for (int i = 0; i < out.wallCount; i++)
+   {
+      out.wallOffset[i] *= f;
+      out.wallA0[i] *= f;
+      out.wallA1[i] *= f;
+   }
+   for (int i = 0; i < out.centerCount; i++)
+   {
+      out.centers[i].u *= f;
+      out.centers[i].w *= f;
+   }
+   for (int i = 0; i < out.openDoors; i++)
+      out.openDoorAt[i] *= f;
+   for (int i = 0; i < out.creaseCount; i++)
+   {
+      out.creases[i].dist *= f;
+      out.creases[i].a0 *= f;
+      out.creases[i].a1 *= f;
+   }
+   out.ceilingSnapped = true;
+   return ok;
+}
+
+/*--------------------------------------------------------------------------------
    axisDeg: the room axis in the world (AnchorDeg, or a correction of it). The stored edges live on
    the anchor frame, which sits (anchor - median) away from the world.
   --------------------------------------------------------------------------------*/
-bool TRoomLayout::Solve(float axisDeg, float ceilingM, TLayoutPlan &out) const
+bool TRoomLayout::solveAt(float axisDeg, float ceilingM, TLayoutPlan &out) const
 {
    const float *data = Pdata();
 
@@ -1146,6 +1400,38 @@ bool TRoomLayout::Solve(float axisDeg, float ceilingM, TLayoutPlan &out) const
       }
    }
    out.stationLines = lineCount - spinLines;
+
+   // diagnostics: every crease the walls are clustered from, as seen from the spin point
+   float scale = ceilingM - out.cameraHeightM;
+
+   out.creaseCount = 0;
+   for (int i = 0; i < lineCount && out.creaseCount < layoutMaxCreases; i++)
+   {
+      const TPlanLine &l = lines[i];
+
+      if (!l.crease)
+         continue;
+
+      TPlanCrease &c = out.creases[out.creaseCount++];
+      float        sign = (l.half & 1) ? -1.f : 1.f,
+                   dist = l.q*scale;
+      int          f = l.frame < 0 ? -1 - l.frame : l.frame;
+
+      c.frame = f;
+      c.half = (BYTE)l.half;
+      c.station = f < Pframes ? PframeStation[f] : 0u;
+      c.dist = dist;
+      c.a0 = fminf(l.r0, l.r1)*sign*dist;
+      c.a1 = fmaxf(l.r0, l.r1)*sign*dist;
+      if (c.a0 > c.a1)
+      {
+         float t = c.a0;
+
+         c.a0 = c.a1;
+         c.a1 = t;
+      }
+      c.weight = l.weight;
+   }
    if (lineCount > spinLines)
       n = layoutLineWalls(lines(), lineCount, ceilingM, out.cameraHeightM, walls, layoutMaxWalls);
 
@@ -1157,6 +1443,7 @@ bool TRoomLayout::Solve(float axisDeg, float ceilingM, TLayoutPlan &out) const
       out.wallA0[i] = walls[i].a0;
       out.wallA1[i] = walls[i].a1;
       out.wallWeight[i] = walls[i].weight;
+      out.wallViews[i] = walls[i].views;
    }
    if (n < 4)
    {
@@ -1206,10 +1493,9 @@ bool TRoomLayout::Solve(float axisDeg, float ceilingM, TLayoutPlan &out) const
       return false;
    }
 
-   /* door heads at 2.10 m would fix the scale better than an assumed ceiling, but a head found as "the
-      strongest wall line below the molding" is often a cabinet slab or a door trim (office 173630: head read
-      at 1.94 m, scale +8.5% the wrong way). Measured and reported only; applied once doors are recognized
-      by their head WITH the two jambs below it. */
+   /* door heads at 2.10 m measure the ceiling better than an assumption, but a head found as "the strongest wall
+      line below the molding" is often a cabinet slab or a door trim (office 173630: head read at 1.94 m, scale
+      +8.5% the wrong way). The head is measured here; Solve only lets it choose between typical ceilings. */
    float head = 0.f;
 
    out.assumedCeilingM = ceilingM;
@@ -1221,10 +1507,14 @@ bool TRoomLayout::Solve(float axisDeg, float ceilingM, TLayoutPlan &out) const
       if (s >= cMinDoorScale && s <= cMaxDoorScale)
       {
          out.doorFound = true;
-         out.doorScale = s; // not applied
+         out.doorScale = s;
+         out.impliedCeilingM = ceilingM*s;
       }
    }
+   out.openDoors = layoutOpenDoors(data, Pcount, axisDeg, out.cameraHeightM, out.doorFound ? head : cDoorHeadM, walls,
+                                   n, out.openDoorWall, out.openDoorAt, layoutMaxOpenDoors);
    layoutStations(out);
+   layoutCenters(out);
    if (!out.stationCount)
       out.failure = pfNoStations;
    out.valid = out.stationCount > 0;
