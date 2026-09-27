@@ -94,6 +94,9 @@ struct TLayoutPlan {
    TPlanCrease creases[layoutMaxCreases];
 };
 
+// A new height of the ceiling line the plan was solved at (a door's measure): every length scales with it
+void layoutScalePlan(TLayoutPlan &plan, float ceilingM);
+
 class TRoomLayout
 {
  public:

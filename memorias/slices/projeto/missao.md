@@ -31,3 +31,12 @@ PÉ-DIREITO ÚNICO (usuário, 2026-09-27): os cômodos de um mesmo imóvel têm 
 As exceções possíveis são um banheiro rebaixado e uma sala de estar com mezanino. A medida de uma porta vale para o
 imóvel inteiro. Um cômodo que discorda é exceção declarada (rebaixo/mezanino) ou erro de medida.
 MEZANINO (usuário): "uma dimensão extra de complexidade na captura". Fica para depois.
+
+VISÃO DO PRODUTO FINAL (usuário, 2026-09-27): cada foto carrega metadado muito valioso (pose, bússola, GPS, faixa,
+estação, pontos de fuga, borrão, portas, eleição). A combinação de todos alimenta, em sequência:
+1. o FILTRO DE MÓVEIS: o imóvel "cru", só paredes, piso e teto, com os móveis removidos pela geometria (piso
+   estendido pelo padrão de ladrilho, paredes pela tinta equalizada, vistas dos cantos cobrindo a paralaxe);
+2. um FILME do imóvel vazio;
+3. CAMADAS DE MOBILIÁRIO de níveis distintos, do mais simples ao mais luxuoso e sofisticado.
+Critério: toda decisão de captura e de metadado é julgada por quanto ela ajuda esses três passos, além da área de
+vassoura.

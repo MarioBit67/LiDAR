@@ -725,3 +725,142 @@ Entradas mais novas no fim.
   - dormitório 3,36 x 3,61;
   - pé-direito 2,70; a linha do teto pela porta dá 2,77-2,78 nos dois cômodos.
 - Usuário: o erro residual das plantas (escritório ~+1-4%) é tolerável; refinamento fino adiado.
+- RETIFICAÇÃO (capInspect --rectify), usuário: o frame 3 foi retificado contra uma fração mínima de parede; com canto nítido, desempatar pela parede com maior exibição. Quadro mirando canto (>= 25 graus) gera UMA vista, a da parede com mais arestas das suas linhas (normal A contém as linhas B: support[2] >= support[1]); sem as duas direções, vale a mais frontal. Dormitório 112439: 57 vistas (antes 76); frame 3 -> parede 3, vinco horizontal na parede dominante.
+- NIVELAMENTO PELO VINCO (usuário: "as linhas de teto definem uma trajetória linear que precisa participar da
+  normalização"; nos frames 5-10 o horizonte flutuava):
+  - capInspect --rectify em duas passadas:
+    (1) mede em cada vista frontal a reta do vinco do teto (a linha horizontal forte mais alta por coluna; mínimos
+        quadrados, 3 rodadas descartando > 4 px), com inclinação e elevação acima do horizonte nivelado;
+    (2) relê a sessão e gira o vertical de cada foto: rolagem = atan(inclinação), para o vinco sair plano;
+        inclinação = elevação - mediana da parede (só no giro central, todas as fotos do mesmo ponto); a normal gira
+        junto.
+  - Sem vinco do teto, usa o do piso (a linha mais baixa), com o dobro de pontos (móveis) e mediana própria.
+  - Limites: |rolagem| <= 3 graus, linha a >= 3 graus do horizonte.
+  - Foto sem linha: interpola as correções das vizinhas medidas da mesma estação (até 3 fotos).
+  - Sinais: a rolagem precisou de -1 (a primeira tentativa dobrava a inclinação); a inclinação, +1.
+  - Dormitório 112439: inclinação do vinco -0,040 -> +0,001 (frame 7); elevação 35,32 -> 36,48 (mediana 36,52,
+    frame 2); 13 fotos medidas + 2 interpoladas (4 e 9). Nos frames 5-9 o vinco e o topo da janela ficam na mesma
+    linha.
+- PRÓXIMO (ideia do usuário): no piso, os próprios móveis (cama, mala, quadro) servem de referência. O mesmo objeto
+  recortado por dois quadros vizinhos dá a rotação relativa, e a correção de um quadro com vinco se propaga em
+  corrente. Cuidado: a paralaxe de objetos fora do plano da parede (raio do giro ~0,3 m).
+- ELEIÇÃO DE FOTOS (usuário: "várias colisões de enquadramento"; em debug manter as duas, em produção sobrescrever):
+  - registro rtElect = 10 (TElectRecord: cômodo, estação, faixa, bin, electedNs, supersededNs pelo carimbo do
+    rtImage), gravado pelo worker a cada foto que entra num bin: quando substitui (laranja ou mais nítida) e quando
+    perde (refoto não mais nítida);
+  - appKeepSuperseded = 1 (debug) mantém tudo. Com 0 (produção), finishProperty chama TSessionWriter::Compact:
+    reescreve capture.lrec sem as imagens substituídas, UMA vez por imóvel (compactar por cômodo reescreveria o
+    arquivo inteiro a cada cômodo);
+  - Compact copia para capture.lrec.tmp, troca só com a cópia completa e reabre com TRecordLogWriter::Append. Limite:
+    ftell em LONG, então arquivo > 2 GB precisa revisão;
+  - capInspect: varredura prévia dos rtElect, frames.csv com coluna "elected"; o nivelamento do --rectify pula as
+    substituídas;
+  - manifesto com "elects"; capTest cobre a compactação.
+- Usuário: "ainda não vi o filtro de candidatos de portas rodando". Correto: ele está só no capInspect. PRÓXIMO:
+  levá-lo ao app.
+- FILTRO DE PORTAS NO APP + ESTAÇÃO DE PORTAS (usuário: "deixe o sprite com a suposta porta e, ao encaixar, a
+  confirmação é automática"; botão vermelho "Descartar"; "o giroscópio mais o teto dão a posição do usuário"):
+  - core/capDoor:
+    - doorFrameWall(vr): o vertical medido e a normal da parede dominante (o mesmo desempate por arestas da
+      retificação);
+    - doorColumnHeadingDeg: o rumo no mundo de uma coluna da vista frontal.
+  - worker, em toda foto medida:
+    - vista frontal (buffer PdoorBuf de 4 planos), doorDetect e rumo do centro de cada porta;
+    - addDoor funde candidatas da MESMA estação a ±8 graus (cDoorMergeDeg), guarda o ponto de onde foram vistas na
+      planta (giro = origem, canto = vértice da estação) e acumula a razão vinco/verga;
+    - na grade de giro, as portas da estação aparecem como contorno ciano; a barra de status mostra "portas N".
+  - Após o último canto:
+    - buildPlanDoors projeta cada candidata na planta (raio até a primeira parede do polígono) e funde as
+      repetidas a até 0,6 m;
+    - com portas, a nova estação skDoor (rpDoor); sem portas, o cômodo fecha.
+  - rpDoor:
+    - o olho começa no último canto; o sprite (drawDoorAim) mostra a porta esperada (chão à verga, largura 0,8 m)
+      na perspectiva da grade, junto com o quadro da câmera;
+    - nivelado (±12), mirando (±8) e firme (< 4 graus/s): foto a cada >= 1,5 s;
+    - worker: porta a até ±10 graus do centro da imagem = confirmada (verde, razão somada), segue para a próxima;
+    - cada foto confirmada reposiciona o olho: a distância até a parede sai do vinco na vista frontal
+      ((vinco - câmera)/tan(e), ambos em vãos de porta), recuada ao longo do raio;
+    - "Descartar" (vermelho) marca state 2 e segue; o mapa mostra as portas (branca a fotografar, verde
+      confirmada, anel amarelo na atual) e o olho mirando a atual.
+  - A meta dos quadros agora tira rumo e inclinação da própria pose (a estação de portas não tem rastreador).
+  - PENDENTE: gravar as portas confirmadas num registro próprio; usar a razão confirmada como escala da planta.
+- APK instalado.
+- ITENS REMANESCENTES DAS PORTAS (usuário: "complete esses dois itens e eu disparo novas capturas"):
+  - registro rtDoor = 11 (TDoorRecord): índice, estado dsPending/dsConfirmed/dsDropped, (u, w) na planta na escala
+    final, razão vinco/verga média, quadros, carimbo da foto que confirmou. Gravado ao fim da estação de portas
+    (finishDoors), também quando o cômodo termina no meio dela. Manifesto com "doors"; capInspect lista cada porta
+    e a estação "doors";
+  - PORTA COMO RÉGUA: finishDoors soma as razões das portas confirmadas no IMÓVEL e faz
+    PpropCeilingM = 2,10 x média. A planta do cômodo é reescalada (layoutScalePlan, agora pública no capLayout e
+    usada também pelo Solve) e gravada de novo com lfDoorScaled; portas e olho escalam junto;
+  - cômodos seguintes: solvePlan usa PpropCeilingM como hipótese e reescala depois do Solve (nenhum palpite de
+    verga pelo histograma pode desfazer); reseta a cada imóvel (openSession);
+  - capTest: ida e volta do TDoorRecord e reescala 2,80 -> 2,78. 0 falhas; APK instalado.
+- CAPTURA 123038 (escritório com a estação de portas), baixada, conferida e apagada do celular:
+  - FALSO DENTE: duas paredes do lado u+, cada uma vista por UMA foto (1,25 m pela foto 0, rasante, com elevação
+    11,7 graus e o vinco perto da borda; 1,35 m pela foto 2), mesma parede lisa com moldura contínua. Passaram pela
+    exceção "vinco perpendicular termina nela", que num retângulo vale para toda parede perto de canto. CORREÇÃO
+    (capLayout): antes das exceções, uma parede secundária com menos de 2 vistas, a menos de cShallowStepM (0,25 m)
+    de outra do mesmo lado, é fundida nela (offset pesado, trecho unido, vistas somadas). As exceções ficam para
+    degraus fundos (braços de L). 123038: 4 cantos, 2,45 x 3,19; 112439 e 102600 inalterados; capTest ok.
+  - PORTAS "na parede oposta": as candidatas (fotos 47 = a folha aberta tomada como porta; 55 = o vão) caíram perto
+    do canto 5, justamente o último canto, de onde a fase de portas supunha o operador. Olho em cima da porta: rumo
+    sem sentido. CORREÇÃO: a fase de portas começa com o olho no PONTO DO GIRO (a cruz branca); dica "Na cruz
+    branca, encaixe a porta amarela do chão à moldura (n)". Cada porta confirmada segue refinando a posição.
+  - PENDENTE: a folha aberta detectada como vão (painel liso, com maçaneta, fora do plano da parede) não pode dar
+    razão; distinguir pelo interior (o vão mostra o cômodo vizinho).
+- APK instalado.
+- LAVABO (~1 m, usuário): o piso só aparece com o celular inclinado até -60. TSpinConfig ganhou reachDownDeg/reachUpDeg: a faixa mais baixa aceita até -60 e a mais alta até +60 (ForFov); na vista do piso dos cantos, até -60 (ForFloorView). O leque nivelado dos cantos não muda. capTest: a vista do piso a -58 entra, a -63 fica vermelha. APK instalado.
+- CAPTURA 124744 (escritório; conferida e apagada do celular). Porta FALSO POSITIVO na janela (frame 1) e FALSO
+  NEGATIVO na porta verdadeira (frames 37, 38, 44). Correções no capDoor:
+  - A porta precisa mostrar o PÉ: logo abaixo do batente a vista ainda cobre a foto. Pé cortado pela borda da foto
+    só vale se a foto chega a >= 30 graus abaixo do horizonte (porta perto, foto nivelada); aí é só candidata (sem
+    razões, altura do vão pela largura x 2,6). A janela (faixa do teto, ~-20 graus) sai.
+  - Câmera mínima 0,55 vão (~1,15 m); a janela dava 0,98 m.
+  - Porta na parede SECUNDÁRIA dos quadros de canto: doorFrameWalls devolve as duas paredes. O app e o capInspect
+    procuram portas nas duas (a retificação segue gravando só a dominante). Cada porta guarda o horizonte, a focal
+    e a normal da própria vista (doorShot).
+  - Vista frontal com 1600 linhas (antes 1200: o pé caía fora).
+  - Busca da verga entre os dois topos (a folha aberta sobe acima dela).
+  - Busca do vinco a >= 0,12 vão acima da verga (o topo do alizar, ~0,03, virava "vinco" e esvaziava a caixa de
+    cima).
+  - Sobel só com os 8 vizinhos válidos (a borda da área coberta criava arestas).
+  - Arestas acima da verga: limite 0,10 (parede lisa real: 0,07).
+  - Diagnóstico: TDoorStats lista cada par e o motivo com o valor medido (capInspect --doors-all grava toda vista).
+  - 124744: janela rejeitada; porta achada no frame 37 (vão na parede 2, com maçaneta e canto; a folha na parede 1).
+    Os frames 38 e 44 seguem sem: a porta na borda da vista, sem o outro batente.
+- Planta 124744: 3,25 x 4,23 (?), altura da câmera 1,18 (suspeita).
+- PRÓXIMO (usuário): WIREFRAME das paredes projetado na prévia (pose + intrínseca + planta: teto a H, piso a 0,
+  arestas dos cantos). Cantos do giro do teto já visíveis no giro do piso, mesmo sem a linha do piso (móveis).
+- APK instalado.
+- WIREFRAME DAS PAREDES NA PRÉVIA (usuário: "a confirmação em wireframe das paredes do ambiente"; "os cantos do
+  primeiro giro aparecem no segundo mesmo sem o piso confirmar"; "o giroscópio te ajuda nisso"):
+  - drawWireframe logo após a prévia no OnPaint. Por parede: linha do teto (H - h) e do piso (-h); aresta vertical
+    em cada canto.
+  - Modelo: Pplan quando válida (polígono). Durante o giro central, PguidePlan: as paredes do teto até ali, com os
+    cantos de updateGuides (PguideAt), que continuam desenhados no giro do piso.
+  - Ponto de vista: centro = ponto do giro; canto = vértice da estação 0,4 m para dentro, rumo ao alvo; portas =
+    PdoorEye.
+  - Projeção: pose do giroscópio (câmera->mundo, transposta), pinhole da intrínseca NATIVA, inverso do giro de
+    updatePreview, escala "cobrir" do canvasBlit (wireToScreen); corte no plano próximo de 5 cm (wireEdge).
+  - Alturas: plan.ceilingM e plan.cameraHeightM (1,5 m até haver medida).
+  - Não testado em campo.
+- APK instalado.
+- 132058 (conferida e apagada do celular): wireframe aprovado pelo usuário ("genial"; "percorria o chão com os
+  móveis e ele desenhava quase precisamente a linha imaginária do piso").
+  - LINHAS DE APOIO REMOVIDAS da grade ("mantenha apenas o wireframe"); updateGuides segue alimentando o wireframe.
+  - Porta confirmada SEM razão: de perto a porta inteira com a moldura não cabe numa foto nivelada (foto 53: pé
+    sim, moldura fora; fotos 37/38: moldura sim, pé cortado). RAZÃO POR ÂNGULOS: na vista frontal nivelada, todo
+    ponto da parede está à mesma distância; altura acima do piso = D (tan e - tan e_pé). TPlanDoor acumula
+    tan(verga), tan(pé), tan(vinco) das fotos centradas; com os três,
+    razão = (tan e_vinco - tan e_pé)/(tan e_verga - tan e_pé).
+  - A porta fica confirmada (verde) na primeira foto e continua a atual até ter pé e moldura. Dicas "incline para
+    baixo até o pé" / "incline para cima até a moldura"; inclinação liberada até ±35 na fase de portas; o botão
+    vira "Pular medida" (azul). TDoor.footCut é exposto.
+  - FOLHA ABERTA como porta (a folha a 90 graus fica paralela à parede vizinha: na vista dela parece uma porta).
+    Regra do ALIZAR: uma porta, aberta ou fechada, tem o topo do alizar, uma segunda linha horizontal a
+    0,012-0,12 vão acima da verga, atravessando o vão; acima da folha solta só há parede. (A regra do rodapé ao
+    lado foi DESCARTADA: sem parede ao lado da folha ela não vê nada.) 132058: o par folha+vão (101-626) é
+    barrado; o vão (306-604) segue; as fotos 37/38/53 continuam com o vão.
+- APK instalado.
+- VISÃO (usuário): metadado por foto -> filtro de móveis (imóvel cru) -> filme -> camadas de mobiliário (do simples ao luxuoso). Registrado em slices/projeto/missao.md.

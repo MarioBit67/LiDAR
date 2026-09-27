@@ -34,7 +34,9 @@ struct TSpinConfig {
          maxAccuracyDeg,             // max compass error (NaN accuracy = unknown, accepted)
          minSepFrac,                 // min heading gap to a kept neighbor, in bins
          maxDriftM,                  // max distance from the first pose (0 disables)
-         fanDeg;                     // 0 = full circle; > 0 = only a fan this wide around the first steady aim
+         fanDeg,                     // 0 = full circle; > 0 = only a fan this wide around the first steady aim
+         reachDownDeg,               // < 0: the lowest band also takes pitches down to this (a small room's floor)
+         reachUpDeg;                 // > 0: the highest band also takes pitches up to this (its ceiling)
 
    static TSpinConfig UltraWide(void); // 0.5x lens: one horizon band covers creases
    static TSpinConfig Wide(void);      // 1x lens (ARKit + LiDAR): three bands

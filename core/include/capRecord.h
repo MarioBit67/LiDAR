@@ -17,7 +17,9 @@ enum TRecordType {
    rtRoom     = 6, // room begin / end marker
    rtStation  = 7, // capture station inside a room (center spin, corner views)
    rtVanish   = 8, // vanishing directions measured on a keyframe (room axes, gravity and intrinsics checks)
-   rtLayout   = 9  // floor plan of a room estimated after its center spin (editable later in the property plan)
+   rtLayout   = 9, // floor plan of a room estimated after its center spin (editable later in the property plan)
+   rtElect    = 10, // which image a coverage bin keeps (a retake replaced one, or lost to it)
+   rtDoor     = 11  // a door of the room from the door station: confirmed (the ruler) or dropped
 };
 
 enum TTrackState {
@@ -126,7 +128,8 @@ enum TStationEvent {
 
 enum TStationKind {
    skCenter = 0, // in-place spin from the middle of the room
-   skCorner = 1  // standing in a corner, aiming at the opposite one: the parallax baseline
+   skCorner = 1, // standing in a corner, aiming at the opposite one: the parallax baseline
+   skDoor   = 2  // the room's doors, each shot frontally: the ruler (head at 2.10 m) of the ceiling height
 };
 
 // One capture station of a room; corners are numbered clockwise from the first one visited
@@ -173,6 +176,44 @@ enum TLayoutFlag {
 /* Floor plan of one room (capLayout), in plan meters: origin at the spin point, u along the room axis at
  * world heading axisDeg, w along axisDeg + 90; corners clockwise seen from above. The property plan
  * places each room later (the operator may re-position rooms), so the plan stays in its own frame. */
+/* The image a coverage bin keeps: a retake that replaced the bin's photo (orange, or a sharper one), or
+ * lost to it. Images are named by the stamp of their rtImage record. In production the superseded
+ * images are dropped from the log when the property is finished; in debug both stay. */
+struct TElectRecord {
+   DWORD roomIndex;
+   BYTE  stationIndex,
+         band,
+         bin;
+   QWORD electedNs,     // the bin's image from now on
+         supersededNs;  // the image it replaced or that lost to it (0: the bin's first image)
+
+   void Encode(TByteBuf &out) const;
+   bool Decode(LPCBYTE p, size_t n);
+};
+
+enum TDoorState {
+   dsPending   = 0, // never shot (the room ended first)
+   dsConfirmed = 1, // found at the center of a door-station shot
+   dsDropped   = 2  // the operator dropped it ("Descartar")
+};
+
+/* A door of a room as the door station left it, in the room's plan (the same frame and the final scale
+ * of its rtLayout). ratio: the highest ceiling line over the head, in door heads (the head is 2.10 m), mean
+ * of the frames that saw both (NaN: none); imageNs: the rtImage stamp of the shot that confirmed it. */
+struct TDoorRecord {
+   DWORD      roomIndex;
+   BYTE       index;
+   TDoorState state;
+   float      u,
+              w,
+              ratio;
+   int        ratios;   // frames the ratio is the mean of
+   QWORD      imageNs;
+
+   void Encode(TByteBuf &out) const;
+   bool Decode(LPCBYTE p, size_t n);
+};
+
 struct TLayoutRecord {
    DWORD roomIndex;
    BYTE  flags,            // TLayoutFlag

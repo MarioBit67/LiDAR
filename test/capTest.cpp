@@ -170,6 +170,13 @@ static void testSpin(void)
    gns += 1000000000u;
    checkThat(guided.Offer(gns, headPitchPose(0.f, 10.f), NAN) == svOffBand && !guided.PoseAllowed());
 
+   // a small room: the floor view takes a pose tilted down to -60, not beyond
+   TSpinTracker floorView(TSpinConfig::ForFloorView(54.f, 68.5f));
+
+   floorView.AimFan(90.f);
+   checkThat(floorView.Offer(5000000000u, headPitchPose(90.f, -58.f), NAN) == svKeep);
+   checkThat(floorView.Offer(6000000000u, headPitchPose(90.f, -63.f), NAN) == svOffBand);
+
    // an orange ceiling bin may be retaken during the floor spin; once retaken (or merely green) it is red again
    guided.Reopen(1, 0, true);
    gns += 1000000000u;
@@ -237,6 +244,34 @@ static void testRecords(void)
    checkThat(back.Decode(buf.Data(), buf.Size()));
    checkThat(back.width == 4000u && back.format == pfJPEG);
    checkThat(closeTo(back.compass.trueDeg, 41.5f, 0.f));
+
+   // a confirmed door: the ruler of the ceiling line
+   TDoorRecord door = {},
+               doorBack = {};
+   TByteBuf    doorBuf;
+
+   door.roomIndex = 2u;
+   door.index = 1u;
+   door.state = dsConfirmed;
+   door.u = 1.8f;
+   door.w = -0.4f;
+   door.ratio = 1.322f;
+   door.ratios = 3;
+   door.imageNs = 123456789u;
+   door.Encode(doorBuf);
+   checkThat(doorBack.Decode(doorBuf.Data(), doorBuf.Size()) && doorBack.state == dsConfirmed && doorBack.index == 1u
+             && closeTo(doorBack.ratio, 1.322f, 0.f) && doorBack.imageNs == 123456789u);
+
+   // a plan solved at 2.80 m, the doors measuring 2.78: every length scales by 2.78/2.80
+   TLayoutPlan plan = {};
+
+   plan.ceilingM = 2.8f;
+   plan.vertexCount = 1;
+   plan.verts[0].u = 2.8f;
+   plan.areaM2 = 10.f;
+   layoutScalePlan(plan, 2.78f);
+   checkThat(closeTo(plan.verts[0].u, 2.78f, 1e-4f) && closeTo(plan.areaM2, 10.f*0.99286f*0.99286f, 1e-3f)
+             && closeTo(plan.ceilingM, 2.78f, 0.f));
    checkThat(back.pixelBytes == 5u && back.pixels[4] == 3);
    checkThat(!back.Decode(buf.Data(), buf.Size() - 1u));
 
@@ -298,11 +333,21 @@ static void testSession(void)
    checkThat(w.BeginRoom(10u, "Sala") == 0u);
    checkThat(w.WritePose(11u, pose));
    checkThat(w.WriteImage(12u, img));
+
+   // a retake replaced the image at 13: production drops it from the log, the rest stays in order
+   TElectRecord elect = {};
+   QWORD        drop = 13u;
+
+   elect.electedNs = 14u;
+   elect.supersededNs = 13u;
+   checkThat(w.WriteImage(13u, img) && w.WriteImage(14u, img) && w.WriteElect(14u, elect));
+   checkThat(w.Compact(&drop, 1) == 1 && w.Counts().images == 2u);
+   checkThat(w.WritePose(15u, pose)); // the log goes on after the rewrite
    checkThat(w.BeginRoom(20u, "Cozinha") == 1u); // ends "Sala"
    w.EndRoom(30u, 1.45f);
    checkThat(!w.RoomOpen());
    w.Close(2000u);
-   checkThat(w.Counts().rooms == 2u && w.Counts().images == 1u);
+   checkThat(w.Counts().rooms == 2u && w.Counts().images == 2u);
 
    TSessionWriter again;
 
@@ -336,7 +381,7 @@ static void testSession(void)
          lastHeight = room.cameraHeightM;
       }
    }
-   checkThat(n == 6);
+   checkThat(n == 9); // the image at 13 is gone: pose, 2 images, elect, pose, 4 room markers
    checkThat(rooms == 4);
    checkThat(closeTo(lastHeight, 1.45f, 0.f));
    checkThat(r.Truncated());

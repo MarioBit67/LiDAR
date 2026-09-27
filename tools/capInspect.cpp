@@ -31,7 +31,8 @@
 enum {
    inspectMaxFrames = 512,  // keyframes whose measures are kept for the wall composition
    inspectWallPxPerM = 250, // wall orthophoto resolution: 4 mm per pixel
-   inspectStations   = 512  // frame info: room*inspectStations + station index
+   inspectStations   = 512, // frame info: room*inspectStations + station index
+   inspectRectReach  = 3    // --rectify: a frame without a crease borrows the corrections of measured ones this close
 };
 
 //--------------------------------------------------------------------------------
@@ -75,6 +76,12 @@ static LPCSTR inspectTypeName(TRecordType t)
 
       case rtVanish :
          return "vanish";
+
+      case rtDoor :
+         return "door";
+
+      case rtElect :
+         return "elect";
 
       default :
          return "unknown";
@@ -336,13 +343,157 @@ static void inspectEdgeImage(LPCBYTE luma, int w, int h, const TIntrinsics &k, c
    fclose(bmp);
 }
 
+// The ceiling crease as the frontal view shows it: slope (rows per column) and elevation (the virtual camera is level)
+struct TRectMeasure {
+   bool  ok,
+         floorLine; // the floor crease (no ceiling crease in the view): its own median per wall
+   int   wall,
+         points;   // columns on the fitted line
+   float slope,
+         elevDeg;  // of the line at the view's middle column, above the level horizon
+};
+
+static TRectMeasure inspectRect[inspectMaxFrames]; // first pass of --rectify: each frame's crease as rotated by its own vertical
+static QWORD        inspectStamp[inspectMaxFrames],  // rtImage stamp of each frame
+                    inspectDropped[inspectMaxFrames]; // stamps the app's rtElect records superseded
+static int          inspectDroppedCount = 0;
+
+//--------------------------------------------------------------------------------
+static bool inspectIsSuperseded(QWORD stampNs)
+{
+   for (int i = 0; i < inspectDroppedCount; i++)
+      if (inspectDropped[i] == stampNs)
+         return true;
+   return false;
+}
+
+/*--------------------------------------------------------------------------------
+   The app's elections, read ahead: every image a retake replaced (or that lost to the bin's photo).
+   A debug capture keeps them all in the log; the analysis uses only the elected ones.
+  --------------------------------------------------------------------------------*/
+static void inspectReadElections(LPCSTR sessionDir)
+{
+   TSessionReader reader;
+   TRecordView    v;
+
+   inspectDroppedCount = 0;
+   if (!reader.Open(sessionDir))
+      return;
+   while (reader.Next(v))
+   {
+      TElectRecord e;
+
+      if (v.type == rtElect && e.Decode(v.payload, v.length) && e.supersededNs && inspectDroppedCount < inspectMaxFrames)
+         inspectDropped[inspectDroppedCount++] = e.supersededNs;
+   }
+}
+static const float  cRectRollSign = -1.f,          // correction senses (view axes: x right, y down)
+                    cRectPitchSign = 1.f,
+                    cRectMinElevDeg = 3.f,     // a crease line this far off the horizon (else: some other line)
+                    cRectMaxRollDeg = 3.f;     // and this near to flat (the vertical errs by 1-2 degrees)
+
+/*--------------------------------------------------------------------------------
+   The crease in a frontal view: in each column the highest strong horizontal edge of the upper part,
+   then a straight line through them - least squares, points farther than 4 px dropped, three rounds
+   (a lamp, a curtain rod or a shelf top leave the line). The crease of a wall is horizontal in the
+   world, so in a true frontal view it is flat, and seen from the spin point it stands at one
+   elevation in every frame.
+  --------------------------------------------------------------------------------*/
+static void inspectCreaseLine(LPCBYTE out, int ow, int oh, int rowBytes, float f, float cyv, bool floor, TRectMeasure &m)
+{
+   TAlloc<float> pc((size_t)ow),
+                 pr((size_t)ow);
+   TAlloc<BYTE>  keep((size_t)ow);
+   int           n = 0;
+
+   m.ok = false;
+   m.points = 0;
+   for (int c = 2; c < ow - 2; c += 2)
+      for (int k = 2; k < oh*7/10; k++)
+      {
+         int     r = floor ? oh - 1 - k : k; // the ceiling from the top down, the floor from the bottom up
+         LPCBYTE p = out + (size_t)(oh - 1 - r)*rowBytes + c*3; // bottom-up rows
+         int     gy = 0,
+                 gx = 0;
+
+         for (int d = -1; d <= 1; d++)
+         {
+            LPCBYTE up = out + (size_t)(oh - r)*rowBytes + (c + d)*3,
+                    dn = out + (size_t)(oh - 2 - r)*rowBytes + (c + d)*3;
+
+            gy += ((int)dn[1] - (int)up[1])*(d ? 1 : 2);
+         }
+         gx = ((int)p[4] - (int)p[-2])*2;
+         if (!p[0] && !p[1] && !p[2]) // outside the frame
+            continue;
+         if ((gy < 0 ? -gy : gy) >= 48 && (gy < 0 ? -gy : gy) >= 2*(gx < 0 ? -gx : gx))
+         {
+            pc[n] = (float)c;
+            pr[n] = (float)r;
+            keep[n] = 1u;
+            n++;
+            break;
+         }
+      }
+   if (n < ow/12)
+      return;
+
+   float a = 0.f,
+         b = 0.f;
+   int   used = 0;
+
+   for (int round = 0; round < 3; round++)
+   {
+      float sx = 0.f,
+            sy = 0.f,
+            sxx = 0.f,
+            sxy = 0.f;
+
+      used = 0;
+      for (int i = 0; i < n; i++)
+         if (keep[i])
+         {
+            sx += pc[i];
+            sy += pr[i];
+            sxx += pc[i]*pc[i];
+            sxy += pc[i]*pr[i];
+            used++;
+         }
+      if (used < ow/12)
+         return;
+
+      float det = (float)used*sxx - sx*sx;
+
+      if (fabsf(det) < 1e-3f)
+         return;
+      a = ((float)used*sxy - sx*sy)/det;
+      b = (sy - a*sx)/(float)used;
+      for (int i = 0; i < n; i++)
+         keep[i] = fabsf(pr[i] - (a*pc[i] + b)) <= 4.f ? 1u : 0u;
+   }
+
+   float mid = a*0.5f*(float)ow + b;
+
+   m.points = used;
+   m.slope = a;
+   m.elevDeg = atan2f(cyv - mid, f)*57.29578f;
+   m.floorLine = floor;
+
+   // a ceiling crease stands above the camera, a floor crease below; nearly flat either way
+   m.ok = (floor ? m.elevDeg < -cRectMinElevDeg : m.elevDeg > cRectMinElevDeg)
+          && fabsf(atanf(a))*57.29578f <= cRectMaxRollDeg
+          && (!floor || used >= ow/6); // furniture hides floor creases: the line must run twice as long
+}
+
 /*--------------------------------------------------------------------------------
    One frontal view: a pure rotation of the camera (homography K R K^-1, no depth needed) onto a
    virtual camera looking straight along the horizontal wall normal n, level and without roll -
    verticals vertical, that wall's creases horizontal. A shift of the principal point keeps the
-   original view centered, like an architectural shift lens, so nothing tilts. 24-bit BMP, upright.
+   original view centered, like an architectural shift lens, so nothing tilts. 24-bit BMP, upright
+   (path NULL: nothing written); measure (optional): the crease line of the view.
   --------------------------------------------------------------------------------*/
-static void inspectFrontal(const TImageRecord &img, LPCBYTE bgr, const TVec3 &up, const TVec3 &n, LPCSTR path)
+static void inspectFrontal(const TImageRecord &img, LPCBYTE bgr, const TVec3 &up, const TVec3 &n, LPCSTR path,
+                           TRectMeasure *measure)
 {
    const int    ow = 900,
                 oh = 1200,
@@ -397,6 +548,14 @@ static void inspectFrontal(const TImageRecord &img, LPCBYTE bgr, const TVec3 &up
          }
       }
    }
+   if (measure)
+   {
+      inspectCreaseLine(out(), ow, oh, rowBytes, f, cyv, false, *measure);
+      if (!measure->ok)
+         inspectCreaseLine(out(), ow, oh, rowBytes, f, cyv, true, *measure); // the floor spin: the floor crease
+   }
+   if (!path)
+      return;
 
    FILE *bmp = fopen(path, "wb");
 
@@ -417,7 +576,8 @@ static void inspectFrontal(const TImageRecord &img, LPCBYTE bgr, const TVec3 &up
 static float inspectDoorTiltDeg = 0.f, // --door-tilt deg
              inspectBlurNoise = 0.f;   // --blur-noise sigma (gray levels)
 static bool  inspectRectOut = false, // --rectify: write the frontal views
-             inspectDoors = false;   // --doors: look for doors in them
+             inspectDoors = false,   // --doors: look for doors in them
+             inspectDoorsAll = false; // --doors-all: and write every view, door or not (diagnosis)
 
 /*--------------------------------------------------------------------------------
    Doors on one frontal view (--doors): the view is built from the frame's YUV (BGR converted, chroma
@@ -483,6 +643,12 @@ static void inspectDoorView(const TImageRecord &img, LPCBYTE bgr, const TVec3 &u
           index, wall, stats.jambs, stats.pairs, stats.shape, stats.head, stats.overrun, stats.above, stats.color, found);
    for (int i = 0; i < stats.jambs; i++)
       printf("    jamb col %d rows %d-%d\n", stats.jambCol[i], stats.jambTop[i], stats.jambBottom[i]);
+
+   static LPCSTR cWhy[9] = { "door", "shape", "foot", "plausibility", "head", "overrun", "above", "color", "leaf" };
+
+   for (int i = 0; inspectDoorsAll && i < stats.tried; i++)
+      printf("    pair %d-%d: %s %.3f\n", stats.triedA[i], stats.triedB[i],
+             stats.triedWhy[i] >= 0 && stats.triedWhy[i] < 9 ? cWhy[stats.triedWhy[i]] : "?", stats.triedValue[i]);
    for (int i = 0; i < found; i++)
    {
       const TDoor &d = doors[i];
@@ -492,7 +658,7 @@ static void inspectDoorView(const TImageRecord &img, LPCBYTE bgr, const TVec3 &u
              d.rightCol, d.headRow, d.floorRow, d.creaseRow, d.creaseOverHead, d.cameraOverHead, 2.1f*d.creaseOverHead,
              2.1f*d.cameraOverHead, d.colorGap, d.knob ? 1 : 0, d.nearCorner ? 1 : 0, d.score);
    }
-   if (!found)
+   if (!found && !inspectDoorsAll)
       return; // an image only where a door was found
    for (int r = 0; r < vh; r++)
    {
@@ -576,15 +742,17 @@ static void inspectDoorView(const TImageRecord &img, LPCBYTE bgr, const TVec3 &u
    Frontal views of one keyframe (--rectify). The room axes in camera axes come from the frame's
    own vanishing points (vertical measured or tilt-calibrated; A measured, or B turned about the
    vertical, or the frame's own heading prediction, or the room consensus). The wall the frame faces
-   gets a frontal view; a frame aimed at a corner (more than 25 degrees off that wall) gets one per
-   wall, since neither is frontal in it. File names tell the wall: rect_NNN_paredeK.bmp, K = 0..3 clockwise
+   gets a frontal view; a frame aimed at a corner (more than 25 degrees off that wall) gets the one of the
+   wall it shows more of (edge support). File names tell the wall: rect_NNN_paredeK.bmp, K = 0..3 clockwise
    from the room axis (the same physical wall in every frame).
   --------------------------------------------------------------------------------*/
 static void inspectRectify(const TImageRecord &img, const TVanishResult &vr, float refAxisDeg, LPCSTR outDir,
-                           int index)
+                           int index, float rollDeg, float pitchDeg, TRectMeasure *measure, bool write)
 {
    TAlloc<BYTE> bgr((size_t)img.width*img.height*3u);
 
+   if (measure)
+      measure->ok = false;
    if (!inspectDecode(img.pixels, img.pixelBytes, img.width, img.height, true, bgr))
       return;
 
@@ -627,9 +795,16 @@ static void inspectRectify(const TImageRecord &img, const TVanishResult &vr, flo
    TVec3 b = { up.y*a.z - up.z*a.y, up.z*a.x - up.x*a.z, up.x*a.y - up.y*a.x };
    float fa = -a.z,  // camera forward (0, 0, -1) along each axis
          fb = -b.z;
-   bool  facingA = fabsf(fa) >= fabsf(fb);
+   bool  facingA = fabsf(fa) >= fabsf(fb),
+         corner = atan2f(fminf(fabsf(fa), fabsf(fb)), fmaxf(fabsf(fa), fabsf(fb))) >= 25.f*0.01745329f;
 
-   for (int pass = 0; pass < 2; pass++)
+   /* aimed at a corner: the one wall that fills more of the frame (user, 2026-09-27: frame 3 was turned to a sliver
+      of wall). A wall holds the lines running along it - the wall facing axis A holds the B edges - so the edge
+      support of each direction tells how much of each wall the frame shows */
+   if (corner && (vr.flags & vfAxisA) && (vr.flags & vfAxisB))
+      facingA = vr.support[2] >= vr.support[1];
+
+   for (int pass = 0; pass < (corner && !inspectDoors ? 1 : 2); pass++) // corner: the second wall for doors only
    {
       bool  useA = pass == 0 ? facingA : !facingA;
       float s = (useA ? fa : fb) >= 0.f ? 1.f : -1.f;
@@ -653,8 +828,41 @@ static void inspectRectify(const TImageRecord &img, const TVanishResult &vr, flo
       char  path[sessionPathMax];
 
       snprintf(path, sizeof(path), "%s/rect_%03d_parede%d.bmp", outDir, index, wall);
-      if (inspectRectOut)
-         inspectFrontal(img, bgr(), up, n, path);
+
+      /* leveled by the crease (second pass): the vertical turned about the view axis (roll) and about the view's
+         horizontal axis (pitch), the wall normal turned with it so it stays level */
+      TVec3 upv = up;
+
+      if (rollDeg != 0.f || pitchDeg != 0.f)
+      {
+         TVec3 zv = { -n.x, -n.y, -n.z };
+         float cr = cosf(rollDeg*0.01745329f),
+               sr = sinf(rollDeg*0.01745329f),
+               cp = cosf(pitchDeg*0.01745329f),
+               sp = sinf(pitchDeg*0.01745329f);
+         TVec3 zu = { zv.y*upv.z - zv.z*upv.y, zv.z*upv.x - zv.x*upv.z, zv.x*upv.y - zv.y*upv.x };
+
+         upv.x = upv.x*cr + zu.x*sr;
+         upv.y = upv.y*cr + zu.y*sr;
+         upv.z = upv.z*cr + zu.z*sr;
+
+         TVec3 xv = { upv.y*zv.z - upv.z*zv.y, upv.z*zv.x - upv.x*zv.z, upv.x*zv.y - upv.y*zv.x },
+               xu = { xv.y*upv.z - xv.z*upv.y, xv.z*upv.x - xv.x*upv.z, xv.x*upv.y - xv.y*upv.x },
+               xn = { xv.y*n.z - xv.z*n.y, xv.z*n.x - xv.x*n.z, xv.x*n.y - xv.y*n.x };
+
+         upv.x = upv.x*cp + xu.x*sp;
+         upv.y = upv.y*cp + xu.y*sp;
+         upv.z = upv.z*cp + xu.z*sp;
+         n.x = n.x*cp + xn.x*sp;
+         n.y = n.y*cp + xn.y*sp;
+         n.z = n.z*cp + xn.z*sp;
+      }
+      if (inspectRectOut && pass == 0) // one frontal view per frame: the dominant wall
+      {
+         inspectFrontal(img, bgr(), upv, n, write ? path : NULL, measure);
+         if (measure)
+            measure->wall = wall;
+      }
       if (inspectDoors)
          inspectDoorView(img, bgr(), up, n, outDir, index, wall);
       if (pass == 0 && atan2f(across, along) < 25.f*0.01745329f)
@@ -703,7 +911,8 @@ static void inspectMeasure(const TImageRecord &img, const TFrameMeta &meta, bool
    if (ok && edgePath)
       inspectEdgeImage(luma(), (int)img.width, (int)img.height, img.intr, edges, edgePath);
    if (ok && rectDir)
-      inspectRectify(img, vr, axis.HasReference() ? axis.ReferenceDeg() : vr.roomAxisDeg, rectDir, index);
+      inspectRectify(img, vr, axis.HasReference() ? axis.ReferenceDeg() : vr.roomAxisDeg, rectDir, index, 0.f, 0.f,
+                     index < inspectMaxFrames ? &inspectRect[index] : NULL, false); // measured; written leveled later
    if (ok)
       layout.AddFrame(img.cameraToWorld, vr, edges, tilt.Bias(), center ? 0 : (int)meta.stationIndex);
    if (useApp)
@@ -1170,6 +1379,118 @@ static void inspectOverlay(LPCSTR sessionDir, LPCSTR outDir, DWORD room, const T
 }
 
 //--------------------------------------------------------------------------------
+// Pitch correction of a measured frame: its crease elevation against the median of its wall and line kind
+static float inspectRectPitch(const TRectMeasure &m, const float *medianElev)
+{
+   float target = medianElev[m.wall*2 + (m.floorLine ? 1 : 0)];
+
+   return isnan(target) ? 0.f : cRectPitchSign*(m.elevDeg - target);
+}
+
+/*--------------------------------------------------------------------------------
+   --rectify, second pass: the ceiling creases level every frontal view (user, 2026-09-27: "as linhas
+   de teto definem uma trajetória linear que precisa participar da normalização"). The first pass
+   measured each frame's crease as its own vertical rotated it; now the view turns about its axis
+   until the crease is flat (roll), and - center spin only, every frame from the same spot - about
+   its horizontal axis until the crease stands at the median elevation of that wall's frames
+   (pitch). Corner stations stand elsewhere: roll only. Printed before and after.
+  --------------------------------------------------------------------------------*/
+static void inspectRectifyLevel(LPCSTR sessionDir, LPCSTR outDir, const TVanishResult *frameVr, const DWORD *frameInfo,
+                                int frames, float refAxisDeg)
+{
+   float medianElev[8]; // per wall, ceiling crease then floor crease
+
+   for (int slot = 0; slot < 8; slot++)
+   {
+      float v[inspectMaxFrames];
+      int   n = 0;
+
+      for (int f = 0; f < frames && f < inspectMaxFrames; f++)
+         if (inspectRect[f].ok && !inspectIsSuperseded(inspectStamp[f])
+             && inspectRect[f].wall*2 + (inspectRect[f].floorLine ? 1 : 0) == slot
+             && frameInfo[f]%inspectStations == 0u)
+            v[n++] = inspectRect[f].elevDeg;
+      for (int i = 1; i < n; i++)
+      {
+         float x = v[i];
+         int   k = i - 1;
+
+         while (k >= 0 && v[k] > x)
+         {
+            v[k + 1] = v[k];
+            k--;
+         }
+         v[k + 1] = x;
+      }
+      medianElev[slot] = n ? v[n/2] : NAN;
+   }
+
+   TSessionReader reader;
+   TRecordView    v;
+   int            index = 0;
+
+   if (!reader.Open(sessionDir))
+      return;
+   while (reader.Next(v))
+   {
+      TImageRecord img;
+
+      if (v.type != rtImage || !img.Decode(v.payload, v.length))
+         continue;
+
+      int f = index++;
+
+      if (f >= frames || f >= inspectMaxFrames)
+         break;
+
+      if (inspectIsSuperseded(inspectStamp[f]))
+         continue; // a replaced photo: no frontal view
+
+      const TRectMeasure &m = inspectRect[f];
+      bool                center = frameInfo[f]%inspectStations == 0u;
+      int                 slot = m.wall*2 + (m.floorLine ? 1 : 0);
+      float               target = medianElev[slot],
+                          roll = m.ok ? cRectRollSign*atanf(m.slope)*57.29578f : 0.f,
+                          pitch = m.ok && center && !isnan(target) ? cRectPitchSign*(m.elevDeg - target) : 0.f;
+      TRectMeasure        after = {};
+
+      /* no crease in this frame (furniture, a plain view): the gyroscope's error drifts slowly, so the corrections
+         of the measured neighbors of the same station, a few frames before and after, are interpolated */
+      if (!m.ok)
+      {
+         int prev = -1,
+             next = -1;
+
+         for (int k = f - 1; k >= 0 && k >= f - inspectRectReach && prev < 0; k--)
+            if (inspectRect[k].ok && frameInfo[k] == frameInfo[f])
+               prev = k;
+         for (int k = f + 1; k < frames && k < inspectMaxFrames && k <= f + inspectRectReach && next < 0; k++)
+            if (inspectRect[k].ok && frameInfo[k] == frameInfo[f])
+               next = k;
+         if (prev >= 0 && next >= 0)
+         {
+            float t = (float)(f - prev)/(float)(next - prev),
+                  r0 = cRectRollSign*atanf(inspectRect[prev].slope)*57.29578f,
+                  r1 = cRectRollSign*atanf(inspectRect[next].slope)*57.29578f;
+
+            roll = r0 + (r1 - r0)*t;
+            pitch = center ? inspectRectPitch(inspectRect[prev], medianElev)
+                             + (inspectRectPitch(inspectRect[next], medianElev) - inspectRectPitch(inspectRect[prev], medianElev))*t
+                           : 0.f;
+            printf("  level frame %03d: interpolated from %03d and %03d, roll %+.2f pitch %+.2f deg\n", f, prev, next,
+                   roll, pitch);
+         }
+      }
+
+      inspectRectify(img, frameVr[f], refAxisDeg, outDir, f, roll, pitch, &after, true);
+      if (m.ok)
+         printf("  level frame %03d wall %d %s: slope %+.4f -> %+.4f, elevation %.2f -> %.2f (median %.2f), roll %+.2f"
+                " pitch %+.2f deg\n", f, m.wall, m.floorLine ? "floor" : "ceiling", m.slope,
+                after.ok ? after.slope : NAN, m.elevDeg, after.ok ? after.elevDeg : NAN, target, roll, pitch);
+   }
+}
+
+//--------------------------------------------------------------------------------
 int main(int argc, LPSTR *argv)
 {
    abSetIdlePriority();
@@ -1182,7 +1503,7 @@ int main(int argc, LPSTR *argv)
    TSessionReader reader;
    TRecordView    v;
    char           path[sessionPathMax];
-   QWORD          counts[rtLayout + 1] = {},
+   QWORD          counts[rtDoor + 1] = {},
                   firstNs = 0u,
                   lastNs = 0u;
    int            images = 0;
@@ -1229,6 +1550,11 @@ int main(int argc, LPSTR *argv)
          edgeImages = true;
       else if (!strcmp(argv[i], "--rectify"))
          rectify = true;
+      else if (!strcmp(argv[i], "--doors-all"))
+      {
+         inspectDoors = true;
+         inspectDoorsAll = true;
+      }
       else if (!strcmp(argv[i], "--doors"))
          inspectDoors = true;
       else if (!strcmp(argv[i], "--door-tilt") && i + 1 < argc)
@@ -1253,6 +1579,7 @@ int main(int argc, LPSTR *argv)
          spinRadiusM = (float)atof(argv[++i]);
 
    inspectRectOut = rectify;
+   inspectReadElections(argv[1]);
 #ifdef _WIN32
    CoInitializeEx(NULL, COINIT_MULTITHREADED);
 #endif
@@ -1278,11 +1605,11 @@ int main(int argc, LPSTR *argv)
    }
    fprintf(frames, "seq,room,station,kind,corner,target,band,bin,headingDeg,pitchDeg,sensorNs,width,height,fx,fy,cx,cy,"
                    "jpegBytes,file,vanishFlags,axisVerdict,roomAxisDeg,axisDevDeg,tiltErrDeg,orthoErrDeg,supV,supA,supB,"
-                   "edges,fwdX,fwdY,fwdZ,rollDeg,blurPx,blurMinPx,blurTextured\r\n");
+                   "edges,fwdX,fwdY,fwdZ,rollDeg,blurPx,blurMinPx,blurTextured,elected\r\n");
    fprintf(poses, "sensorNs,headingDeg,pitchDeg,tracking\r\n");
    while (reader.Next(v))
    {
-      if ((int)v.type <= (int)rtLayout)
+      if ((int)v.type <= (int)rtDoor)
          counts[v.type]++;
       if (!firstNs)
          firstNs = v.stampNs;
@@ -1307,6 +1634,16 @@ int main(int argc, LPSTR *argv)
             printf("room %lu %s \"%s\" at %llu ns\n", (unsigned long)r.index, r.event == reBegin ? "begin" : "end",
                    r.name, (unsigned long long)v.stampNs);
       }
+      else if (v.type == rtDoor)
+      {
+         TDoorRecord dr;
+
+         if (dr.Decode(v.payload, v.length))
+            printf("  door %u of room %lu: %s at u %.2f w %.2f, crease/head %.3f (%d frames) -> ceiling line %.2f m\n",
+                   (unsigned)dr.index, (unsigned long)dr.roomIndex,
+                   dr.state == dsConfirmed ? "confirmed" : (dr.state == dsDropped ? "dropped" : "not shot"), dr.u, dr.w,
+                   dr.ratio, dr.ratios, 2.1f*dr.ratio);
+      }
       else if (v.type == rtStation)
       {
          TStationRecord st;
@@ -1315,6 +1652,8 @@ int main(int argc, LPSTR *argv)
          {
             if (st.kind == skCenter && st.event == seBegin)
                printf("  station %lu: center spin\n", (unsigned long)st.index);
+            else if (st.kind == skDoor)
+               printf("  station %lu %s: doors\n", (unsigned long)st.index, st.event == seBegin ? "begin" : "end");
             else if (st.kind != skCenter)
                printf("  station %lu %s: corner %u aiming at corner %u\n", (unsigned long)st.index,
                       st.event == seBegin ? "begin" : "end", (unsigned)st.corner, (unsigned)st.target);
@@ -1458,7 +1797,10 @@ int main(int argc, LPSTR *argv)
                printf("\n");
             }
          }
-         fprintf(frames, "%.2f,%.2f,%d\r\n", br.medianPx, br.sharpPx, br.textured);
+         fprintf(frames, "%.2f,%.2f,%d,%d\r\n", br.medianPx, br.sharpPx, br.textured,
+                 inspectIsSuperseded(v.stampNs) ? 0 : 1); // 0: a retake replaced it, or it lost to the bin's photo
+         if (images < inspectMaxFrames)
+            inspectStamp[images] = v.stampNs;
          images++;
       }
       else if (v.type == rtVanish)
@@ -1485,6 +1827,9 @@ int main(int argc, LPSTR *argv)
          if (overlay)
             inspectOverlay(argv[1], argv[2], statRoom, plan, frameVr(), frameInfo(), images, spinRadiusM);
       }
+      if (rectify)
+         inspectRectifyLevel(argv[1], argv[2], frameVr(), frameInfo(), images,
+                             axis.HasReference() ? axis.ReferenceDeg() : NAN);
       inspectAxisPrint("session", allStats);
    }
 #ifdef _WIN32
@@ -1493,7 +1838,7 @@ int main(int argc, LPSTR *argv)
    fclose(frames);
    fclose(poses);
    printf("records:");
-   for (int t = 1; t <= (int)rtLayout; t++)
+   for (int t = 1; t <= (int)rtDoor; t++)
       printf(" %s=%llu", inspectTypeName((TRecordType)t), (unsigned long long)counts[t]);
    printf("\nspan: %.1f s, truncated tail: %s\n", (float)(lastNs - firstNs)*1e-9f, reader.Truncated() ? "yes" : "no");
    return 0;

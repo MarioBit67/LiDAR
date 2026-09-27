@@ -273,7 +273,61 @@ bool TStationRecord::Decode(LPCBYTE p, size_t n)
    target = r.GetByte();
    if (!r.Ok() || !r.AtEnd())
       return false;
-   return (event == seBegin || event == seEnd) && (kind == skCenter || kind == skCorner);
+   return (event == seBegin || event == seEnd) && (kind == skCenter || kind == skCorner || kind == skDoor);
+}
+
+//--------------------------------------------------------------------------------
+void TDoorRecord::Encode(TByteBuf &out) const
+{
+   out.PutDword(roomIndex);
+   out.PutByte(index);
+   out.PutByte((BYTE)state);
+   out.PutFloat(u);
+   out.PutFloat(w);
+   out.PutFloat(ratio);
+   out.PutDword((DWORD)ratios);
+   out.PutQword(imageNs);
+}
+
+//--------------------------------------------------------------------------------
+bool TDoorRecord::Decode(LPCBYTE p, size_t n)
+{
+   TByteReader r(p, n);
+
+   roomIndex = r.GetDword();
+   index = r.GetByte();
+   state = (TDoorState)r.GetByte();
+   u = r.GetFloat();
+   w = r.GetFloat();
+   ratio = r.GetFloat();
+   ratios = (int)r.GetDword();
+   imageNs = r.GetQword();
+   return r.Ok() && r.AtEnd() && (state == dsPending || state == dsConfirmed || state == dsDropped);
+}
+
+//--------------------------------------------------------------------------------
+void TElectRecord::Encode(TByteBuf &out) const
+{
+   out.PutDword(roomIndex);
+   out.PutByte(stationIndex);
+   out.PutByte(band);
+   out.PutByte(bin);
+   out.PutQword(electedNs);
+   out.PutQword(supersededNs);
+}
+
+//--------------------------------------------------------------------------------
+bool TElectRecord::Decode(LPCBYTE p, size_t n)
+{
+   TByteReader r(p, n);
+
+   roomIndex = r.GetDword();
+   stationIndex = r.GetByte();
+   band = r.GetByte();
+   bin = r.GetByte();
+   electedNs = r.GetQword();
+   supersededNs = r.GetQword();
+   return r.Ok() && r.AtEnd();
 }
 
 //--------------------------------------------------------------------------------

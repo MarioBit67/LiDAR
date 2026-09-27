@@ -3,6 +3,7 @@
 #include "winTypes.h"
 #include "capGeom.h"
 #include "capJPEG.h"
+#include "capVanish.h"
 
 /* Doors as the ruler of a room (user, 2026-09-27: "a verga tem 2,10"). A keyframe is turned by a pure
  * rotation into a frontal, level view of one wall: verticals vertical, the wall's creases horizontal, and
@@ -20,9 +21,10 @@
 
 enum {
    doorViewW   = 900,  // frontal view, pixels
-   doorViewH   = 1200,
+   doorViewH   = 1600, // tall enough for the whole frame: a door's foot must not fall off the view
    doorMaxDoors = 4,
-   doorMaxJambs = 96
+   doorMaxJambs = 96,
+   doorMaxTried = 64
 };
 
 // A frontal, level view of one wall (caller buffers: doorViewW*doorViewH bytes each)
@@ -44,6 +46,7 @@ struct TDoor {
          colorGap,          // chroma+luma distance of the wall above the head to the wall beside it
          score;
    bool  knob,              // a compact dark blob at knob height next to a jamb
+         footCut,           // its foot fell off the photo: floorRow is the photo's edge, nothing measured on it
          nearCorner;        // a full-height vertical edge (a room corner) close to a jamb
 };
 
@@ -51,6 +54,19 @@ struct TDoor {
  * direction the view looks along) from a keyframe; upCam: the true vertical in camera axes. The view keeps
  * the frame's own field centered (principal point shifted, like a shift lens). */
 void doorFrontal(const TYUVImage &img, const TIntrinsics &k, const TVec3 &upCam, const TVec3 &nCam, TDoorView &view);
+
+/* The wall a keyframe shows the most, from its vanishing measure (capVanish): upCam = the measured
+ * vertical, nCam = that wall's horizontal normal from the camera into it (as doorFrontal takes it). Aimed
+ * at a corner, the wall whose lines have more edge support wins. False without a horizontal direction. */
+bool doorFrameWall(const TVanishResult &vr, TVec3 &upCam, TVec3 &nCam);
+
+/* Both walls a frame aimed at a corner shows (the dominant first), or the one it faces: a door on the
+ * wall seen sideways is only upright in that wall's own frontal view (124744: frames 37, 38, 44). */
+int doorFrameWalls(const TVanishResult &vr, TVec3 &upCam, TVec3 *nCam);
+
+// World heading of a column of a frontal view (the view's level ray through it)
+float doorColumnHeadingDeg(const TDoorView &view, const TVec3 &upCam, const TVec3 &nCam, const TMat4 &cameraToWorld,
+                           float col);
 
 // Where the candidates of a view fell (diagnosis)
 struct TDoorStats {
@@ -63,7 +79,12 @@ struct TDoorStats {
        color,     // rejected: the wall above differs from the wall beside
        jambCol[doorMaxJambs], // the jambs themselves: column, top and bottom rows
        jambTop[doorMaxJambs],
-       jambBottom[doorMaxJambs];
+       jambBottom[doorMaxJambs],
+       tried,                  // pairs listed below (the first doorMaxTried)
+       triedA[doorMaxTried],   // their jamb columns and the check that stopped them (0 found, 1 shape,
+       triedB[doorMaxTried],   // 2 foot, 3 plausibility, 4 head, 5 overrun, 6 above, 7 color, 8 leaf)
+       triedWhy[doorMaxTried];
+   float triedValue[doorMaxTried]; // the measure that failed (edges above, color gap...)
 };
 
 // Doors found in a frontal view, best first; returns how many (stats optional)

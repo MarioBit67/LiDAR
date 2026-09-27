@@ -56,6 +56,26 @@ bool TRecordLogWriter::Open(LPCSTR path)
 }
 
 //--------------------------------------------------------------------------------
+bool TRecordLogWriter::Append(LPCSTR path)
+{
+   Close();
+   Pfile = fopen(path, "ab");
+   if (!Pfile)
+      return false;
+   fseek(Pfile, 0, SEEK_END);
+
+   LONG end = (LONG)ftell(Pfile);
+
+   Pbytes = end > 0 ? (QWORD)end : 0u;
+   if (Pbytes < (QWORD)logFileHeader) // not a log
+   {
+      Close();
+      return false;
+   }
+   return true;
+}
+
+//--------------------------------------------------------------------------------
 bool TRecordLogWriter::Write(QWORD stampNs, TRecordType type, LPCBYTE payload, size_t length)
 {
    BYTE header[logRecordHeader];

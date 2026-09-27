@@ -14,12 +14,17 @@ static const float cViewFocal = 0.3f,     // view focal over the frame's: the wh
                    cHeadMinFrac = 0.5f,   // columns between the jambs that see the head edge
                    cOverrunMax = 0.4f,    // columns beside the casing where the head edge runs on (a divider)
                    cRunOnMax = 0.3f,      // rows above the head where a jamb's edge runs on (a panel gap)
-                   cAboveEdgesMax = 0.05f, // edge pixels on the wall above the head
+                   cAboveEdgesMax = 0.10f, // edge pixels on the wall above the head (124744: a plain wall reads 0.07)
                    cColorGapMax = 10.f,   // wall above vs wall beside the door
                    cKnobRowLo = 0.40f,    // knob band, in opening heights above the floor (~1 m of 2.1)
                    cKnobRowHi = 0.52f,
-                   cCameraMinHeads = 0.45f, // camera height in opening heights: ~0.95-2.0 m at 2.10
+                   cCameraMinHeads = 0.55f, // camera height in opening heights: ~1.15-2.0 m at 2.10 (a phone held up)
                    cCameraMaxHeads = 0.95f,
+                   cCutFootMinDeg = 30.f,   // a door foot cut by the photo's edge is accepted when the photo reaches this far down
+                   cDoorAspectInv = 2.6f,   // height over width of a door opening (2.10 over ~0.8)
+                   cCreaseClearHeads = 0.12f, // the ceiling line stands this far above the head at least (the casing top: ~0.03)
+                   cCasingNearHeads = 0.012f, // the casing top stands this far above the head (in openings)...
+                   cCasingFarHeads = 0.12f,   // ...up to this far (a 3-10 cm casing over 2.10; a cut door's height is estimated)
                    cCreaseMinHeads = 1.1f,  // ceiling line in opening heights: ~2.3-3.8 m
                    cCreaseMaxHeads = 1.8f;
 
@@ -79,6 +84,93 @@ void doorFrontal(const TYUVImage &img, const TIntrinsics &k, const TVec3 &upCam,
          view.v[o] = img.v[c];
          view.valid[o] = 1u;
       }
+}
+
+//--------------------------------------------------------------------------------
+bool doorFrameWall(const TVanishResult &vr, TVec3 &upCam, TVec3 &nCam)
+{
+   TVec3 up = vr.dirCam[0],
+         a = vr.dirCam[1];
+
+   if (!(vr.flags & (vfAxisA | vfAxisB)))
+      return false;
+   if (!(vr.flags & vfAxisA)) // only B measured: A is B turned about the vertical
+   {
+      const TVec3 &bm = vr.dirCam[2];
+
+      a.x = bm.y*up.z - bm.z*up.y;
+      a.y = bm.z*up.x - bm.x*up.z;
+      a.z = bm.x*up.y - bm.y*up.x;
+   }
+
+   float d = a.x*up.x + a.y*up.y + a.z*up.z;
+
+   a.x -= d*up.x;
+   a.y -= d*up.y;
+   a.z -= d*up.z;
+
+   float len = sqrtf(a.x*a.x + a.y*a.y + a.z*a.z);
+
+   if (!(len > 1e-6f)) // also NaN
+      return false;
+   a.x /= len;
+   a.y /= len;
+   a.z /= len;
+
+   TVec3 b = { up.y*a.z - up.z*a.y, up.z*a.x - up.x*a.z, up.x*a.y - up.y*a.x };
+   float fa = -a.z, // camera forward (0, 0, -1) along each axis
+         fb = -b.z;
+   bool  facingA = fabsf(fa) >= fabsf(fb),
+         corner = atan2f(fminf(fabsf(fa), fabsf(fb)), fmaxf(fabsf(fa), fabsf(fb))) >= 25.f*0.01745329f;
+
+   // aimed at a corner: the wall it shows more of - a wall holds the lines running along it (A-facing: B edges)
+   if (corner && (vr.flags & vfAxisA) && (vr.flags & vfAxisB))
+      facingA = vr.support[2] >= vr.support[1];
+
+   TVec3 n = facingA ? a : b;
+   float s = (facingA ? fa : fb) >= 0.f ? 1.f : -1.f;
+
+   upCam = up;
+   nCam.x = n.x*s;
+   nCam.y = n.y*s;
+   nCam.z = n.z*s;
+   return true;
+}
+
+//--------------------------------------------------------------------------------
+int doorFrameWalls(const TVanishResult &vr, TVec3 &upCam, TVec3 *nCam)
+{
+   if (!doorFrameWall(vr, upCam, nCam[0]))
+      return 0;
+
+   // the other wall: the dominant normal turned 90 degrees about the vertical, toward the camera's forward
+   TVec3 n = nCam[0],
+         o = { upCam.y*n.z - upCam.z*n.y, upCam.z*n.x - upCam.x*n.z, upCam.x*n.y - upCam.y*n.x };
+   float along = -n.z, // camera forward (0, 0, -1) along each
+         across = -o.z;
+
+   if (atan2f(fabsf(across), fabsf(along)) < 25.f*0.01745329f)
+      return 1; // facing one wall: the other is barely seen
+   if (across < 0.f)
+   {
+      o.x = -o.x;
+      o.y = -o.y;
+      o.z = -o.z;
+   }
+   nCam[1] = o;
+   return 2;
+}
+
+//--------------------------------------------------------------------------------
+float doorColumnHeadingDeg(const TDoorView &view, const TVec3 &upCam, const TVec3 &nCam, const TMat4 &cameraToWorld,
+                           float col)
+{
+   TVec3 zv = { -nCam.x, -nCam.y, -nCam.z },
+         xv = { upCam.y*zv.z - upCam.z*zv.y, upCam.z*zv.x - upCam.x*zv.z, upCam.x*zv.y - upCam.y*zv.x };
+   float rx = (col - view.cx)/view.focalPx;
+   TVec3 ray = { xv.x*rx - zv.x, xv.y*rx - zv.y, xv.z*rx - zv.z };
+
+   return geomHeadingDeg(cameraToWorld.RotateVector(ray));
 }
 
 //--------------------------------------------------------------------------------
@@ -236,6 +328,19 @@ static bool doorKnob(const TDoorView &view, int c0, int c1, int r0, int r1)
 }
 
 //--------------------------------------------------------------------------------
+// Diagnosis: a jamb pair and the check that stopped it (0: it made a door)
+static void doorTried(TDoorStats &st, int a, int b, int why, float value = 0.f)
+{
+   if (st.tried >= doorMaxTried)
+      return;
+   st.triedA[st.tried] = a;
+   st.triedB[st.tried] = b;
+   st.triedWhy[st.tried] = why;
+   st.triedValue[st.tried] = value;
+   st.tried++;
+}
+
+//--------------------------------------------------------------------------------
 int doorDetect(const TDoorView &view, TDoor *doors, int cap, TDoorStats *stats)
 {
    const int  w = doorViewW,
@@ -257,7 +362,8 @@ int doorDetect(const TDoorView &view, TDoor *doors, int cap, TDoorStats *stats)
          size_t  o = (size_t)r*w + c;
          LPCBYTE p = view.y + o;
 
-         if (!view.valid[o - w - 1] || !view.valid[o - w + 1] || !view.valid[o + w - 1] || !view.valid[o + w + 1])
+         if (!view.valid[o - w - 1] || !view.valid[o - w] || !view.valid[o - w + 1] || !view.valid[o - 1] || !view.valid[o + 1]
+             || !view.valid[o + w - 1] || !view.valid[o + w] || !view.valid[o + w + 1]) // the frame's own edge is no edge
             continue;
          gx[o] = (int)p[-w + 1] + 2*(int)p[1] + (int)p[w + 1] - (int)p[-w - 1] - 2*(int)p[-1] - (int)p[w - 1];
          gy[o] = (int)p[w - 1] + 2*(int)p[w] + (int)p[w + 1] - (int)p[-w - 1] - 2*(int)p[-w] - (int)p[-w + 1];
@@ -334,16 +440,19 @@ int doorDetect(const TDoorView &view, TDoor *doors, int cap, TDoorStats *stats)
          if (oh < 50.f || ow < 20.f || ow/oh < cAspectMin || ow/oh > cAspectMax)
          {
             st.shape++;
+            doorTried(st, a.col, b.col, 1);
             continue;
          }
          if (fabsf((float)(a.top - b.top)) > 0.15f*oh || fabsf((float)(a.bottom - b.bottom)) > 0.45f*oh)
          {
             st.shape++;
+            doorTried(st, a.col, b.col, 1);
             continue;
          }
          if (top >= view.horizonRow || bot <= view.horizonRow)
          {
             st.shape++;
+            doorTried(st, a.col, b.col, 1);
             continue;
          }
 
@@ -351,7 +460,7 @@ int doorDetect(const TDoorView &view, TDoor *doors, int cap, TDoorStats *stats)
          int   headRow = -1;
          float headFrac = 0.f;
 
-         for (int r = (int)top - 6; r <= (int)top + 6; r++)
+         for (int r = (a.top < b.top ? a.top : b.top) - 12; r <= (int)top + 6; r++) // between the two tops: a leaf may rise past the head
          {
             float fr = doorRowFrac(gx(), gy(), w, h, r, a.col + 4, b.col - 4);
 
@@ -364,6 +473,7 @@ int doorDetect(const TDoorView &view, TDoor *doors, int cap, TDoorStats *stats)
          if (headFrac < cHeadMinFrac)
          {
             st.head++;
+            doorTried(st, a.col, b.col, 4);
             continue;
          }
 
@@ -380,27 +490,73 @@ int doorDetect(const TDoorView &view, TDoor *doors, int cap, TDoorStats *stats)
                floorRow = (float)jb.bottom;
          }
 
+         /* a door shows its own foot: just below it the view still has the frame. A tall window seen from the ceiling
+            band has "jambs" cut by the edge of the photo, no floor (124744 frame 1) */
+         int  below = (int)floorRow + 12;
+         bool footSeen = below < h - 2 && a.col >= 0 && b.col < w && view.valid[(size_t)below*w + a.col]
+                         && view.valid[(size_t)below*w + b.col],
+              footCut = false;
+
+         /* a foot cut by the photo's own bottom edge: a door close by, when the photo reaches well below the horizon
+            (124744 frame 37: a level frame, the door ~2 m away); a photo of the ceiling band barely does (frame 1:
+            the window). A cut door is a candidate only: without its foot nothing is measured on it */
+         if (!footSeen)
+         {
+            int lowest = -1;
+
+            for (int r = h - 1; r > (int)floorRow && lowest < 0; r--)
+               if (view.valid[(size_t)r*w + a.col] && view.valid[(size_t)r*w + b.col])
+                  lowest = r;
+            footCut = lowest >= 0 && (float)lowest - floorRow < 16.f
+                      && atan2f(view.horizonRow - (float)lowest, view.focalPx)*57.29578f <= -cCutFootMinDeg;
+            if (!footCut)
+            {
+               st.shape++;
+               doorTried(st, a.col, b.col, 2);
+               continue;
+            }
+         }
+
          // from here the opening itself: head to floor (the runs may reach past both)
-         float open = floorRow - (float)headRow,
+         float open = footCut ? fminf(floorRow - (float)headRow, cDoorAspectInv*ow) // cut: the height its width implies
+                              : floorRow - (float)headRow,
                camera = (floorRow - view.horizonRow)/open;
 
-         if (camera < cCameraMinHeads || camera > cCameraMaxHeads)
+         if (!footCut && (camera < cCameraMinHeads || camera > cCameraMaxHeads))
          {
             st.shape++;
+            doorTried(st, a.col, b.col, 3);
             continue; // a camera held below knee height or above a head: not an opening at door scale
          }
 
          // the highest ceiling line over the door: the crease of the floor plan, molding included
          int creaseRow = -1;
 
-         for (int r = 2; r < headRow - (int)(0.05f*open) && creaseRow < 0; r++)
+         for (int r = 2; r < headRow - (int)(cCreaseClearHeads*open) && creaseRow < 0; r++) // clear of the casing top
             if (doorRowFrac(gx(), gy(), w, h, r, a.col - (int)(0.2f*ow), b.col + (int)(0.2f*ow)) >= 0.5f)
                creaseRow = r;
-         if (creaseRow >= 0 && ((floorRow - (float)creaseRow)/open < cCreaseMinHeads
+         if (!footCut && creaseRow >= 0 && ((floorRow - (float)creaseRow)/open < cCreaseMinHeads
                                 || (floorRow - (float)creaseRow)/open > cCreaseMaxHeads))
          {
             st.shape++;
+            doorTried(st, a.col, b.col, 3);
             continue; // a ceiling within a hand of the head, or twice its height: something else
+         }
+
+         /* an open leaf swung parallel to this wall looks just like a door in its frontal view (user, 2026-09-27:
+            "deu positivo na folha aberta"). A door, open or shut, sits in its casing: the casing's top is a second
+            line just above the head, across the whole opening; above a bare leaf there is only the wall */
+         bool casing = false;
+         int  casingFrom = headRow - (int)(cCasingFarHeads*open),
+              casingTo = headRow - (int)(cCasingNearHeads*open);
+
+         for (int r = casingFrom; r <= casingTo && !casing; r++)
+            casing = doorRowFrac(gx(), gy(), w, h, r, a.col + 4, b.col - 4) >= cHeadMinFrac;
+         if (!casing)
+         {
+            st.shape++;
+            doorTried(st, a.col, b.col, 8);
+            continue;
          }
 
          // a wardrobe's divider runs on beside the "casing"; a door head stops
@@ -416,6 +572,7 @@ int doorDetect(const TDoorView &view, TDoor *doors, int cap, TDoorStats *stats)
          if (overrun > cOverrunMax || fminf(onA, onB) > cRunOnMax)
          {
             st.overrun++;
+            doorTried(st, a.col, b.col, 5);
             continue;
          }
 
@@ -438,6 +595,7 @@ int doorDetect(const TDoorView &view, TDoor *doors, int cap, TDoorStats *stats)
          if (!hasAbove || aboveEdges > cAboveEdgesMax || (!hasLeft && !hasRight))
          {
             st.above++;
+            doorTried(st, a.col, b.col, 6, !hasAbove ? -1.f : ((!hasLeft && !hasRight) ? -2.f : aboveEdges)); // -1 no box, -2 no sides
             continue;
          }
 
@@ -459,6 +617,7 @@ int doorDetect(const TDoorView &view, TDoor *doors, int cap, TDoorStats *stats)
          if (gap > cColorGapMax)
          {
             st.color++;
+            doorTried(st, a.col, b.col, 7, gap);
             continue;
          }
 
@@ -497,13 +656,16 @@ int doorDetect(const TDoorView &view, TDoor *doors, int cap, TDoorStats *stats)
          d.headRow = (float)headRow;
          d.floorRow = floorRow;
          d.creaseRow = creaseRow >= 0 ? (float)creaseRow : NAN;
-         d.creaseOverHead = creaseRow >= 0 ? (floorRow - (float)creaseRow)/(floorRow - (float)headRow) : NAN;
-         d.cameraOverHead = camera;
+         d.creaseOverHead = creaseRow >= 0 && !footCut ? (floorRow - (float)creaseRow)/(floorRow - (float)headRow) : NAN;
+         d.cameraOverHead = footCut ? NAN : camera;
          d.colorGap = gap;
          d.knob = knob;
+         d.footCut = footCut;
          d.nearCorner = corner;
          d.score = headFrac + (1.f - overrun) + (cAboveEdgesMax - aboveEdges)*10.f + (cColorGapMax - gap)/cColorGapMax
                    + (knob ? 0.3f : 0.f) + (corner ? 0.3f : 0.f);
+
+         doorTried(st, a.col, b.col, 0);
 
          // keep the best of overlapping openings (outer and inner casing edges frame the same door)
          int slot = -1;

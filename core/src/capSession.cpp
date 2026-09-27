@@ -211,6 +211,80 @@ bool TSessionWriter::WriteLayout(QWORD stampNs, const TLayoutRecord &r)
 }
 
 //--------------------------------------------------------------------------------
+bool TSessionWriter::WriteElect(QWORD stampNs, const TElectRecord &r)
+{
+   TMutexLock lock(Pmutex, thisInfo);
+
+   Pscratch.Clear();
+   r.Encode(Pscratch);
+   return writeLocked(stampNs, rtElect, &Pcounts.elects);
+}
+
+//--------------------------------------------------------------------------------
+bool TSessionWriter::WriteDoor(QWORD stampNs, const TDoorRecord &r)
+{
+   TMutexLock lock(Pmutex, thisInfo);
+
+   Pscratch.Clear();
+   r.Encode(Pscratch);
+   return writeLocked(stampNs, rtDoor, &Pcounts.doors);
+}
+
+/*--------------------------------------------------------------------------------
+   The log copied record by record into capture.lrec.tmp, the dropped images left out, then put in
+   place of the original and reopened for appending. The original goes only once the copy is whole.
+  --------------------------------------------------------------------------------*/
+int TSessionWriter::Compact(LPCQWORD drop, int count)
+{
+   TMutexLock       lock(Pmutex, thisInfo);
+   char             path[sessionPathMax],
+                    tmp[sessionPathMax];
+   TRecordLogReader in;
+   TRecordLogWriter out;
+   TRecordView      v;
+   int              dropped = 0;
+   bool             ok = true;
+
+   if (!Popen || !drop || count <= 0)
+      return 0;
+   sessionJoin(path, Pdir, cRecordFile);
+   snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+   Plog.Close();
+   if (!in.Open(path) || !out.Open(tmp))
+   {
+      Plog.Append(path);
+      return 0;
+   }
+   while (ok && in.Next(v))
+   {
+      bool skip = false;
+
+      for (int i = 0; v.type == rtImage && i < count && !skip; i++)
+         skip = drop[i] == v.stampNs;
+      if (skip)
+      {
+         dropped++;
+         continue;
+      }
+      ok = out.Write(v.stampNs, v.type, v.payload, v.length);
+   }
+   in.Close();
+   out.Close();
+   if (!ok)
+   {
+      remove(tmp);
+      Plog.Append(path);
+      return 0;
+   }
+   remove(path); // rename does not replace on every platform
+   rename(tmp, path);
+   Plog.Append(path);
+   Pcounts.images -= (QWORD)dropped;
+   Pcounts.bytes = Plog.Bytes();
+   return dropped;
+}
+
+//--------------------------------------------------------------------------------
 DWORD TSessionWriter::BeginRoom(QWORD stampNs, LPCSTR name)
 {
    TMutexLock lock(Pmutex, thisInfo);
@@ -340,8 +414,9 @@ bool TSessionWriter::writeManifest(bool complete, QWORD wallNs)
            (unsigned long long)Pcounts.meshes);
    fprintf(f, "\"poses\": %llu, \"locations\": %llu, \"stations\": %llu, ", (unsigned long long)Pcounts.poses,
            (unsigned long long)Pcounts.locations, (unsigned long long)Pcounts.stations);
-   fprintf(f, "\"vanish\": %llu, \"layouts\": %llu, \"bytes\": %llu}\r\n", (unsigned long long)Pcounts.vanish,
-           (unsigned long long)Pcounts.layouts, (unsigned long long)Pcounts.bytes);
+   fprintf(f, "\"vanish\": %llu, \"layouts\": %llu, \"elects\": %llu, \"doors\": %llu, \"bytes\": %llu}\r\n",
+           (unsigned long long)Pcounts.vanish, (unsigned long long)Pcounts.layouts, (unsigned long long)Pcounts.elects,
+           (unsigned long long)Pcounts.doors, (unsigned long long)Pcounts.bytes);
    fprintf(f, "}\r\n");
 
    bool ok = fclose(f) == 0;

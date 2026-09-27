@@ -31,7 +31,8 @@ class TRecordLogWriter
 
    ~TRecordLogWriter(void);
 
-   bool  Open(LPCSTR path);
+   bool  Open(LPCSTR path);   // a new log (an existing file is replaced)
+   bool  Append(LPCSTR path); // an existing log, written on at its end
    bool  Write(QWORD stampNs, TRecordType type, LPCBYTE payload, size_t length);
    void  Flush(void);
    void  Close(void);

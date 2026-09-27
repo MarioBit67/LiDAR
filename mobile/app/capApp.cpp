@@ -6,6 +6,7 @@
 #include "capVanish.h"
 #include "capLayout.h"
 #include "capBlur.h"
+#include "capDoor.h"
 #include "thread.h"
 #include "alloc.h"
 #include "libDiscipline.h"
@@ -32,7 +33,11 @@ enum {
    appFocusTries    = 2,        // focus runs per station when the lens settles at an odd distance
    appBlurHistory   = 64,       // blur of the latest keyframes (the camera's own softness), for their median
    appBlurMinSamples = 5,       // no blur verdict before this many
-   appMaxGuides     = 16        // corner support lines on the spin view
+   appMaxGuides     = 16,       // corner support lines on the spin view
+   appMaxDoors      = 12,       // door candidates of a room
+   appDoorShotMs    = 1500,     // between two door-station shots
+   appMaxSuperseded = 4096,     // replaced photos of a property, dropped from the log at its end (production)
+   appKeepSuperseded = 1        // 1 = debug: the replaced photos stay in the log; 0 = production: overwritten
 };
 
 static const float cFocusDiopters = 0.5f, // fixed focus at 2 m for the whole spin: sharp ~1.3-4 m, constant intrinsics
@@ -48,7 +53,45 @@ static const float cFocusDiopters = 0.5f, // fixed focus at 2 m for the whole sp
                    cFocusLevelHalf = 0.15f, // level poses: the middle 30% of the view each way
                    cFocusMinDiopters = 0.1f, // a room lies between ~0.6 and 10 m; beyond, the AF locked on the wrong thing
                    cFocusMaxDiopters = 1.6f,
-                   cGuideReachM = 0.35f;   // two walls this close to meeting make a corner (the support lines)
+                   cGuideReachM = 0.35f,   // two walls this close to meeting make a corner (the support lines)
+                   cDoorMergeDeg = 8.f,    // doors found this close in heading, from one station, are one
+                   cDoorDrawHalfDeg = 6.f, // half width of a door outline on the spin view
+                   cDoorSameM = 0.6f,      // candidates placed this close on the plan are one door
+                   cDoorCenterDeg = 10.f,  // a door this close to the image center is the one being shot
+                   cDoorAimDeg = 8.f,      // the camera fits the door: its heading this close to the door's
+                   cDoorLevelDeg = 35.f,   // and pitched within this (up for the molding, down for the foot)
+                   cDoorSteadyDps = 4.f,   // turning slower than this
+                   cDoorHeadM = 2.10f,     // a door head (the ruler)
+                   cDoorHalfWidthM = 0.4f, // half of a door opening, for its outline
+                   cWireNearM = 0.05f,     // the wireframe's near plane (camera space)
+                   cWireCornerInM = 0.4f,  // standing in a corner: this far inside it
+                   cWireCameraM = 1.5f;    // camera height before the plan measures it
+
+// A door seen in the room: candidates for the door station (the operator confirms or drops them)
+struct TDoorCandidate {
+   float headingDeg,     // world heading from where it was seen (the spin point or a corner station)
+         ratioSum;       // sum of the crease-over-head ratios measured on it (a level frame with the crease)
+   int   views,          // keyframes that found it
+         ratios;         // of them, with the ratio
+   DWORD station;        // station of its first sighting
+   float obsU,           // where it was seen from, on the plan (NaN: no plan then)
+         obsW;
+};
+
+// A door of the room on the plan, for the door station
+struct TPlanDoor {
+   TPlanPoint at;       // where its heading met the plan's walls
+   float      ratioSum; // crease-over-head ratios measured on it
+   int        ratios;
+   BYTE       state;    // TDoorState: 0 to shoot, 1 confirmed, 2 dropped
+   QWORD      imageNs;  // the shot that confirmed it (its rtImage)
+   float      tanHead,  // door-station shots from one spot: tangents of the head, foot and ceiling line elevations
+              tanFoot,  // in the level frontal view (sums) - the ratio needs no single photo to hold them all
+              tanCrease;
+   int        nHead,
+              nFoot,
+              nCrease;
+};
 
 // Where the focus is measured: what the pose is after
 enum TFocusAim {
@@ -62,7 +105,8 @@ enum TRoomPhase {
    rpNone,   // no room open
    rpCenter, // in-place spin from the middle (both pitch bands)
    rpWalk,   // walking to the next corner, waiting for "arrived"
-   rpCorner  // standing in a corner, sweeping the fan around the opposite one
+   rpCorner, // standing in a corner, sweeping the fan around the opposite one
+   rpDoor    // the doors: each candidate shot frontally, confirmed when found at the image center, or dropped
 };
 
 class TCapApp;
@@ -139,7 +183,20 @@ class TCapApp : public TCapSink
    void  drawPlan(TSurface &s, int x, int y, int size);
    void  drawEye(TSurface &s, int x, int y, float dx, float dy, int size, DWORD rgba);
    void  solvePlan(void);
+   void  writeLayout(bool doorScaled);
+   void  finishDoors(void);
    void  updateGuides(void);
+   void  addDoor(float headingDeg, float creaseOverHead, DWORD station);
+   int   buildPlanDoors(void);
+   void  beginDoors(void);
+   void  nextDoor(void);
+   float doorAimDeg(void) const;
+   void  doorShot(const TDoor *doors, const float *headings, const float *horizons, const float *focals, const TVec3 *walls,
+                  int found, const TFrameMeta &meta, const TMat4 &pose);
+   void  drawDoorAim(TSurface &s, int cx, int cy, int radius);
+   bool  wireToScreen(const TSurface &s, const TVec3 &pc, float &sx, float &sy) const;
+   void  wireEdge(TSurface &s, const TMat4 &pose, const TVec3 &a, const TVec3 &b, DWORD rgba);
+   void  drawWireframe(TSurface &s);
    void  finishProperty(void);
    bool  openSession(void);
    void  drawLabel(TSurface &s, int x, int y, LPCSTR text, DWORD rgba, int sizeDp, bool bold, bool centered);
@@ -155,7 +212,8 @@ class TCapApp : public TCapSink
    TBlock<TSpinTracker> Pspin,
                         Pahead;       // at a corner, the floor view taken early (tilted down during the fan)
    TBlock<DWORD>        Ppreview;
-   TBlock<BYTE>         PjobPlanes;
+   TBlock<BYTE>         PjobPlanes,
+                        PdoorBuf;     // the frontal view the door finder works on (4 planes, worker thread)
    TByteBuf             Pjpeg,
                         Pexif,
                         Pfinal,
@@ -192,10 +250,20 @@ class TCapApp : public TCapSink
                         PbinOrange[spinMaxBands][spinMaxBins]; // its verdict: far off the axes or blurred (accepted, open to a retake)
    float                PbinBlur[spinMaxBands][spinMaxBins];   // FFT blur of the bin's keyframe (NaN: plain image)
    BYTE                 PbinTries[spinMaxBands][spinMaxBins];  // retakes offered to a green bin for a sharper photo
+   QWORD                PbinStamp[spinMaxBands][spinMaxBins],  // stamp of the bin's current photo (its rtImage)
+                        Psuperseded[appMaxSuperseded];         // photos replaced so far in the property
    float                ProomBlur[appBlurHistory];             // latest keyframe blurs of the capture (ring)
    int                  ProomBlurCount,
-                        PguideCount;
+                        PsupersededCount,
+                        PguideCount,
+                        PdoorCount,
+                        PplanDoorCount,
+                        PdoorIdx;     // the door being shot
+   TDoorCandidate       PdoorCand[appMaxDoors];  // doors seen in the room so far
+   TPlanDoor            PplanDoors[appMaxDoors]; // the candidates placed on the plan (the door station goes through them)
+   TPlanPoint           PdoorEye;                // where the operator stands during the door station (plan)
    float                PguideDeg[appMaxGuides]; // world headings of the ceiling corners found so far
+   TPlanPoint           PguideAt[appMaxGuides];  // and where they are on the plan (the wireframe)
    bool                 PguideConvex[appMaxGuides], // that corner juts into the room (the walls leave it away from the spin point)
                         PplanWanted,
                         PplanSketch;  // Pplan is only a square on the room axes (no plan could be made): no dimensions
@@ -205,7 +273,9 @@ class TCapApp : public TCapSink
                         PbtnFinish;
    QWORD                PjobStampNs,
                         PfocusNs,     // the focus run began
-                        PbackArmedNs; // first Back pressed at (0: not armed)
+                        PbackArmedNs, // first Back pressed at (0: not armed)
+                        PdoorShotNs,  // the door station's last shot
+                        PdoorPrevNs;  // and its previous frame (turn rate)
    DWORD                PkeySeq,
                         PstationCount,
                         ProomIndex;
@@ -218,8 +288,12 @@ class TCapApp : public TCapSink
                         PringHead,
                         PringCount,
                         PpreviewH,
+                        PpropRatios,  // how many
                         Prooms;
-   float                PhfovDeg,
+   float                PdoorPrevHeading, // heading of the door station's previous frame
+                        PpropCeilingM,    // the property's ceiling line from its doors (NaN until a door station measures it)
+                        PpropRatioSum,    // the confirmed doors' crease-over-head ratios so far
+                        PhfovDeg,
                         PvfovDeg;
    bool                 PcamReady,
                         PlocAllowed,
@@ -248,8 +322,8 @@ void TKeyframeWorker::DoJob(void)
 TCapApp::TCapApp(TCapPort *port) : Pport(port), Pencoder(appJPEGQuality), Pworker(*this), PjobMeta(), Pring(),
    Pcam(), Pintr(), Ploc(), Pjob(), Pverdict(svCovered), PcenterCfg(), PcornerCfg(), PfloorCfg(),
    PvanishCfg(TVanishConfig::Default()), PaxisCheck(cAxisTolDeg), PaxisVerdict(avNoLines), Pplan(), PguidePlan(), Pedges(),
-   PfocusAim(faLevel), PfocusTries(0), PfocusBand(0), PcornerStep(0), PcornerCount(4), PcornerSlot(0), PcornerMask(0u), PbinAxis(), PbinDone(), PbinOrange(), PbinBlur(), PbinTries(), ProomBlur(), ProomBlurCount(0), PguideCount(0), PguideDeg(), PguideConvex(), PplanWanted(false), PplanSketch(false), Pphase(rpNone), Pstation(), PbtnMain(), PbtnFinish(), PjobStampNs(0u), PfocusNs(0u), PbackArmedNs(0u), PkeySeq(0u),
-   PstationCount(0u), ProomIndex(0u), PviewW(0), PviewH(0), Pdensity(256), PringHead(0), PringCount(0), PpreviewH(0), Prooms(0), PhfovDeg(60.f),
+   PfocusAim(faLevel), PfocusTries(0), PfocusBand(0), PcornerStep(0), PcornerCount(4), PcornerSlot(0), PcornerMask(0u), PbinAxis(), PbinDone(), PbinOrange(), PbinBlur(), PbinTries(), PbinStamp(), Psuperseded(), ProomBlur(), ProomBlurCount(0), PsupersededCount(0), PguideCount(0), PdoorCount(0), PplanDoorCount(0), PdoorIdx(0), PdoorCand(), PplanDoors(), PdoorEye(), PguideDeg(), PguideAt(), PguideConvex(), PplanWanted(false), PplanSketch(false), Pphase(rpNone), Pstation(), PbtnMain(), PbtnFinish(), PjobStampNs(0u), PfocusNs(0u), PbackArmedNs(0u), PdoorShotNs(0u), PdoorPrevNs(0u), PkeySeq(0u),
+   PstationCount(0u), ProomIndex(0u), PviewW(0), PviewH(0), Pdensity(256), PringHead(0), PringCount(0), PpreviewH(0), PpropRatios(0), Prooms(0), PdoorPrevHeading(0.f), PpropCeilingM(NAN), PpropRatioSum(0.f), PhfovDeg(60.f),
    PvfovDeg(60.f), PcamReady(false), PlocAllowed(false), PhasLoc(false), PhasPreview(false),
    ProomOpen(false), PjobBusy(false), PcompleteSignaled(false), PfloorView(false), Pmagnetic(false), PsensorFresh(true),
    Pfocusing(false), PaheadDone(false), PposeOk(true)
@@ -393,6 +467,12 @@ void TCapApp::OnCameraReady(const TCamInfo &info)
       Pedges.label = PedgeLabels();
       Pedges.capacity = (DWORD)PvanishCfg.maxEdges;
       Pedges.count = 0u;
+   }
+   if (!PdoorBuf())
+   {
+      TAlloc<BYTE> door((size_t)doorViewW*doorViewH*4u); // luma, chroma and the valid mask of a frontal view
+
+      door.Drop(PdoorBuf);
    }
    PhasPreview = false;
    PcamReady = true;
@@ -561,8 +641,8 @@ void TCapApp::queueKeyframe(const TCamFrame &f, const TMat4 &pose, const TAttitu
    PjobMeta.intr = Pintr;
    for (int i = 0; i < 5; i++)
       PjobMeta.distortion[i] = Pcam.distortion[i];
-   PjobMeta.headingDeg = Pspin->LastHeadingDeg();
-   PjobMeta.pitchDeg = Pspin->LastPitchDeg();
+   PjobMeta.headingDeg = geomHeadingDeg(pose.Forward()); // as the tracker saw it (the door station has none)
+   PjobMeta.pitchDeg = geomPitchDeg(pose.Forward());
 
    TVec3 fwd = pose.Forward();
 
@@ -570,8 +650,8 @@ void TCapApp::queueKeyframe(const TCamFrame &f, const TMat4 &pose, const TAttitu
    PjobMeta.forward[1] = fwd.y;
    PjobMeta.forward[2] = fwd.z;
    PjobMeta.rollDeg = geomRollDeg(pose);
-   PjobMeta.spinBand = (BYTE)(floorFrame ? appFloorBand : Pspin->LastKeptBand()); // the floor view: its own band
-   PjobMeta.spinBin = (BYTE)(floorFrame ? 0 : Pspin->LastKeptBin()); // one bin
+   PjobMeta.spinBand = (BYTE)(floorFrame ? appFloorBand : (Pphase == rpDoor ? 0 : Pspin->LastKeptBand())); // floor view: own band
+   PjobMeta.spinBin = (BYTE)(floorFrame ? 0 : (Pphase == rpDoor ? PdoorIdx : Pspin->LastKeptBin())); // door station: the door
    PjobMeta.stationIndex = (BYTE)Pstation.index;
    PjobMeta.stationKind = (BYTE)Pstation.kind;
    PjobMeta.cornerIndex = Pstation.kind == skCorner ? Pstation.corner : 0u;
@@ -650,13 +730,51 @@ void TCapApp::EncodePending(void)
    TBlurResult blur = {};
 
    blurMeasure(img.y, img.width, img.height, img.yStride, blur); // on the raw luma, before JPEG
+
+   /* doors on the walls the frame shows (both when aimed at a corner: a door on the wall seen sideways is only upright
+      in that wall's frontal view): candidates for the door station, which the operator confirms */
+   TDoor     doors[doorMaxDoors];
+   float     doorHeading[doorMaxDoors],
+             doorHorizon[doorMaxDoors],  // the frontal view each door was found in: its level row and focal
+             doorFocal[doorMaxDoors];
+   TVec3     doorWallN[doorMaxDoors],    // and that wall's normal (camera axes)
+             doorUp = {},
+             doorN[2] = {};
+   int       doorsFound = 0,
+             walls = measured && PdoorBuf() ? doorFrameWalls(vr, doorUp, doorN) : 0;
+   size_t    plane = (size_t)doorViewW*doorViewH;
+   TDoorView view = { PdoorBuf(), PdoorBuf() + plane, PdoorBuf() + 2*plane, PdoorBuf() + 3*plane, 0.f, 0.f, 0.f };
+
+   for (int k = 0; k < walls && doorsFound < doorMaxDoors; k++)
+   {
+      TDoor found[doorMaxDoors];
+      int   n;
+
+      doorFrontal(img, rec.intr, doorUp, doorN[k], view);
+      n = doorDetect(view, found, doorMaxDoors);
+      for (int i = 0; i < n && doorsFound < doorMaxDoors; i++)
+      {
+         doors[doorsFound] = found[i];
+         doorHeading[doorsFound] = doorColumnHeadingDeg(view, doorUp, doorN[k], rec.cameraToWorld,
+                                                        0.5f*(found[i].leftCol + found[i].rightCol));
+         doorHorizon[doorsFound] = view.horizonRow;
+         doorFocal[doorsFound] = view.focalPx;
+         doorWallN[doorsFound] = doorN[k];
+         doorsFound++;
+      }
+   }
    {
       TMutexLock lock(Pmutex, thisInfo);
       float      dev = NAN;
-      bool       sameRoom = ProomOpen && ProomIndex == meta.roomIndex;
+      bool       sameRoom = ProomOpen && ProomIndex == meta.roomIndex,
+                 doorFrame = meta.stationKind == (BYTE)skDoor;
 
       meta.blurPx = blur.medianPx;
       meta.blurMinPx = blur.sharpPx;
+      for (int i = 0; i < doorsFound && sameRoom && !doorFrame; i++)
+         addDoor(doorHeading[i], doors[i].creaseOverHead, meta.stationIndex);
+      if (doorFrame && sameRoom && Pphase == rpDoor && meta.stationIndex == (BYTE)Pstation.index)
+         doorShot(doors, doorHeading, doorHorizon, doorFocal, doorWallN, doorsFound, meta, rec.cameraToWorld);
       if (sameRoom && !isnan(blur.medianPx))
          addRoomBlur(blur.medianPx);
       PaxisVerdict = measured && sameRoom ? PaxisCheck.Offer(vr, &dev) : avNoLines;
@@ -687,7 +805,7 @@ void TCapApp::EncodePending(void)
       bool floorFrame = meta.stationKind == (BYTE)skCorner && meta.spinBand == (BYTE)appFloorBand;
       int  band = floorFrame ? 0 : (int)meta.spinBand;
 
-      if (sameRoom && meta.stationIndex == (BYTE)Pstation.index && floorFrame == PfloorView && band < spinMaxBands
+      if (sameRoom && !doorFrame && meta.stationIndex == (BYTE)Pstation.index && floorFrame == PfloorView && band < spinMaxBands
           && meta.spinBin < spinMaxBins)
       {
          int  bin = meta.spinBin;
@@ -695,8 +813,17 @@ void TCapApp::EncodePending(void)
 
          /* a green bin retaken for sharpness keeps its photo unless the new one is sharper (user, 2026-09-27:
             "uma nova captura, mesmo verde, com borrão menor deve substituir a anterior") */
+         TElectRecord elect = {};
+
+         elect.roomIndex = meta.roomIndex;
+         elect.stationIndex = meta.stationIndex;
+         elect.band = (BYTE)band;
+         elect.bin = (BYTE)bin;
          if (!PbinDone[band][bin] || PbinOrange[band][bin] || sharper)
          {
+            elect.electedNs = stamp; // this photo is the bin's now; the one before it (if any) is superseded
+            elect.supersededNs = PbinDone[band][bin] ? PbinStamp[band][bin] : 0u;
+            PbinStamp[band][bin] = stamp;
             PbinAxis[band][bin] = measured ? vr.roomAxisDeg : NAN;
             PbinBlur[band][bin] = blur.medianPx;
             PbinDone[band][bin] = true;
@@ -707,6 +834,14 @@ void TCapApp::EncodePending(void)
             PbinOrange[band][bin] = (!floorFrame && binOffAxis(band, bin))
                                     || (!isnan(blur.medianPx) && blur.medianPx > blurFloorPx(cBlurOrangeRel, cBlurMaxPx));
          }
+         else
+         {
+            elect.electedNs = PbinStamp[band][bin]; // a retake that was no sharper: it loses to the bin's photo
+            elect.supersededNs = stamp;
+         }
+         Psession.WriteElect(stamp, elect);
+         if (elect.supersededNs && PsupersededCount < appMaxSuperseded)
+            Psuperseded[PsupersededCount++] = elect.supersededNs;
          if (Pspin && PbinOrange[band][bin])
             Pspin->Reopen(band, bin, true);
          else if (Pspin && PbinBlur[band][bin] > blurFloorPx(cBlurRetakeRel, cBlurGoodPx) && PbinTries[band][bin] < appBlurTries)
@@ -895,6 +1030,29 @@ void TCapApp::OnFrame(const TCamFrame &frame)
       if (Pverdict == svKeep)
          checkComplete();
    }
+   else if (Pphase == rpDoor && attitudeAt(frame.stampNs, a))
+   {
+      // the door station: a shot once the camera fits the door - level, steady, aimed at it
+      TMat4 pose = poseOf(a);
+      float heading = geomHeadingDeg(pose.Forward()),
+            pitch = geomPitchDeg(pose.Forward()),
+            dt = PdoorPrevNs && frame.stampNs > PdoorPrevNs ? (float)(frame.stampNs - PdoorPrevNs)*1e-9f : 0.f,
+            rate = dt > 0.f && dt < 0.5f ? fabsf(geomHeadingDiffDeg(heading, PdoorPrevHeading))/dt : 1e9f;
+      bool  aimed = fabsf(geomHeadingDiffDeg(heading, doorAimDeg())) <= cDoorAimDeg;
+
+      PdoorPrevNs = frame.stampNs;
+      PdoorPrevHeading = heading;
+      if (Pfocusing && frame.stampNs - PfocusNs > (QWORD)appFocusMaxMs*1000000u)
+         Pfocusing = false;
+      PposeOk = fabsf(pitch) <= cDoorLevelDeg;
+      if (PposeOk && aimed && rate <= cDoorSteadyDps && !PjobBusy && !Pfocusing && PdoorIdx >= 0
+          && frame.stampNs - PdoorShotNs > (QWORD)appDoorShotMs*1000000u)
+      {
+         PdoorShotNs = frame.stampNs;
+         queueKeyframe(frame, pose, a, false);
+         Pport->Vibrate(15);
+      }
+   }
    Pport->RequestPaint();
 }
 
@@ -1014,9 +1172,318 @@ void TCapApp::updateGuides(void)
                backU = (midU - u)*u < 0.f;
 
          PguideDeg[PguideCount] = fmodf(PguidePlan.axisDeg + atan2f(w, u)*57.29578f + 720.f, 360.f);
+         PguideAt[PguideCount].u = u;
+         PguideAt[PguideCount].w = w;
          PguideConvex[PguideCount] = !backW && !backU;
          PguideCount++;
       }
+}
+
+/*--------------------------------------------------------------------------------
+   A door found on a keyframe joins the candidate seen from the same station at a heading this close,
+   or becomes a new one; the crease-over-head ratio (a level frame with the crease) accumulates.
+  --------------------------------------------------------------------------------*/
+void TCapApp::addDoor(float headingDeg, float creaseOverHead, DWORD station)
+{
+   int k = -1;
+
+   for (int i = 0; i < PdoorCount && k < 0; i++)
+      if (PdoorCand[i].station == station && fabsf(geomHeadingDiffDeg(PdoorCand[i].headingDeg, headingDeg)) <= cDoorMergeDeg)
+         k = i;
+   if (k < 0)
+   {
+      if (PdoorCount >= appMaxDoors)
+         return;
+      k = PdoorCount++;
+      PdoorCand[k] = TDoorCandidate();
+      PdoorCand[k].headingDeg = headingDeg;
+      PdoorCand[k].station = station;
+      PdoorCand[k].obsU = NAN;
+      PdoorCand[k].obsW = NAN;
+      if (station == 0u) // the spin point is the plan's origin
+      {
+         PdoorCand[k].obsU = 0.f;
+         PdoorCand[k].obsW = 0.f;
+      }
+      else if (Pplan.valid && !PplanSketch && Pstation.kind == skCorner && Pstation.index == station
+               && Pstation.corner < Pplan.vertexCount)
+      {
+         PdoorCand[k].obsU = Pplan.verts[Pstation.corner].u;
+         PdoorCand[k].obsW = Pplan.verts[Pstation.corner].w;
+      }
+   }
+   PdoorCand[k].views++;
+   if (!isnan(creaseOverHead))
+   {
+      PdoorCand[k].ratioSum += creaseOverHead;
+      PdoorCand[k].ratios++;
+   }
+}
+
+/*--------------------------------------------------------------------------------
+   The candidates on the plan: from where each was seen, its heading runs to the first wall of the
+   polygon; candidates of different stations landing within cDoorSameM are one door.
+  --------------------------------------------------------------------------------*/
+int TCapApp::buildPlanDoors(void)
+{
+   PplanDoorCount = 0;
+   if (!Pplan.valid || PplanSketch || Pplan.vertexCount < 3)
+      return 0;
+   for (int k = 0; k < PdoorCount; k++)
+   {
+      const TDoorCandidate &c = PdoorCand[k];
+
+      if (isnan(c.obsU))
+         continue;
+
+      float t = (c.headingDeg - Pplan.axisDeg)*0.01745329f,
+            du = cosf(t),
+            dw = sinf(t),
+            best = 1e9f;
+
+      for (int i = 0; i < Pplan.vertexCount; i++)
+      {
+         const TPlanPoint &a = Pplan.verts[i],
+                          &b = Pplan.verts[(i + 1)%Pplan.vertexCount];
+         float             eu = b.u - a.u,
+                           ew = b.w - a.w,
+                           den = du*ew - dw*eu;
+
+         if (fabsf(den) < 1e-6f)
+            continue;
+
+         float s = ((a.u - c.obsU)*ew - (a.w - c.obsW)*eu)/den, // along the ray
+               r = ((a.u - c.obsU)*dw - (a.w - c.obsW)*du)/den; // along the wall
+
+         if (s > 0.2f && r >= 0.f && r <= 1.f && s < best)
+            best = s;
+      }
+      if (best > 1e8f)
+         continue;
+
+      TPlanPoint at = { c.obsU + best*du, c.obsW + best*dw };
+      int        same = -1;
+
+      for (int i = 0; i < PplanDoorCount && same < 0; i++)
+      {
+         float eu = PplanDoors[i].at.u - at.u,
+               ew = PplanDoors[i].at.w - at.w;
+
+         if (sqrtf(eu*eu + ew*ew) <= cDoorSameM)
+            same = i;
+      }
+      if (same < 0 && PplanDoorCount < appMaxDoors)
+      {
+         same = PplanDoorCount++;
+         PplanDoors[same] = TPlanDoor();
+         PplanDoors[same].at = at;
+      }
+      if (same >= 0)
+      {
+         PplanDoors[same].ratioSum += c.ratioSum;
+         PplanDoors[same].ratios += c.ratios;
+      }
+   }
+   return PplanDoorCount;
+}
+
+/*--------------------------------------------------------------------------------
+   The door station (user, 2026-09-27): the last one of the room. The operator goes back to the spin
+   point (from the last corner a door may stand right beside, with no aim at all: 123038); the map
+   and the aim view show the door to shoot; once the camera frame fits it, level and steady, the
+   photo is taken, and a door found at its center confirms it. "Descartar" drops a false one. Each
+   shot also tells where the operator stands (doorShot).
+  --------------------------------------------------------------------------------*/
+void TCapApp::beginDoors(void)
+{
+   PdoorEye.u = 0.f; // from the spin point (the white cross): the doors face it, and the operator knows the spot
+   PdoorEye.w = 0.f;
+   Pstation.event = seBegin;
+   Pstation.roomIndex = ProomIndex;
+   Pstation.index = PstationCount++;
+   Pstation.kind = skDoor;
+   Psession.WriteStation(Pport->SensorClockNs(), Pstation);
+   Pphase = rpDoor;
+   PdoorIdx = -1;
+   PdoorShotNs = 0u;
+   PposeOk = true;
+   nextDoor();
+   if (Pphase == rpDoor)
+   {
+      PfocusTries = 0;
+      requestFocus(faLevel);
+   }
+}
+
+//--------------------------------------------------------------------------------
+// The next door to shoot; none left: the room is done
+void TCapApp::nextDoor(void)
+{
+   int next = -1;
+
+   for (int i = 0; i < PplanDoorCount && next < 0; i++)
+      if (PplanDoors[i].state == 0u)
+         next = i;
+   PdoorIdx = next;
+   if (next >= 0)
+      return;
+   finishDoors();
+   endStation();
+   Pphase = rpWalk; // the station is already closed: finishRoom must not close it again
+   finishRoom();
+}
+
+//--------------------------------------------------------------------------------
+// World heading from where the operator stands to the door being shot
+float TCapApp::doorAimDeg(void) const
+{
+   if (PdoorIdx < 0 || PdoorIdx >= PplanDoorCount)
+      return 0.f;
+
+   const TPlanPoint &d = PplanDoors[PdoorIdx].at;
+
+   return fmodf(Pplan.axisDeg + atan2f(d.w - PdoorEye.w, d.u - PdoorEye.u)*57.29578f + 720.f, 360.f);
+}
+
+/*--------------------------------------------------------------------------------
+   A door-station keyframe came back from the worker. A door found at the image center confirms the
+   door being shot (its ratio joins the door's). Any door found also places the operator (user: "o
+   giroscópio mais o teto dão a posição"): in the level frontal view the crease stands at elevation e
+   above the camera, so the wall lies (crease - camera) / tan(e) away - both heights known in door
+   heads from the door itself - and the operator is that far back from the door along the ray.
+  --------------------------------------------------------------------------------*/
+void TCapApp::doorShot(const TDoor *doors, const float *headings, const float *horizons, const float *focals,
+                       const TVec3 *walls, int found, const TFrameMeta &meta, const TMat4 &pose)
+{
+   int centered = -1;
+
+   for (int i = 0; i < found && centered < 0; i++)
+      if (fabsf(geomHeadingDiffDeg(headings[i], meta.headingDeg)) <= cDoorCenterDeg)
+         centered = i;
+   for (int i = 0; i < found; i++)
+   {
+      const TDoor &d = doors[i];
+
+      if (isnan(d.creaseRow) || isnan(d.creaseOverHead))
+         continue;
+
+      float e = atan2f(horizons[i] - d.creaseRow, focals[i]),
+            wallM = cDoorHeadM*(d.creaseOverHead - d.cameraOverHead)/tanf(e), // perpendicular distance to the wall
+            normalDeg = geomHeadingDeg(pose.RotateVector(walls[i])),
+            cosPhi = cosf((headings[i] - normalDeg)*0.01745329f),
+            t = (headings[i] - Pplan.axisDeg)*0.01745329f;
+
+      if (!(e > 0.05f) || fabsf(cosPhi) < 0.3f || !(wallM > 0.3f && wallM < 12.f))
+         continue;
+
+      // only the centered door is surely the one being shot: it places the operator
+      int   k = i == centered ? PdoorIdx : -1;
+      float range = wallM/fabsf(cosPhi);
+
+      if (k < 0 || k >= PplanDoorCount)
+         continue;
+      PdoorEye.u = PplanDoors[k].at.u - range*cosf(t);
+      PdoorEye.w = PplanDoors[k].at.w - range*sinf(t);
+   }
+   if (centered < 0 || PdoorIdx < 0 || PdoorIdx >= PplanDoorCount)
+      return;
+
+   /* the ratio by angles: in the level frontal view every point of the wall lies at the same distance, so a height
+      above the floor is D (tan e - tan e_foot); head, foot and ceiling line may come from different shots of one
+      spot (a close door never fits whole: 132058 frame 53 had the foot, 37/38 the molding) */
+   TPlanDoor   &pd = PplanDoors[PdoorIdx];
+   const TDoor &d = doors[centered];
+   bool         first = pd.state != (BYTE)dsConfirmed;
+
+   pd.tanHead += (horizons[centered] - d.headRow)/focals[centered];
+   pd.nHead++;
+   if (!d.footCut)
+   {
+      pd.tanFoot += (horizons[centered] - d.floorRow)/focals[centered];
+      pd.nFoot++;
+   }
+   if (!isnan(d.creaseRow))
+   {
+      pd.tanCrease += (horizons[centered] - d.creaseRow)/focals[centered];
+      pd.nCrease++;
+   }
+   pd.state = (BYTE)dsConfirmed;
+   if (first)
+   {
+      pd.imageNs = meta.sensorNs;
+      Pport->Vibrate(120);
+   }
+   if (!pd.nFoot || !pd.nCrease)
+      return; // confirmed; the aim view asks for the part still missing
+
+   float th = pd.tanHead/(float)pd.nHead,
+         tf = pd.tanFoot/(float)pd.nFoot,
+         tc = pd.tanCrease/(float)pd.nCrease;
+
+   if (th - tf > 0.05f)
+   {
+      pd.ratioSum = (tc - tf)/(th - tf);
+      pd.ratios = 1;
+   }
+   Pport->Vibrate(200);
+   nextDoor();
+}
+
+/*--------------------------------------------------------------------------------
+   The door station is over (every door shot or dropped, or the room ended): the confirmed doors'
+   ratios measure the ceiling line (the head is 2.10 m), for this room and - one ceiling height in a
+   building (user, 2026-09-27) - for the whole property, the next rooms solving at it. The plan is
+   scaled to it and recorded again; every door gets its record in that final scale.
+  --------------------------------------------------------------------------------*/
+void TCapApp::finishDoors(void)
+{
+   float before = Pplan.ceilingM;
+
+   for (int i = 0; i < PplanDoorCount; i++)
+      if (PplanDoors[i].state == (BYTE)dsConfirmed && PplanDoors[i].ratios > 0)
+      {
+         PpropRatioSum += PplanDoors[i].ratioSum;
+         PpropRatios += PplanDoors[i].ratios;
+      }
+   if (PpropRatios > 0)
+      PpropCeilingM = cDoorHeadM*PpropRatioSum/(float)PpropRatios;
+
+   bool scaled = !isnan(PpropCeilingM) && Pplan.valid && !PplanSketch && before > 0.f;
+
+   if (scaled)
+   {
+      float f = PpropCeilingM/before;
+
+      layoutScalePlan(Pplan, PpropCeilingM);
+      for (int i = 0; i < PplanDoorCount; i++)
+      {
+         PplanDoors[i].at.u *= f;
+         PplanDoors[i].at.w *= f;
+      }
+      PdoorEye.u *= f;
+      PdoorEye.w *= f;
+      writeLayout(true);
+   }
+   for (int i = 0; i < PplanDoorCount; i++)
+   {
+      TDoorRecord rec = {};
+
+      rec.roomIndex = ProomIndex;
+      rec.index = (BYTE)i;
+      rec.state = (TDoorState)PplanDoors[i].state;
+      rec.u = PplanDoors[i].at.u;
+      rec.w = PplanDoors[i].at.w;
+      rec.ratio = PplanDoors[i].ratios ? PplanDoors[i].ratioSum/(float)PplanDoors[i].ratios : NAN;
+      rec.ratios = PplanDoors[i].ratios;
+      rec.imageNs = PplanDoors[i].imageNs;
+      Psession.WriteDoor(Pport->SensorClockNs(), rec);
+   }
+
+   char msg[96];
+
+   snprintf(msg, sizeof(msg), "doors: %d, ceiling line %.2f m (%d ratios), plan %s", PplanDoorCount, PpropCeilingM,
+            PpropRatios, scaled ? "scaled" : "as solved");
+   Pport->Log(msg);
 }
 
 //--------------------------------------------------------------------------------
@@ -1089,6 +1556,9 @@ bool TCapApp::openSession(void)
    if (!Psession.Open(dir, dev, Pport->WallClockNs()))
       return false;
    Prooms = 0;
+   PpropCeilingM = NAN; // a new property: its doors will measure its ceiling
+   PpropRatioSum = 0.f;
+   PpropRatios = 0;
    if (PhasLoc)
       Psession.WriteLocation(Pport->SensorClockNs(), Ploc);
    return true;
@@ -1112,6 +1582,7 @@ void TCapApp::startRoom(void)
    PaxisCheck.Reset();
    PaxisVerdict = avNoLines;
    Playout.Reset();
+   PdoorCount = 0;
    PguideCount = 0;
    Pplan = TLayoutPlan();
    PplanSketch = false;
@@ -1165,7 +1636,7 @@ void TCapApp::beginStation(TStationKind kind)
 //--------------------------------------------------------------------------------
 void TCapApp::endStation(void)
 {
-   if (Pphase != rpCenter && Pphase != rpCorner)
+   if (Pphase != rpCenter && Pphase != rpCorner && Pphase != rpDoor)
       return;
    Pstation.event = seEnd;
    Psession.WriteStation(Pport->SensorClockNs(), Pstation);
@@ -1189,6 +1660,13 @@ void TCapApp::stationDone(void)
    }
    if (!wasCenter && PcornerStep + 1 >= PcornerCount)
    {
+      PcornerMask |= 1u << PcornerSlot;
+      PcornerStep++;
+      if (buildPlanDoors() > 0)
+      {
+         beginDoors(); // the last station of the room: its doors
+         return;
+      }
       Pphase = rpWalk; // the station is already closed: finishRoom must not close it again
       finishRoom();
       return;
@@ -1260,6 +1738,8 @@ void TCapApp::finishRoom(void)
 {
    if (!ProomOpen)
       return;
+   if (Pphase == rpDoor) // ended during the door station: the doors so far still measure
+      finishDoors();
    endStation();
    Psession.EndRoom(Pport->SensorClockNs(), Pplan.valid ? Pplan.cameraHeightM : NAN);
    ProomOpen = false;
@@ -1275,34 +1755,19 @@ void TCapApp::finishRoom(void)
   --------------------------------------------------------------------------------*/
 void TCapApp::solvePlan(void)
 {
-   TLayoutRecord rec = {};
-
    PplanWanted = false;
-   if (!Playout.Solve(Playout.AnchorDeg(), cCeilingM, Pplan))
+
+   /* the property's ceiling line, once a door station measured it, is this room's too (one ceiling height in a
+      building, user 2026-09-27): it replaces the assumption and no door-head guess may snap it away */
+   bool ruler = !isnan(PpropCeilingM);
+
+   if (!Playout.Solve(Playout.AnchorDeg(), ruler ? PpropCeilingM : cCeilingM, Pplan))
       Pplan.valid = false;
+   if (ruler && Pplan.valid)
+      layoutScalePlan(Pplan, PpropCeilingM);
    PcornerCount = Pplan.valid ? Pplan.stationCount : 4;
    PcornerSlot = nextCorner();
-   rec.roomIndex = ProomIndex;
-   rec.flags = (BYTE)((Pplan.valid ? lfValid : 0) | (Pplan.complete ? lfComplete : 0)
-                      | (Pplan.heightSolved ? lfHeightSolved : 0));
-   rec.vertexCount = (BYTE)Pplan.vertexCount;
-   rec.stationCount = (BYTE)Pplan.stationCount;
-   rec.axisDeg = Pplan.axisDeg;
-   rec.ceilingM = Pplan.ceilingM;
-   rec.assumedCeilingM = Pplan.assumedCeilingM;
-   rec.cameraHeightM = Pplan.cameraHeightM;
-   rec.doorScale = Pplan.doorScale;
-   for (int i = 0; i < Pplan.vertexCount && i < layoutRecMaxVerts; i++)
-   {
-      rec.u[i] = Pplan.verts[i].u;
-      rec.w[i] = Pplan.verts[i].w;
-   }
-   for (int i = 0; i < Pplan.stationCount && i < layoutRecMaxStations; i++)
-   {
-      rec.stationVertex[i] = Pplan.stationVertex[i];
-      rec.targetVertex[i] = Pplan.targetVertex[i];
-   }
-   Psession.WriteLayout(Pport->SensorClockNs(), rec);
+   writeLayout(ruler);
    Pport->Vibrate(Pplan.valid ? 60 : 20);
    PplanSketch = !Pplan.valid && PaxisCheck.HasReference();
    if (PplanSketch)
@@ -1331,11 +1796,46 @@ void TCapApp::solvePlan(void)
 }
 
 //--------------------------------------------------------------------------------
+// The room's plan as a record (its own frame); doorScaled: its scale is a door station's measure
+void TCapApp::writeLayout(bool doorScaled)
+{
+   TLayoutRecord rec = {};
+
+   rec.roomIndex = ProomIndex;
+   rec.flags = (BYTE)((Pplan.valid ? lfValid : 0) | (Pplan.complete ? lfComplete : 0)
+                      | (Pplan.heightSolved ? lfHeightSolved : 0) | (doorScaled ? lfDoorScaled : 0));
+   rec.vertexCount = (BYTE)Pplan.vertexCount;
+   rec.stationCount = (BYTE)Pplan.stationCount;
+   rec.axisDeg = Pplan.axisDeg;
+   rec.ceilingM = Pplan.ceilingM;
+   rec.assumedCeilingM = Pplan.assumedCeilingM;
+   rec.cameraHeightM = Pplan.cameraHeightM;
+   rec.doorScale = Pplan.doorScale;
+   for (int i = 0; i < Pplan.vertexCount && i < layoutRecMaxVerts; i++)
+   {
+      rec.u[i] = Pplan.verts[i].u;
+      rec.w[i] = Pplan.verts[i].w;
+   }
+   for (int i = 0; i < Pplan.stationCount && i < layoutRecMaxStations; i++)
+   {
+      rec.stationVertex[i] = Pplan.stationVertex[i];
+      rec.targetVertex[i] = Pplan.targetVertex[i];
+   }
+   Psession.WriteLayout(Pport->SensorClockNs(), rec);
+}
+
+//--------------------------------------------------------------------------------
 void TCapApp::finishProperty(void)
 {
    TSessionCounts c = Psession.Counts();
 
    finishRoom();
+
+   // production: a replaced photo is overwritten - the log drops it once, now (user, 2026-09-27); debug keeps both
+   if (!appKeepSuperseded && PsupersededCount)
+      Psession.Compact(Psuperseded, PsupersededCount);
+   PsupersededCount = 0;
+   c = Psession.Counts();
    Psession.Close(Pport->WallClockNs());
    snprintf(Pstatus, sizeof(Pstatus), "Imóvel salvo: %lu cômodos, %llu imagens", (unsigned long)c.rooms,
             (unsigned long long)c.images);
@@ -1352,9 +1852,15 @@ void TCapApp::OnTap(int x, int y)
    {
       if (Pphase == rpNone)
          startRoom();
+      else if (Pphase == rpDoor && PdoorIdx >= 0 && PdoorIdx < PplanDoorCount)
+      {
+         if (PplanDoors[PdoorIdx].state != (BYTE)dsConfirmed)
+            PplanDoors[PdoorIdx].state = (BYTE)dsDropped; // "Descartar": a false candidate; confirmed: "Pular medida"
+         nextDoor();
+      }
       else if (Pphase == rpWalk)
          beginStation(skCorner); // "arrived at corner N"
-      else
+      else if (Pphase != rpDoor)
          stationDone();          // skip the rest of this station
    }
    else if (PbtnFinish.visible && x >= PbtnFinish.x && x < PbtnFinish.x + PbtnFinish.w && y >= PbtnFinish.y
@@ -1434,9 +1940,32 @@ void TCapApp::hintText(LPSTR out, size_t cap) const
    out[0] = '\0';
    if (!ProomOpen || !spin)
       return;
-   if (Pfocusing && (Pphase == rpCenter || Pphase == rpCorner))
+   if (Pfocusing && (Pphase == rpCenter || Pphase == rpCorner || Pphase == rpDoor))
    {
       snprintf(out, cap, "Focando: segure firme");
+      return;
+   }
+   if (Pphase == rpDoor)
+   {
+      int left = 0;
+
+      for (int i = 0; i < PplanDoorCount; i++)
+         left += PplanDoors[i].state == 0u ? 1 : 0;
+      if (!PposeOk)
+         snprintf(out, cap, "Deixe a câmera na horizontal");
+      else if (PjobBusy)
+         snprintf(out, cap, "Segure: conferindo a porta");
+      else
+      {
+         const TPlanDoor *d = PdoorIdx >= 0 && PdoorIdx < PplanDoorCount ? &PplanDoors[PdoorIdx] : NULL;
+
+         if (d && d->state == (BYTE)dsConfirmed && !d->nFoot)
+            snprintf(out, cap, "Porta confirmada: incline para baixo até o pé dela");
+         else if (d && d->state == (BYTE)dsConfirmed && !d->nCrease)
+            snprintf(out, cap, "Porta confirmada: incline para cima até a moldura");
+         else
+            snprintf(out, cap, "Na cruz branca, encaixe a porta amarela do chão à moldura (%d)", left);
+      }
       return;
    }
    if (Pphase == rpWalk)
@@ -1753,6 +2282,23 @@ void TCapApp::drawPlan(TSurface &s, int x, int y, int size)
       scale = 0.72f*(float)size/reach;
       cy = y + size*85/100;
    }
+   else if (Pphase == rpDoor) // the door station: the eye where the operator was placed (last corner, then each shot)
+   {
+      const TPlanPoint &e = PdoorEye;
+      float             reach = 0.1f;
+
+      for (int i = 0; i < Pplan.vertexCount; i++)
+      {
+         float du = Pplan.verts[i].u - e.u,
+               dw = Pplan.verts[i].w - e.w;
+
+         reach = fmaxf(reach, sqrtf(du*du + dw*dw));
+      }
+      midX = e.w*cs + e.u*sn;
+      midY = e.u*cs - e.w*sn;
+      scale = 0.72f*(float)size/reach;
+      cy = y + size*85/100;
+   }
 
    for (int i = 0; i < Pplan.vertexCount; i++)
    {
@@ -1822,6 +2368,27 @@ void TCapApp::drawPlan(TSurface &s, int x, int y, int size)
       drawEye(s, sx[v], sy[v], (float)(tx - sx[v]), (float)(ty - sy[v]), scaleDp(12), eye);
    }
 
+   // the doors: white to shoot, green confirmed (dropped ones vanish); the current one a yellow ring, the eye aimed at it
+   for (int i = 0; Pphase == rpDoor && i < PplanDoorCount; i++)
+   {
+      if (PplanDoors[i].state == 2u)
+         continue;
+
+      int px = cx + (int)((PplanDoors[i].at.w*cs + PplanDoors[i].at.u*sn - midX)*scale),
+          py = cy - (int)((PplanDoors[i].at.u*cs - PplanDoors[i].at.w*sn - midY)*scale);
+
+      canvasFillCircle(s, px, py, scaleDp(6), PplanDoors[i].state == 1u ? canvasRGBA(60, 220, 110, 255)
+                                                                        : canvasRGBA(255, 255, 255, 220));
+      if (i == PdoorIdx)
+      {
+         int ex = cx + (int)((PdoorEye.w*cs + PdoorEye.u*sn - midX)*scale),
+             ey = cy - (int)((PdoorEye.u*cs - PdoorEye.w*sn - midY)*scale);
+
+         canvasRing(s, px, py, scaleDp(15), scaleDp(3), canvasRGBA(255, 220, 0, 255));
+         drawEye(s, ex, ey, (float)(px - ex), (float)(py - ey), scaleDp(12), canvasRGBA(255, 140, 30, 255));
+      }
+   }
+
    char dims[48];
 
    if (PplanSketch)
@@ -1863,6 +2430,230 @@ bool TCapApp::binOffAxis(int band, int bin) const
 }
 
 /*--------------------------------------------------------------------------------
+   A camera-space point (x right, y up, looking down -z) on the screen: the pinhole of the native
+   image, then the preview's rotation to upright, then canvasBlit's cover scaling. False behind.
+  --------------------------------------------------------------------------------*/
+bool TCapApp::wireToScreen(const TSurface &s, const TVec3 &pc, float &sx, float &sy) const
+{
+   if (pc.z > -cWireNearM || !PpreviewH || !Pcam.width)
+      return false;
+
+   float nu = Pintr.cx + Pintr.fx*pc.x/-pc.z, // native pixels
+         nv = Pintr.cy - Pintr.fy*pc.y/-pc.z,
+         nw = (float)Pcam.width,
+         nh = (float)Pcam.height,
+         u = nu,
+         v = nv;
+   int   rot = ((Pcam.sensorRotDeg%360) + 360)%360;
+
+   if (rot == 90) // the inverse of updatePreview's turn
+   {
+      u = nh - 1.f - nv;
+      v = nu;
+   }
+   else if (rot == 270)
+   {
+      u = nv;
+      v = nw - 1.f - nu;
+   }
+   else if (rot == 180)
+   {
+      u = nw - 1.f - nu;
+      v = nh - 1.f - nv;
+   }
+
+   float pw = (rot == 90 || rot == 270) ? nh : nw,
+         pu = u*(float)appPreviewW/pw, // preview pixels
+         pv = v*(float)appPreviewW/pw,
+         stepX = (float)appPreviewW/(float)s.width,
+         stepY = (float)PpreviewH/(float)s.height,
+         step = stepX < stepY ? stepX : stepY,
+         offX = 0.5f*((float)appPreviewW - step*(float)s.width),
+         offY = 0.5f*((float)PpreviewH - step*(float)s.height);
+
+   sx = (pu - offX)/step;
+   sy = (pv - offY)/step;
+   return true;
+}
+
+//--------------------------------------------------------------------------------
+// A plan point at a height above the camera, as a world offset from the eye (du, dw: plan axes in the world)
+static TVec3 wireAt(const TPlanPoint &eye, const TVec3 &du, const TVec3 &dw, float u, float w, float y)
+{
+   TVec3 p = { (u - eye.u)*du.x + (w - eye.w)*dw.x, y, (u - eye.u)*du.z + (w - eye.w)*dw.z };
+
+   return p;
+}
+
+//--------------------------------------------------------------------------------
+// One 3D edge (world offsets from the eye) cut at the near plane and drawn
+void TCapApp::wireEdge(TSurface &s, const TMat4 &pose, const TVec3 &a, const TVec3 &b, DWORD rgba)
+{
+   TVec3 ca = { pose.m[0]*a.x + pose.m[1]*a.y + pose.m[2]*a.z, pose.m[4]*a.x + pose.m[5]*a.y + pose.m[6]*a.z,
+                pose.m[8]*a.x + pose.m[9]*a.y + pose.m[10]*a.z },
+         cb = { pose.m[0]*b.x + pose.m[1]*b.y + pose.m[2]*b.z, pose.m[4]*b.x + pose.m[5]*b.y + pose.m[6]*b.z,
+                pose.m[8]*b.x + pose.m[9]*b.y + pose.m[10]*b.z };
+
+   if (ca.z > -cWireNearM && cb.z > -cWireNearM)
+      return; // wholly behind
+   if (ca.z > -cWireNearM || cb.z > -cWireNearM)
+   {
+      TVec3 &in = ca.z > -cWireNearM ? ca : cb;
+      const TVec3 &keep = ca.z > -cWireNearM ? cb : ca;
+      float t = (-cWireNearM - keep.z)/(in.z - keep.z);
+
+      in.x = keep.x + (in.x - keep.x)*t;
+      in.y = keep.y + (in.y - keep.y)*t;
+      in.z = -cWireNearM;
+   }
+
+   float x0,
+         y0,
+         x1,
+         y1;
+
+   if (wireToScreen(s, ca, x0, y0) && wireToScreen(s, cb, x1, y1))
+      canvasLine(s, (int)x0, (int)y0, (int)x1, (int)y1, scaleDp(2), rgba);
+}
+
+/*--------------------------------------------------------------------------------
+   The room's walls as a wireframe over the live preview (user, 2026-09-27: "a confirmação em
+   wireframe das paredes do ambiente"): each wall's ceiling line and floor line and the vertical edge
+   of every corner, placed by the plan (or, during the center spin, by the walls the ceiling gave so
+   far - the corners found on the ceiling band show on the floor band too, furniture or not) and
+   projected with the gyroscope's pose. Where it sits on the creases, the plan is confirmed.
+  --------------------------------------------------------------------------------*/
+void TCapApp::drawWireframe(TSurface &s)
+{
+   if (!PringCount || (Pphase != rpCenter && Pphase != rpCorner && Pphase != rpDoor))
+      return;
+
+   const TLayoutPlan &plan = Pplan.valid && !PplanSketch ? Pplan : PguidePlan;
+   bool               polygon = Pplan.valid && !PplanSketch;
+   TPlanPoint         eye = { 0.f, 0.f };
+
+   if (!polygon && !PguidePlan.wallCount)
+      return;
+   if (Pphase == rpDoor)
+      eye = PdoorEye;
+   else if (Pphase == rpCorner && polygon && PcornerSlot >= 0 && PcornerSlot < Pplan.stationCount)
+   {
+      // standing in the corner, a little inside: toward the corner it aims at
+      const TPlanPoint &c = Pplan.verts[Pplan.stationVertex[PcornerSlot]],
+                       &t = Pplan.verts[Pplan.targetVertex[PcornerSlot]];
+      float             du = t.u - c.u,
+                        dw = t.w - c.w,
+                        len = fmaxf(0.01f, sqrtf(du*du + dw*dw));
+
+      eye.u = c.u + cWireCornerInM*du/len;
+      eye.w = c.w + cWireCornerInM*dw/len;
+   }
+
+   TMat4 pose = poseOf(Pring[(PringHead + appRingSize - 1)%appRingSize]);
+   float a = plan.axisDeg*0.01745329f,
+         camH = plan.cameraHeightM > 0.5f ? plan.cameraHeightM : cWireCameraM,
+         top = (plan.ceilingM > 1.f ? plan.ceilingM : cCeilingM) - camH,
+         bottom = -camH;
+   TVec3 du = { sinf(a), 0.f, -cosf(a) }, // plan u and w in the world (x east, y up, -z north)
+         dw = { cosf(a), 0.f, sinf(a) };
+   DWORD tone = canvasRGBA(0, 230, 170, 220);
+
+   if (polygon)
+      for (int i = 0; i < plan.vertexCount; i++)
+      {
+         const TPlanPoint &p = plan.verts[i],
+                          &q = plan.verts[(i + 1)%plan.vertexCount];
+
+         wireEdge(s, pose, wireAt(eye, du, dw, p.u, p.w, top), wireAt(eye, du, dw, q.u, q.w, top), tone);
+         wireEdge(s, pose, wireAt(eye, du, dw, p.u, p.w, bottom), wireAt(eye, du, dw, q.u, q.w, bottom), tone);
+         wireEdge(s, pose, wireAt(eye, du, dw, p.u, p.w, bottom), wireAt(eye, du, dw, p.u, p.w, top), tone);
+      }
+   else
+   {
+      for (int i = 0; i < plan.wallCount && i < layoutMaxWalls; i++)
+      {
+         float o = plan.wallOffset[i],
+               a0 = plan.wallA0[i],
+               a1 = plan.wallA1[i];
+         bool  alongW = plan.wallKind[i] == 0; // u constant, runs along w
+
+         for (int k = 0; k < 2; k++)
+         {
+            float y = k == 0 ? top : bottom;
+
+            wireEdge(s, pose, alongW ? wireAt(eye, du, dw, o, a0, y) : wireAt(eye, du, dw, a0, o, y),
+                     alongW ? wireAt(eye, du, dw, o, a1, y) : wireAt(eye, du, dw, a1, o, y), tone);
+         }
+      }
+      for (int k = 0; k < PguideCount; k++)
+         wireEdge(s, pose, wireAt(eye, du, dw, PguideAt[k].u, PguideAt[k].w, bottom),
+                  wireAt(eye, du, dw, PguideAt[k].u, PguideAt[k].w, top), tone);
+   }
+}
+
+/*--------------------------------------------------------------------------------
+   The door to shoot as the camera should frame it (the same perspective as the spin view): the
+   opening from the floor to its head, where the plan puts it from where the operator stands, and
+   the camera frame now. The two fitting - aimed and level - turns the door green; the shot follows.
+   Red when the phone is not level.
+  --------------------------------------------------------------------------------*/
+void TCapApp::drawDoorAim(TSurface &s, int cx, int cy, int radius)
+{
+   if (PdoorIdx < 0 || PdoorIdx >= PplanDoorCount)
+      return;
+
+   const TPlanPoint &d = PplanDoors[PdoorIdx].at;
+   TMat4             pose = poseOf(Pring[(PringHead + appRingSize - 1)%appRingSize]);
+   float             heading = geomHeadingDeg(pose.Forward()),
+                     pitch = geomPitchDeg(pose.Forward()),
+                     du = d.u - PdoorEye.u,
+                     dw = d.w - PdoorEye.w,
+                     range = fmaxf(0.5f, sqrtf(du*du + dw*dw)),
+                     camH = Pplan.cameraHeightM > 0.5f ? Pplan.cameraHeightM : 1.5f,
+                     off = fmodf(doorAimDeg() - heading + 540.f, 360.f) - 180.f,
+                     halfDeg = atanf(cDoorHalfWidthM/range)*57.29578f,
+                     topDeg = atanf((cDoorHeadM - camH)/range)*57.29578f,
+                     bottomDeg = atanf(-camH/range)*57.29578f;
+   int               halfW = radius*3/2,
+                     halfH = radius;
+   float             unit = 0.62f*(float)halfW/90.f; // the spin view's pixels per degree
+   bool              fits = PposeOk && fabsf(off) <= cDoorAimDeg;
+   DWORD             tone = fits ? canvasRGBA(60, 220, 110, 255) : canvasRGBA(255, 210, 0, 255),
+                     frame = canvasRGBA(255, 255, 255, 220);
+
+   canvasFillRect(s, cx - halfW, cy - halfH, 2*halfW, 2*halfH, PposeOk ? canvasRGBA(0, 0, 0, 90) : canvasRGBA(220, 30, 30, 120));
+
+   // the door, fixed in the world: its heading off the camera's, its elevations off the horizon
+   int x0 = cx + (int)((off - halfDeg)*unit),
+       x1 = cx + (int)((off + halfDeg)*unit),
+       yTop = cy - (int)(topDeg/60.f*(float)halfH),
+       yBottom = cy - (int)(bottomDeg/60.f*(float)halfH);
+
+   canvasLine(s, x0, yBottom, x0, yTop, scaleDp(4), tone);
+   canvasLine(s, x0, yTop, x1, yTop, scaleDp(4), tone);
+   canvasLine(s, x1, yTop, x1, yBottom, scaleDp(4), tone);
+
+   // the camera frame now (moves with the pitch)
+   int fw = (int)(0.5f*PhfovDeg*unit),
+       fy = cy - (int)(pitch/60.f*(float)halfH),
+       fh = (int)(0.5f*PvfovDeg/60.f*(float)halfH);
+
+   canvasLine(s, cx - fw, fy - fh, cx + fw, fy - fh, scaleDp(2), frame);
+   canvasLine(s, cx + fw, fy - fh, cx + fw, fy + fh, scaleDp(2), frame);
+   canvasLine(s, cx + fw, fy + fh, cx - fw, fy + fh, scaleDp(2), frame);
+   canvasLine(s, cx - fw, fy + fh, cx - fw, fy - fh, scaleDp(2), frame);
+   if (fabsf(off) > 95.f) // off screen: which way to turn
+   {
+      int side = off > 0.f ? 1 : -1,
+          tip = cx + side*(halfW - scaleDp(8)),
+          base = tip - side*scaleDp(28);
+
+      canvasLine(s, base, cy - scaleDp(20), tip, cy, scaleDp(4), tone);
+      canvasLine(s, base, cy + scaleDp(20), tip, cy, scaleDp(4), tone);
+   }
+}
+
+/*--------------------------------------------------------------------------------
    Coverage as the room in front of the operator, in perspective (the current heading at the
    center, scrolling as the operator turns): heading bins become panels, the upper band fans up to
    the ceiling, the lower band down to the floor, each colored by its coherence verdict. With the
@@ -1890,8 +2681,7 @@ void TCapApp::drawCoverage(TSurface &s, int cx, int cy, int radius)
    /* a pose off the guided band turns the panels red and nothing is kept: the ceiling spin level at most, the floor
       spin the opposite, the corner fan level, the floor view tilted down (user 2026-09-27) */
    bool  tilted = !PposeOk;
-   DWORD edge = tilted ? canvasRGBA(235, 60, 50, 255) : canvasRGBA(255, 255, 255, 255),
-         grid = tilted ? canvasRGBA(235, 60, 50, 230) : canvasRGBA(255, 255, 255, 110),
+   DWORD grid = tilted ? canvasRGBA(235, 60, 50, 230) : canvasRGBA(255, 255, 255, 110),
          aim = canvasRGBA(255, 210, 0, 255);
 
    while (targetBand > 0 && Pspin->BandFilled(targetBand) >= bins)
@@ -1967,54 +2757,28 @@ void TCapApp::drawCoverage(TSurface &s, int cx, int cy, int radius)
                canvasLine(s, xs[i], ys[i], xs[(i + 1)%4], ys[(i + 1)%4], scaleDp(3), aim);
       }
    }
-   /* support lines only on corners actually found: where two ceiling walls met (center spin), or the corner
-      the station aims at (user, 2026-09-27: "se o sprite não acompanhar os cantos, se torna um ruído") */
-   float guides[appMaxGuides];
-   bool  jutting[appMaxGuides];
-   int   guideCount = 0;
 
-   if (Pphase == rpCenter)
-      for (int k = 0; k < PguideCount && guideCount < appMaxGuides; k++)
-      {
-         guides[guideCount] = PguideDeg[k];
-         jutting[guideCount] = PguideConvex[k];
-         guideCount++;
-      }
-   else if (Pphase == rpCorner && !PfloorView && Pplan.valid && !PplanSketch && PcornerSlot >= 0
-            && PcornerSlot < Pplan.stationCount)
+   // doors found from this station: an opening outline at their heading, floor up to the head (cyan)
+   const DWORD doorTone = canvasRGBA(0, 200, 255, 255);
+
+   for (int k = 0; k < PdoorCount; k++)
    {
-      int               tv = Pplan.targetVertex[PcornerSlot];
-      const TPlanPoint &c = Pplan.verts[Pplan.stationVertex[PcornerSlot]],
-                       &t = Pplan.verts[tv];
+      if (PdoorCand[k].station != Pstation.index)
+         continue;
 
-      guides[guideCount] = fmodf(Pplan.axisDeg + atan2f(t.w - c.w, t.u - c.u)*57.29578f + 720.f, 360.f);
-      jutting[guideCount] = !Pplan.convex[tv]; // a reflex vertex of the polygon juts into the room
-      guideCount++;
-   }
-
-   /* a room corner lies farther than the walls beside it: its creases leave the corner outward, up to the ceiling
-      ("\ /") and down to the floor ("/ \"); a corner jutting into the room is nearer, so they run back toward the
-      middle band ("/ \" above, "\ /" below) */
-   for (int k = 0; k < guideCount; k++)
-   {
-      float corner = guides[k],
-            d = fmodf(corner - heading + 540.f, 360.f) - 180.f;
+      float d = fmodf(PdoorCand[k].headingDeg - heading + 540.f, 360.f) - 180.f;
 
       if (fabsf(d) > 95.f)
          continue;
 
       int x = cx + (int)(d*unit),
-          reach = halfW/3,
-          top = jutting[k] ? yTop : yCeil,      // the corner's own ceiling point
-          topEnd = jutting[k] ? yCeil : yTop,   // where the creases go from it
-          bottom = jutting[k] ? yBottom : yFloor,
-          bottomEnd = jutting[k] ? yFloor : yBottom;
+          half = (int)(cDoorDrawHalfDeg*unit),
+          top = cy - halfH/3,
+          bottom = yBottom - halfH/6;
 
-      canvasLine(s, x, top, x, bottom, scaleDp(2), edge);
-      canvasLine(s, x, top, x - reach, topEnd, scaleDp(2), edge);
-      canvasLine(s, x, top, x + reach, topEnd, scaleDp(2), edge);
-      canvasLine(s, x, bottom, x - reach, bottomEnd, scaleDp(2), edge);
-      canvasLine(s, x, bottom, x + reach, bottomEnd, scaleDp(2), edge);
+      canvasLine(s, x - half, bottom, x - half, top, scaleDp(3), doorTone);
+      canvasLine(s, x - half, top, x + half, top, scaleDp(3), doorTone);
+      canvasLine(s, x + half, top, x + half, bottom, scaleDp(3), doorTone);
    }
 
    // what the camera sees now, and the way to the next region when it is off screen
@@ -2053,6 +2817,8 @@ void TCapApp::OnPaint(TSurface &s)
    canvasFillRect(s, 0, 0, s.width, s.height, canvasRGBA(16, 16, 20, 255));
    if (PhasPreview)
       canvasBlit(s, 0, 0, s.width, s.height, Ppreview(), appPreviewW, PpreviewH);
+   if (PhasPreview)
+      drawWireframe(s); // the room's walls over the live view
 
    canvasFillRect(s, 0, 0, s.width, scaleDp(98), bar);
    if (Pphase == rpCenter && Pspin)
@@ -2073,7 +2839,11 @@ void TCapApp::OnPaint(TSurface &s)
       snprintf(gps, sizeof(gps), "GPS +-%u m", (unsigned)(Ploc.horizAccMm/1000u));
    else
       snprintf(gps, sizeof(gps), PlocAllowed ? "GPS aguardando" : "GPS sem permissão");
-   snprintf(line, sizeof(line), "Rumo %03d%s  -  %s", (int)heading, Pmagnetic ? "" : " (relativo)", gps);
+   if (ProomOpen && PdoorCount)
+      snprintf(line, sizeof(line), "Rumo %03d%s  -  %s  -  portas %d", (int)heading, Pmagnetic ? "" : " (relativo)", gps,
+               PdoorCount);
+   else
+      snprintf(line, sizeof(line), "Rumo %03d%s  -  %s", (int)heading, Pmagnetic ? "" : " (relativo)", gps);
    drawLabel(s, scaleDp(16), scaleDp(46), line, canvasRGBA(220, 220, 220, 255), 14, false, false);
    if (ProomOpen)
    {
@@ -2098,7 +2868,9 @@ void TCapApp::OnPaint(TSurface &s)
       drawCoverage(s, s.width/2, s.height/2, s.width*3/10); // the corner fan in the same perspective view
    if (Pplan.valid && Pphase == rpWalk)
       drawPlan(s, s.width/10, s.height/2 - s.width*4/10, s.width*8/10); // walking: the map is the guide
-   if (Pplan.valid && Pphase == rpCorner)
+   if (Pphase == rpDoor && PringCount)
+      drawDoorAim(s, s.width/2, s.height/2, s.width*3/10); // the door as the camera should frame it
+   if (Pplan.valid && (Pphase == rpCorner || Pphase == rpDoor))
    {
       int room = s.height/2 - s.width*3/10 - scaleDp(106 + 30), // between the top bar and the perspective view
           size = room < s.width/2 ? room : s.width/2;
@@ -2139,9 +2911,15 @@ void TCapApp::OnPaint(TSurface &s)
          snprintf(main, sizeof(main), "Ir para os cantos");
       else if (Pphase == rpWalk)
          snprintf(main, sizeof(main), "Cheguei");
+      else if (Pphase == rpDoor)
+         snprintf(main, sizeof(main), PdoorIdx >= 0 && PdoorIdx < PplanDoorCount && PplanDoors[PdoorIdx].state == (BYTE)dsConfirmed
+                                      ? "Pular medida" : "Descartar");
       else
          snprintf(main, sizeof(main), PcornerStep + 1 >= PcornerCount ? "Concluir último canto" : "Próximo canto");
-      drawButton(s, PbtnMain, main, Pphase == rpNone ? canvasRGBA(30, 110, 220, 235) : canvasRGBA(40, 160, 90, 235));
+      drawButton(s, PbtnMain, main, Pphase == rpNone ? canvasRGBA(30, 110, 220, 235)
+                                                     : (Pphase == rpDoor ? (strcmp(main, "Descartar") ? canvasRGBA(60, 90, 160, 235)
+                                                                                                    : canvasRGBA(210, 45, 40, 235))
+                                                                         : canvasRGBA(40, 160, 90, 235)));
       if (ProomOpen || Psession.IsOpen())
       {
          PbtnFinish.w = PbtnMain.w;

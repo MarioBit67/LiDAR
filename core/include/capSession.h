@@ -26,7 +26,7 @@ struct TDeviceInfo {
 
 struct TSessionCounts {
    DWORD rooms;
-   QWORD poses, images, depth, meshes, locations, stations, vanish, layouts, bytes;
+   QWORD poses, images, depth, meshes, locations, stations, vanish, layouts, elects, doors, bytes;
 };
 
 class TSessionWriter
@@ -47,6 +47,12 @@ class TSessionWriter
    bool WriteStation(QWORD stampNs, const TStationRecord &r);
    bool WriteVanish(QWORD stampNs, const TVanishRecord &r);
    bool WriteLayout(QWORD stampNs, const TLayoutRecord &r);
+   bool WriteElect(QWORD stampNs, const TElectRecord &r);
+   bool WriteDoor(QWORD stampNs, const TDoorRecord &r);
+
+   /* Rewrites the log without the images stamped in drop (superseded retakes, production only); the rest keeps
+      its order. Returns the images dropped; on any failure the log is left as it was. */
+   int  Compact(LPCQWORD drop, int count);
 
    // A room brackets one 360-degree spin; beginning a room ends the open one
    DWORD BeginRoom(QWORD stampNs, LPCSTR name);

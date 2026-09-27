@@ -3,7 +3,8 @@
 
 static const float cCornerPitchDeg = 0.f,     // corner fans: a natural level pose, a frontal view of the corner
                    cCornerLevelHalfDeg = 10.f, // the corner fan accepts this far from level
-                   cFloorViewPitchDeg = -35.f; // the floor view from a corner: the middle of the room, tiles in perspective
+                   cFloorViewPitchDeg = -35.f, // the floor view from a corner: the middle of the room, tiles in perspective
+                   cSmallRoomReachDeg = 60.f;  // outer bands reach this far up / down (a 1 m powder room)
 
 //--------------------------------------------------------------------------------
 TSpinConfig TSpinConfig::UltraWide(void)
@@ -64,6 +65,8 @@ TSpinConfig TSpinConfig::ForFov(float hfovDeg, float vfovDeg)
    if (c.headingBins > spinMaxBins)
       c.headingBins = spinMaxBins;
    c.maxRateDps = 0.5f*hfovDeg; // half a frame width per second keeps motion blur low
+   c.reachDownDeg = -cSmallRoomReachDeg; // a small room: floor and ceiling creases right below and above
+   c.reachUpDeg = cSmallRoomReachDeg;
    return c;
 }
 
@@ -98,6 +101,7 @@ TSpinConfig TSpinConfig::ForFloorView(float hfovDeg, float vfovDeg)
    c.fanDeg = 0.5f*hfovDeg;
    c.headingBins = 1;
    c.maxRateDps = 0.5f*hfovDeg;
+   c.reachDownDeg = -cSmallRoomReachDeg; // tilted further down in a small room
    return c;
 }
 
@@ -173,6 +177,14 @@ int TSpinTracker::bandOf(float pitchDeg) const
    for (int band = 0; band < Pcfg.bandCount; band++)
       if (fabsf(pitchDeg - Pcfg.bandPitchDeg[band]) <= Pcfg.bandHalfDeg)
          return band;
+
+   // beyond the outer bands, as far as the config reaches (user, 2026-09-27: a 1 m powder room's floor needs -60)
+   int top = Pcfg.bandCount - 1;
+
+   if (Pcfg.reachDownDeg < 0.f && pitchDeg < Pcfg.bandPitchDeg[0] && pitchDeg >= Pcfg.reachDownDeg)
+      return 0;
+   if (Pcfg.reachUpDeg > 0.f && pitchDeg > Pcfg.bandPitchDeg[top] && pitchDeg <= Pcfg.reachUpDeg)
+      return top;
    return -1;
 }
 

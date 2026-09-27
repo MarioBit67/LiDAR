@@ -20,6 +20,7 @@ static const float cDegToRad = 0.01745329252f,
                    cMaxAimDeg = 35.f,        // corner station aim: at most this off the corner bisector (the diagonal)
                    cCornerMeetM = 0.35f,     // a perpendicular crease ending this close to a wall meets it at a corner
                    cLoneWallLenM = 1.5f,     // one keyframe seeing this much of a wall confirms it by itself
+                   cShallowStepM = 0.25f,    // a step this shallow needs both walls seen twice, else they are one
                    cCornerReachM = 0.5f,     // perpendicular walls this far past a wall's ends still bear on it
                    cResectTolM = 0.15f,      // a station crease matches a known wall within this (or this share of
                    cResectTolFrac = 0.06f,   // its distance)
@@ -651,6 +652,36 @@ static int layoutLineWalls(const TPlanLine *lines, int n, float ceilingM, float 
       view covers a long stretch of it, or when a perpendicular crease ends at it - ceiling creases meet at the
       corners. Otherwise it is a misread crease (070542: one short grazing molding edge at 2.25 m made a tooth;
       the w+ crease ended at 1.73, at the true wall 1.51) */
+   /* a shallow step first: a weaker wall within cShallowStepM of another on the same side, seen by fewer than
+      layoutMinWallViews keyframes, is the same wall measured twice (123038: one smooth molding read at 1.25 m by
+      a low grazing frame and at 1.35 m by the next); it joins that wall. The exceptions below (a long single
+      view, creases meeting it) only hold for deep steps - the arms of an L - since in a rectangle every wall
+      near a corner meets a perpendicular crease */
+   for (int i = 0; i < found; i++)
+   {
+      TPlanWall &w = walls[i];
+      int        into = -1;
+
+      if (w.primary || w.views >= layoutMinWallViews || w.weight < 0.f)
+         continue;
+      for (int j = 0; j < found; j++)
+         if (j != i && walls[j].weight >= 0.f && walls[j].kind == w.kind && (walls[j].offset < 0.f) == (w.offset < 0.f)
+             && fabsf(walls[j].offset - w.offset) < cShallowStepM && (into < 0 || walls[j].weight > walls[into].weight))
+            into = j;
+      if (into < 0)
+         continue;
+
+      TPlanWall &q = walls[into];
+      float      total = q.weight + w.weight;
+
+      q.offset = (q.offset*q.weight + w.offset*w.weight)/total;
+      q.a0 = fminf(q.a0, w.a0);
+      q.a1 = fmaxf(q.a1, w.a1);
+      q.weight = total;
+      q.views += w.views;
+      w.weight = -1.f; // merged away
+   }
+
    int kept = 0;
 
    for (int i = 0; i < found; i++)
@@ -659,11 +690,14 @@ static int layoutLineWalls(const TPlanLine *lines, int n, float ceilingM, float 
       bool             crossed = false,
                        met = false;
 
+      if (w.weight < 0.f)
+         continue;
+
       for (int j = 0; j < found && !w.primary; j++)
       {
          const TPlanWall &p = walls[j];
 
-         if (p.kind == w.kind || p.offset < w.a0 - cCornerReachM || p.offset > w.a1 + cCornerReachM)
+         if (p.weight < 0.f || p.kind == w.kind || p.offset < w.a0 - cCornerReachM || p.offset > w.a1 + cCornerReachM)
             continue;
          crossed = true;
          met = met || fabsf(p.a0 - w.offset) < cCornerMeetM || fabsf(p.a1 - w.offset) < cCornerMeetM;
@@ -1304,10 +1338,23 @@ bool TRoomLayout::Solve(float axisDeg, float ceilingM, TLayoutPlan &out) const
    if (best <= 0.f || fabsf(best - ceilingM) < 0.005f)
       return ok;
 
-   // every length of the model is proportional to the ceiling (the camera height is a ratio of it): scale, not redo
-   float f = best/ceilingM;
+   layoutScalePlan(out, best);
+   out.ceilingSnapped = true;
+   return ok;
+}
 
-   out.ceilingM = best;
+/*--------------------------------------------------------------------------------
+   Every length of the model is proportional to the ceiling line it was solved at (the camera height
+   is a ratio of it): a new height of that line scales the plan, it is not solved again.
+  --------------------------------------------------------------------------------*/
+void layoutScalePlan(TLayoutPlan &out, float ceilingM)
+{
+   if (!(out.ceilingM > 0.f) || !(ceilingM > 0.f))
+      return;
+
+   float f = ceilingM/out.ceilingM;
+
+   out.ceilingM = ceilingM;
    out.cameraHeightM *= f;
    out.extentU *= f;
    out.extentW *= f;
@@ -1336,8 +1383,6 @@ bool TRoomLayout::Solve(float axisDeg, float ceilingM, TLayoutPlan &out) const
       out.creases[i].a0 *= f;
       out.creases[i].a1 *= f;
    }
-   out.ceilingSnapped = true;
-   return ok;
 }
 
 /*--------------------------------------------------------------------------------
