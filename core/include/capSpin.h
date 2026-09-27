@@ -75,10 +75,12 @@ class TSpinTracker
    float BinWidthDeg(void) const { return binWidthDeg(); }
    float BinCenterDeg(int bin, float aimDeg) const; // heading of a bin center; a fan not yet aimed centers on aimDeg
    bool  AimedEmpty(int &band, int &bin) const;       // the bin the camera aims at now is still empty
-   void  Reopen(int band, int bin); // its frame turned out wrong: the next steady view replaces it (still counts)
+   /* the next steady view of the bin replaces its frame (the bin still counts); wrong = the frame is off (orange):
+      it may be retaken even outside the guided band */
+   void  Reopen(int band, int bin, bool wrong = false);
    void  AimFan(float headingDeg);  // a fan centered on this heading instead of the first steady aim
    int   GuidedBand(void) const;    // the band to hold now (ceiling first); -1 once every bin is in
-   bool  PoseAllowed(void) const;   // the last pitch lies in the guided band: false = red view, nothing kept
+   bool  PoseAllowed(void) const;   // the last pose lies in the guided band (or on an orange bin): false = red, nothing kept
 
    TSpinTracker(const TSpinTracker &) = delete;
    TSpinTracker &operator=(const TSpinTracker &) = delete;
@@ -87,14 +89,15 @@ class TSpinTracker
 
  private:
    int  bandOf(float pitchDeg) const;
-   int  allowedBand(float pitchDeg) const; // bandOf, but -1 outside the guided band
+   int  allowedBand(float pitchDeg, float headingDeg) const; // bandOf, but -1 outside the guided band (orange bins aside)
    bool nearKept(int band, int bin, float headingDeg) const;
    int  binOf(float headingDeg) const; // -1 outside the fan
    float binWidthDeg(void) const;
 
    TSpinConfig Pcfg;
    bool        Pbin[spinMaxBands][spinMaxBins],
-               Pretake[spinMaxBands][spinMaxBins], // kept, but its frame may be replaced (far off the room axes)
+               Pretake[spinMaxBands][spinMaxBins], // kept, but its frame may be replaced (orange, or a sharper one wanted)
+               Pwrong[spinMaxBands][spinMaxBins],  // that frame is off (orange): retakable outside the guided band
                PhasLast,
                PhasOrigin,
                PfanSet;

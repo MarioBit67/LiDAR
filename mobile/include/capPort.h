@@ -74,6 +74,7 @@ class TCapSink
    virtual void OnResume(void) = 0;                           // main thread
    virtual void OnPermissions(bool camera, bool location) = 0; // main thread
    virtual void OnCameraReady(const TCamInfo &info) = 0;      // any thread
+   virtual void OnFocus(bool locked, float diopters) = 0;     // camera thread; diopters where the lens settled (NaN unknown)
    virtual void OnFrame(const TCamFrame &frame) = 0;          // camera thread
    virtual void OnAttitude(const TAttitude &a) = 0;           // sensor thread
    virtual void OnLocation(QWORD stampNs, const TLocationRecord &loc) = 0; // any thread
@@ -93,6 +94,12 @@ class TCapPort
       continuous AF), <= 0 = continuous AF; exposure capped at 1/maxExposureHz. OnCameraReady follows. */
    virtual bool StartCamera(int index, int maxPixels, float focusDiopters, int maxExposureHz) = 0;
    virtual void StopCamera(void) = 0;
+   /* One focus run on what the camera sees now (autofocus), then the lens is held where it settled (manual
+      lens), so the intrinsics stay put until the next run. OnFocus follows; without a manual lens the camera
+      keeps its continuous AF: false, and no OnFocus follows. */
+   /* focus measured in count rectangles of the NATIVE image, 4 floats each (left, top, right, bottom, 0..1 on each
+      axis), most telling first: the platform takes as many as the camera allows */
+   virtual bool Autofocus(const float *rects, int count) = 0;
    virtual void StartSensors(void) = 0;             // attitude at ~100 Hz
    virtual void StopSensors(void) = 0;
    virtual void StartLocation(void) = 0;            // GNSS fixes as they come

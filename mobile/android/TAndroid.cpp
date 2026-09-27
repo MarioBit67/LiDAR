@@ -23,6 +23,8 @@ enum {
    androidTextRows   = 160,
    androidSensorUs   = 10000,
    androidMaxImages  = 4,
+   androidFocusMs    = 2500,      // a focus run that has not settled by then is held where it is
+   androidMaxAfRegions = 4,
    androidAntiAlias  = 1,         // Paint.ANTI_ALIAS_FLAG
    androidPendingFlags = 0x0C000000 // PendingIntent.FLAG_IMMUTABLE | FLAG_UPDATE_CURRENT
 };
@@ -67,7 +69,8 @@ static QWORD androidClock(clockid_t id)
 TAndroid::TAndroid(struct android_app *app) : Papp(app), Psink(NULL), PlocMgr(NULL), PlocIntent(NULL),
    Pvibrator(NULL), Pbitmap(NULL), Pcanvas(NULL), Ppaint(NULL), PpaintBold(NULL), PcamIds(), Pcams(),
    PcamCount(0), PbitmapW(0), PbitmapH(0), PdownX(0), PdownY(0), Pdensity(256), PlastFixNs(0u),
-   PlastPollNs(0u), PlastPaintNs(0u), Pmagnetic(false), Pasked(false), Pdirty(true), Pvisible(false),
+   PlastPollNs(0u), PlastPaintNs(0u), PfocusStartNs(0u), Pmagnetic(false), Pasked(false), Pdirty(true), Pvisible(false),
+   PmanualLens(false), Pactive(), PmaxAfRegions(0),
    PcamMgr(NULL), Pdevice(NULL), Psession(NULL), Pcontainer(NULL), Poutput(NULL), Ptarget(NULL),
    Prequest(NULL), Preader(NULL), PsensorMgr(NULL), Pqueue(NULL), Pattitude(NULL)
 {
@@ -321,6 +324,16 @@ bool TAndroid::StartCamera(int index, int maxPixels, float focusDiopters, int ma
 
    ACameraMetadata_const_entry e;
 
+   Pactive[0] = 0;
+   Pactive[1] = 0;
+   Pactive[2] = 0;
+   Pactive[3] = 0;
+   if (ACameraMetadata_getConstEntry(meta, ACAMERA_SENSOR_INFO_ACTIVE_ARRAY_SIZE, &e) == ACAMERA_OK && e.count >= 4)
+      for (int k = 0; k < 4; k++)
+         Pactive[k] = e.data.i32[k];
+   PmaxAfRegions = 0;
+   if (ACameraMetadata_getConstEntry(meta, ACAMERA_CONTROL_MAX_REGIONS, &e) == ACAMERA_OK && e.count >= 3)
+      PmaxAfRegions = e.data.i32[2]; // AE, AWB, AF
    if (ACameraMetadata_getConstEntry(meta, ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS, &e) == ACAMERA_OK)
       for (DWORD k = 0; k + 3 < e.count; k += 4)
       {
@@ -347,6 +360,7 @@ bool TAndroid::StartCamera(int index, int maxPixels, float focusDiopters, int ma
          if (e.data.i32[k] == maxExposureHz && e.data.i32[k + 1] == maxExposureHz)
             fpsLock = true;
    ACameraMetadata_free(meta);
+   PmanualLens = manualLens;
    if (!w)
       return false;
 
@@ -399,8 +413,116 @@ bool TAndroid::StartCamera(int index, int maxPixels, float focusDiopters, int ma
 }
 
 //--------------------------------------------------------------------------------
+static void androidOnResult(LPVOID context, ACameraCaptureSession *session, ACaptureRequest *request,
+                            const ACameraMetadata *result)
+{
+   (void)session;
+   (void)request;
+   ((TAndroid *)context)->DeliverResult(result);
+}
+
+/*--------------------------------------------------------------------------------
+   One autofocus run: AUTO mode with a trigger, results watched until the AF settles (locked focused
+   or locked unfocused) or androidFocusMs pass; then the lens is held at the distance it reached.
+  --------------------------------------------------------------------------------*/
+bool TAndroid::Autofocus(const float *rects, int count)
+{
+   TMutexLock lock(Pmutex, thisInfo);
+
+   if (!Psession || !Prequest || !PmanualLens)
+      return false; // no camera, or continuous AF: nothing to run or hold
+
+   ACameraCaptureSession_captureCallbacks cb = {};
+   BYTE                                   mode = ACAMERA_CONTROL_AF_MODE_AUTO,
+                                          idle = ACAMERA_CONTROL_AF_TRIGGER_IDLE,
+                                          start = ACAMERA_CONTROL_AF_TRIGGER_START;
+
+   cb.context = this;
+   cb.onCaptureCompleted = androidOnResult;
+
+   // metering rectangles in active-array pixels, weight 1000 each, as many as the camera takes
+   int n = count < PmaxAfRegions ? count : PmaxAfRegions;
+
+   n = n > androidMaxAfRegions ? androidMaxAfRegions : n;
+   if (Pactive[2] > 0 && Pactive[3] > 0 && n > 0)
+   {
+      LONG regions[androidMaxAfRegions*5];
+
+      for (int i = 0; i < n; i++)
+      {
+         const float *r = rects + 4*i;
+
+         regions[5*i] = Pactive[0] + (LONG)(r[0]*(float)Pactive[2]);
+         regions[5*i + 1] = Pactive[1] + (LONG)(r[1]*(float)Pactive[3]);
+         regions[5*i + 2] = Pactive[0] + (LONG)(r[2]*(float)Pactive[2]);
+         regions[5*i + 3] = Pactive[1] + (LONG)(r[3]*(float)Pactive[3]);
+         regions[5*i + 4] = 1000;
+      }
+      ACaptureRequest_setEntry_i32(Prequest, ACAMERA_CONTROL_AF_REGIONS, (DWORD)(5*n), regions);
+   }
+   ACaptureRequest_setEntry_u8(Prequest, ACAMERA_CONTROL_AF_MODE, 1, &mode);
+   ACaptureRequest_setEntry_u8(Prequest, ACAMERA_CONTROL_AF_TRIGGER, 1, &idle);
+   ACameraCaptureSession_setRepeatingRequest(Psession, &cb, 1, &Prequest, NULL);
+   ACaptureRequest_setEntry_u8(Prequest, ACAMERA_CONTROL_AF_TRIGGER, 1, &start);
+   ACameraCaptureSession_capture(Psession, &cb, 1, &Prequest, NULL);
+   ACaptureRequest_setEntry_u8(Prequest, ACAMERA_CONTROL_AF_TRIGGER, 1, &idle);
+   PfocusStartNs = SensorClockNs();
+   return true;
+}
+
+//--------------------------------------------------------------------------------
+void TAndroid::DeliverResult(const ACameraMetadata *result)
+{
+   ACameraMetadata_const_entry e;
+
+   int   state = -1;
+   float diopters = NAN;
+
+   {
+      TMutexLock lock(Pmutex, thisInfo);
+
+      if (!PfocusStartNs)
+         return;
+      if (ACameraMetadata_getConstEntry(result, ACAMERA_CONTROL_AF_STATE, &e) == ACAMERA_OK && e.count)
+         state = e.data.u8[0];
+      if (ACameraMetadata_getConstEntry(result, ACAMERA_LENS_FOCUS_DISTANCE, &e) == ACAMERA_OK && e.count)
+         diopters = e.data.f[0];
+
+      bool settled = state == ACAMERA_CONTROL_AF_STATE_FOCUSED_LOCKED
+                     || state == ACAMERA_CONTROL_AF_STATE_NOT_FOCUSED_LOCKED,
+           late = SensorClockNs() - PfocusStartNs > (QWORD)androidFocusMs*1000000u;
+
+      if (!settled && !late)
+         return;
+      PfocusStartNs = 0u;
+      if (diopters == diopters) // NaN: keep whatever the lens holds
+         holdFocus(diopters);
+   }
+
+   // outside the port's lock: the app takes its own (it calls Autofocus holding it)
+   if (Psink)
+      Psink->OnFocus(state == ACAMERA_CONTROL_AF_STATE_FOCUSED_LOCKED, diopters);
+}
+
+//--------------------------------------------------------------------------------
+// Manual lens at this distance, no result callbacks: the repeating request as StartCamera left it
+void TAndroid::holdFocus(float diopters)
+{
+   BYTE off = ACAMERA_CONTROL_AF_MODE_OFF,
+        idle = ACAMERA_CONTROL_AF_TRIGGER_IDLE;
+
+   if (!Psession || !Prequest)
+      return;
+   ACaptureRequest_setEntry_u8(Prequest, ACAMERA_CONTROL_AF_MODE, 1, &off);
+   ACaptureRequest_setEntry_u8(Prequest, ACAMERA_CONTROL_AF_TRIGGER, 1, &idle);
+   ACaptureRequest_setEntry_float(Prequest, ACAMERA_LENS_FOCUS_DISTANCE, 1, &diopters);
+   ACameraCaptureSession_setRepeatingRequest(Psession, NULL, 1, &Prequest, NULL);
+}
+
+//--------------------------------------------------------------------------------
 void TAndroid::StopCamera(void)
 {
+   PfocusStartNs = 0u;
    if (Psession)
    {
       ACameraCaptureSession_stopRepeating(Psession);

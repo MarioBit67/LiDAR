@@ -26,3 +26,4 @@ diretiva do usuário neste projeto; nenhuma é importada de outro projeto.
 - [13. Protocolo do cômodo - dois giros centrais, depois os cantos que a planta indica (adaptativo)](slices/regraOuro/13-protocolo-do-comodo.md)
 - [14. Espelhar as memórias só no fim da sessão (ou quando pedido)](slices/regraOuro/14-espelho-no-fim.md)
 - [15. Ordem do TODO: em operação no topo, pendentes no meio, resolvidos no final](slices/regraOuro/15-ordem-do-todo.md)
+- [16. Baixou a captura (conferida), apaga do celular](slices/regraOuro/16-baixou-apaga-do-celular.md)

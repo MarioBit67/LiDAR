@@ -635,3 +635,93 @@ Entradas mais novas no fim.
 - PRÓXIMO:
   (1) Solve: com portas, linha do teto = 2,10 x mediana(vinco/verga); valor do IMÓVEL para cômodos sem porta;
   (2) portas no worker do app (quadros de canto nivelados) + estação de portas com confirmação pelo centro da imagem.
+- Celular esvaziado a pedido do usuário (nova sessão): 081054 e 083920 foram antes trazidas para
+  build/sessions/pull/ (a pasta do PC estava vazia; tamanhos conferidos byte a byte) e então apagadas no aparelho.
+
+## 2026-09-27 - SESSÃO 093519 (ESCRITÓRIO + DORMITÓRIO): FOCO, EXCEÇÃO DO LARANJA, PISO ANTECIPADO
+- Escritório: 305 fotos em 1 cômodo (antes 45); 279 com borrão > 4 px. Isso NÃO era erro da métrica: comparei, por
+  engano, a mediana do app com o MÍNIMO do JPEG; mínimo contra mínimo, app e JPEG batem (4,30/4,26, 5,23/5,23).
+  Somar grão (σ 2-4) ao JPEG não muda nada.
+- CAUSA: o sensor principal do Moto tem MANUAL_SENSOR, então o app desligava o AF e fixava 0,5 D. A calibração de
+  foco é APPROXIMATE (hiperfocal 0,245 D): o foco fixo errava e borrava tudo por igual.
+- CORREÇÃO:
+  - Porta ganhou Autofocus() (bool: false sem lente manual) e o evento OnFocus(travado, dioptrias).
+  - TAndroid: AF_MODE_AUTO + TRIGGER_START; resultados observados até FOCUSED_LOCKED/NOT_FOCUSED_LOCKED ou 2,5 s;
+    depois AF_MODE_OFF com LENS_FOCUS_DISTANCE onde parou.
+  - OnFocus sai FORA do lock do adaptador (o app chama Autofocus segurando o dele: evita ABBA).
+  - App: requestFocus no início de cada estação e da vista do piso; sem keyframe enquanto foca (limite 4 s); dica
+    "Focando: segure firme".
+- Usuário: no giro do piso, olhar para cima fica vermelho, EXCETO sobre um quadro laranja da faixa de cima (refoto
+  legítima); verde segue vermelho. TSpinTracker::Reopen(band, bin, wrong): wrong = laranja, pode ser refeito fora da
+  faixa guiada; a reabertura por nitidez não abre essa exceção. capTest cobre os dois casos.
+- Usuário: nos cantos, apontar para baixo não fica vermelho se mirar o centro esperado do cômodo. A vista do piso é
+  capturada ali (Pahead, rastreador ForFloorView mirando floorViewHeadingDeg) e o passo seguinte é pulado
+  (PaheadDone). Mirando fora do centro: vermelho e nada é guardado. Dicas: "Segure: foto do piso adiantada" /
+  "Para o piso, mire o centro do cômodo". PposeOk decide o vermelho da grade e do mapa.
+- Sessão 093519 APAGADA do celular a pedido do usuário (a pasta do PC também foi zerada por ele). APK instalado
+  09:59:52.
+- PENDENTE: gravar a distância de foco por quadro (intrínseca); a vista do piso antecipada usa o foco do leque.
+- Recaptura do escritório (100303, 169 fotos): o AF travou em 0,05 / 2,18 / 0,26 / 0,26 D (log "focus locked"). O
+  borrão ficou ~5 px mesmo nas estações de 0,26 D (plausível): no giro central, 11 de 131 fotos com <= 2 px. Planta
+  1,60 x 2,11 (real 2,40 x 3,00), câmera 1,81.
+  - Frame 157: véu no quadro inteiro + raio de luz diagonal saindo da janela. Suspeita de LENTE SUJA (digital); o
+    usuário foi orientado a limpar.
+- Usuário: AF pelo centro, longe das bordas (móveis, monitores); depois "o triângulo que toca os dois cantos de cima
+  e o centro", porque o teto é limpo e o piso atrapalha.
+  - Porta: Autofocus(rects, count), retângulos normalizados na imagem NATIVA, o mais importante primeiro.
+  - TAndroid: ACAMERA_CONTROL_AF_REGIONS (matriz ativa, peso 1000), tantos quanto CONTROL_MAX_REGIONS[AF] permite.
+  - App: 3 faixas do triângulo (0,17-0,32 primeiro; 0,02-0,17; 0,32-0,47), meia-largura pela geometria do
+    triângulo, convertidas pela rotação do sensor.
+  - Resultado fora de 0,1..1,6 D (10 m..0,6 m): uma nova tentativa (appFocusTries 2, zerado por estação).
+- APK instalado.
+- Usuário: com o triângulo do teto, "a parte do teto ficou perfeita e esculhambou o piso". Pediu autofoco
+  ADAPTATIVO: teto = triângulo ancorado em cima; piso = triângulo invertido; horizontal = só o centro.
+  - TFocusAim (faCeiling / faLevel / faFloor); requestFocus(aim).
+  - Giro central: começa em faCeiling e refoca quando a faixa guiada muda (PfocusBand): faFloor no giro do piso.
+  - Leque do canto: faLevel (30% central). Vista do piso: faFloor.
+  - A nova tentativa (resultado fora de 0,1..1,6 D) repete a mesma mira.
+  - Moto: CONTROL_MAX_REGIONS AF = 1, só a faixa principal de cada triângulo é usada.
+- APK instalado.
+- 102600 (escritório com AF adaptativo): o usuário achou "bem melhor". Planta 3,13 x 2,34 com 2,80 suposto (real
+  3,00 x 2,40; com 2,70 daria ~3,02 x 2,26). O borrão segue ~5 px em todas as faixas: em 100% as bordas espalham
+  2-3 px. É o limite da ótica do Moto (48 MP binado em 12). Frame 068 ainda com raio de luz a partir da janela
+  (sol direto na ótica).
+- LOG DO AF suspeito: a 2a tentativa trava 57 ms após a 1a, e vários travamentos saem em 0,00-0,02 D. Rever se o
+  estado do AF lido é do pedido anterior (falta checar se o resultado pertence ao disparo).
+- Borrão RELATIVO à câmera:
+  - laranja acima de max(4 px, 1,3 x mediana das últimas 64 fotos da captura);
+  - troca por mais nítida acima de max(2 px, 1,1 x mediana);
+  - sem veredito antes de 5 amostras.
+  - addRoomBlur / blurFloorPx; o histórico NÃO zera por cômodo (a maciez é da câmera).
+- APK compilado, NÃO instalado: o adb por Wi-Fi recusou a conexão (10061). O modo tcpip se perdeu; é preciso USB
+  para `adb tcpip 5555` de novo.
+- USB religado: adb tcpip 5555 + connect 192.168.15.22:5555 OK; APK do borrão relativo instalado.
+- Dormitório capturado com borrão relativo e AF adaptativo: "foco bem coerente, nenhum bloco laranja" (usuário).
+- LINHAS DE APOIO DA GRADE (usuário: "devem encaixar nos cantos do cômodo... se o sprite não acompanhar os cantos,
+  se torna um ruído"):
+  - a posição teórica (eixo + 45 + 90k) SAIU;
+  - giro central: updateGuides após cada quadro do centro. Playout.Solve com o que já entrou (as paredes vêm mesmo
+    com falha pfFewWalls); uma parede u e uma w cujas extensões se alcançam (0,35 m) formam uma quina, e a linha vai
+    no rumo dela a partir do ponto do giro;
+  - côncava (as paredes voltam para o ponto do giro): vincos "\ /" para o teto e "/ \" para o piso;
+  - convexa (saliente): a forma invertida;
+  - estação de canto: uma linha só, no canto-alvo da planta (convexa se o vértice-alvo é reflexo);
+  - sem quina conhecida, nada é desenhado.
+- REGRA DE OURO 16 (usuário): baixou e conferiu, apaga do celular (a capacidade dele é limitada).
+- APK das linhas de apoio compilado, NÃO instalado: o adb por Wi-Fi caiu de novo (10061). Pede USB e `adb tcpip 5555`.
+  O dormitório segue no celular, não baixado.
+- USB: wifi_sleep_policy=2 e stay_on_while_plugged_in=7 aplicados; adb tcpip 5555 reconectado.
+- Baixadas e conferidas byte a byte, depois apagadas do celular (Regra 16): 100303, 101501, 102600, 112439. APK das
+  linhas de apoio instalado.
+- DORMITÓRIO 112439:
+  - 57 fotos, borrão 3,0-4,8 por estação, nenhum laranja (AF adaptativo + borrão relativo resolveram).
+  - Porta (frame 41): linha do teto 2,78, câmera 1,57 (igual ao escritório: pé-direito único confirmado).
+  - Planta 3,36 x 3,61 (escalada para 2,70). Se for o dormitório 3,00 x 3,20, dá +12%. Pela porta, H-h = 1,21 contra
+    1,23 da planta: o erro está nos ângulos dos vincos (q), não na escala vertical.
+- ROOT: proposto (desbloqueio pela conta Motorola, apaga o aparelho, anula a garantia); o usuário RECUSOU por ora.
+- CORREÇÃO (usuário): a planta do dormitório 112439, 3,36 x 3,61 m, está "PERFEITA". É outro cômodo, não o de
+  3,00 x 3,20; não há os 12% de erro. Referências agora:
+  - escritório 2,40 x 3,00 (102600 deu 3,13 x 2,34 a 2,80; ~3,02 x 2,26 a 2,70);
+  - dormitório 3,36 x 3,61;
+  - pé-direito 2,70; a linha do teto pela porta dá 2,77-2,78 nos dois cômodos.
+- Usuário: o erro residual das plantas (escritório ~+1-4%) é tolerável; refinamento fino adiado.

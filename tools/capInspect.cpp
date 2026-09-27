@@ -414,7 +414,8 @@ static void inspectFrontal(const TImageRecord &img, LPCBYTE bgr, const TVec3 &up
    fclose(bmp);
 }
 
-static float inspectDoorTiltDeg = 0.f; // --door-tilt deg
+static float inspectDoorTiltDeg = 0.f, // --door-tilt deg
+             inspectBlurNoise = 0.f;   // --blur-noise sigma (gray levels)
 static bool  inspectRectOut = false, // --rectify: write the frontal views
              inspectDoors = false;   // --doors: look for doors in them
 
@@ -491,6 +492,8 @@ static void inspectDoorView(const TImageRecord &img, LPCBYTE bgr, const TVec3 &u
              d.rightCol, d.headRow, d.floorRow, d.creaseRow, d.creaseOverHead, d.cameraOverHead, 2.1f*d.creaseOverHead,
              2.1f*d.cameraOverHead, d.colorGap, d.knob ? 1 : 0, d.nearCorner ? 1 : 0, d.score);
    }
+   if (!found)
+      return; // an image only where a door was found
    for (int r = 0; r < vh; r++)
    {
       LPBYTE row = out() + (size_t)(vh - 1 - r)*rowBytes; // bottom-up
@@ -1230,6 +1233,8 @@ int main(int argc, LPSTR *argv)
          inspectDoors = true;
       else if (!strcmp(argv[i], "--door-tilt") && i + 1 < argc)
          inspectDoorTiltDeg = (float)atof(argv[++i]);
+      else if (!strcmp(argv[i], "--blur-noise") && i + 1 < argc)
+         inspectBlurNoise = (float)atof(argv[++i]);
       else if (!strcmp(argv[i], "--walls"))
          walls = true;
       else if (!strcmp(argv[i], "--creases"))
@@ -1428,6 +1433,23 @@ int main(int argc, LPSTR *argv)
 
             if (inspectDecode(img.pixels, img.pixelBytes, img.width, img.height, false, luma))
             {
+               DWORD seed = 777u;
+
+               // --blur-noise: sensor grain added back (the JPEG smoothed it; the app measures the raw luma)
+               for (size_t p = 0; inspectBlurNoise > 0.f && p < (size_t)img.width*img.height; p++)
+               {
+                  float g = 0.f;
+
+                  for (int k = 0; k < 4; k++)
+                  {
+                     seed = seed*1664525u + 1013904223u;
+                     g += (float)(seed >> 8)/16777216.f - 0.5f;
+                  }
+
+                  float v = (float)luma[p] + g*1.732f*inspectBlurNoise; // 4 uniforms: variance 1/3, scaled to sigma
+
+                  luma[p] = (BYTE)(v < 0.f ? 0.f : (v > 255.f ? 255.f : v + 0.5f));
+               }
                blurMeasure(luma(), (int)img.width, (int)img.height, (int)img.width, br);
                printf("  blur frame %03d: %5.2f px (median %5.2f, %d/%d textured) tiles", images, br.sharpPx,
                       br.medianPx, br.textured, br.tiles);

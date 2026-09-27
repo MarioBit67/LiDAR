@@ -27,7 +27,12 @@ enum {
    appExposureHz    = 30,       // exposure cap requested from the camera (1/30 s)
    appFloorBand     = 1,        // spin band recorded on a corner station's floor view (its fan is band 0)
    appBlurTries     = 2,        // sharper retakes offered to a green bin
-   appBackArmMs     = 3000      // a second Back within this ends the room (the first only warns)
+   appBackArmMs     = 3000,     // a second Back within this ends the room (the first only warns)
+   appFocusMaxMs    = 4000,     // a focus run the camera never answers is given up
+   appFocusTries    = 2,        // focus runs per station when the lens settles at an odd distance
+   appBlurHistory   = 64,       // blur of the latest keyframes (the camera's own softness), for their median
+   appBlurMinSamples = 5,       // no blur verdict before this many
+   appMaxGuides     = 16        // corner support lines on the spin view
 };
 
 static const float cFocusDiopters = 0.5f, // fixed focus at 2 m for the whole spin: sharp ~1.3-4 m, constant intrinsics
@@ -36,7 +41,21 @@ static const float cFocusDiopters = 0.5f, // fixed focus at 2 m for the whole sp
                    cDiagonalTolDeg = 6.f, // an axis this close to 45 degrees off is a diagonal tile floor, not an error
                    cCeilingM = 2.8f,       // assumed ceiling height until door heads (2.10 m) measure it
                    cBlurMaxPx = 4.f,       // blur floor: beyond it the keyframe is orange (083920: 15 and 44 out of focus, 5.7-6.3)
-                   cBlurGoodPx = 2.f;      // a green keyframe above this stays open for a sharper one (32 almost good, 2.6)
+                   cBlurGoodPx = 2.f,      // a green keyframe above this stays open for a sharper one (32 almost good, 2.6)
+                   cBlurOrangeRel = 1.3f,  // ...and both floors follow the camera: orange beyond 1.3x the median of the latest keyframes,
+                   cBlurRetakeRel = 1.1f,  // a sharper retake beyond 1.1x (the Moto's own softness reads ~5 px: 102600)
+                   cFocusApexV = 0.5f,     // the focus triangle: top corners of the upright view and this far down the middle
+                   cFocusLevelHalf = 0.15f, // level poses: the middle 30% of the view each way
+                   cFocusMinDiopters = 0.1f, // a room lies between ~0.6 and 10 m; beyond, the AF locked on the wrong thing
+                   cFocusMaxDiopters = 1.6f,
+                   cGuideReachM = 0.35f;   // two walls this close to meeting make a corner (the support lines)
+
+// Where the focus is measured: what the pose is after
+enum TFocusAim {
+   faCeiling, // the triangle anchored on the top edge of the upright view
+   faLevel,   // the middle of the view
+   faFloor    // the triangle anchored on the bottom edge
+};
 
 // Where the operator is in the room protocol: two center spins, then each corner aiming at the opposite one
 enum TRoomPhase {
@@ -85,6 +104,7 @@ class TCapApp : public TCapSink
    void OnResume(void) override;
    void OnPermissions(bool camera, bool location) override;
    void OnCameraReady(const TCamInfo &info) override;
+   void OnFocus(bool locked, float diopters) override;
    void OnFrame(const TCamFrame &frame) override;
    void OnAttitude(const TAttitude &a) override;
    void OnLocation(QWORD stampNs, const TLocationRecord &loc) override;
@@ -98,7 +118,7 @@ class TCapApp : public TCapSink
    TMat4 poseOf(const TAttitude &a) const;
    bool  attitudeAt(QWORD stampNs, TAttitude &out) const;
    void  updatePreview(const TCamFrame &f);
-   void  queueKeyframe(const TCamFrame &f, const TMat4 &pose, const TAttitude &a);
+   void  queueKeyframe(const TCamFrame &f, const TMat4 &pose, const TAttitude &a, bool floorFrame);
    void  startRoom(void);
    void  finishRoom(void);
    void  beginStation(TStationKind kind);
@@ -109,13 +129,17 @@ class TCapApp : public TCapSink
    bool  binOffAxis(int band, int bin) const;
    void  checkComplete(void);
    void  beginFloorView(void);
+   void  requestFocus(TFocusAim aim);
    TPlanPoint floorViewTarget(void) const;
    float floorViewHeadingDeg(void) const;
    int   orangeBins(void) const;
+   float blurFloorPx(float rel, float minPx) const;
+   void  addRoomBlur(float px);
    DWORD binColor(int band, int bin) const;
    void  drawPlan(TSurface &s, int x, int y, int size);
    void  drawEye(TSurface &s, int x, int y, float dx, float dy, int size, DWORD rgba);
    void  solvePlan(void);
+   void  updateGuides(void);
    void  finishProperty(void);
    bool  openSession(void);
    void  drawLabel(TSurface &s, int x, int y, LPCSTR text, DWORD rgba, int sizeDp, bool bold, bool centered);
@@ -128,7 +152,8 @@ class TCapApp : public TCapSink
    TSessionWriter       Psession;
    TJPEGEncoder         Pencoder;
    TKeyframeWorker      Pworker;
-   TBlock<TSpinTracker> Pspin;
+   TBlock<TSpinTracker> Pspin,
+                        Pahead;       // at a corner, the floor view taken early (tilted down during the fan)
    TBlock<DWORD>        Ppreview;
    TBlock<BYTE>         PjobPlanes;
    TByteBuf             Pjpeg,
@@ -150,11 +175,15 @@ class TCapApp : public TCapSink
    TAxisCheck           PaxisCheck;
    TAxisVerdict         PaxisVerdict;
    TRoomLayout          Playout;
-   TLayoutPlan          Pplan;
+   TLayoutPlan          Pplan,
+                        PguidePlan;   // the walls so far, for the support lines (worker thread)
    TBlock<float>        PedgeRays;
    TBlock<BYTE>         PedgeLabels;
    TVanishEdges         Pedges;
-   int                  PcornerStep,  // corner stations already captured
+   TFocusAim            PfocusAim;    // where the last focus run measured
+   int                  PfocusTries,  // focus runs of the current station
+                        PfocusBand,   // the guided band the center spin focused for
+                        PcornerStep,  // corner stations already captured
                         PcornerCount, // planned corner stations (4 without a plan)
                         PcornerSlot;  // the station at hand: suggested while walking, then deduced from the aimed diagonal
    DWORD                PcornerMask;  // stations captured, one bit per plan station
@@ -163,13 +192,19 @@ class TCapApp : public TCapSink
                         PbinOrange[spinMaxBands][spinMaxBins]; // its verdict: far off the axes or blurred (accepted, open to a retake)
    float                PbinBlur[spinMaxBands][spinMaxBins];   // FFT blur of the bin's keyframe (NaN: plain image)
    BYTE                 PbinTries[spinMaxBands][spinMaxBins];  // retakes offered to a green bin for a sharper photo
-   bool                 PplanWanted,
+   float                ProomBlur[appBlurHistory];             // latest keyframe blurs of the capture (ring)
+   int                  ProomBlurCount,
+                        PguideCount;
+   float                PguideDeg[appMaxGuides]; // world headings of the ceiling corners found so far
+   bool                 PguideConvex[appMaxGuides], // that corner juts into the room (the walls leave it away from the spin point)
+                        PplanWanted,
                         PplanSketch;  // Pplan is only a square on the room axes (no plan could be made): no dimensions
    TRoomPhase           Pphase;
    TStationRecord       Pstation;
    TButton              PbtnMain,
                         PbtnFinish;
    QWORD                PjobStampNs,
+                        PfocusNs,     // the focus run began
                         PbackArmedNs; // first Back pressed at (0: not armed)
    DWORD                PkeySeq,
                         PstationCount,
@@ -195,7 +230,10 @@ class TCapApp : public TCapSink
                         PcompleteSignaled,
                         PfloorView,   // the corner station is on its floor view (after its fan)
                         Pmagnetic,
-                        PsensorFresh;
+                        PsensorFresh,
+                        Pfocusing,    // a focus run is on: no keyframe until the lens settles
+                        PaheadDone,   // the floor view of this corner is already in
+                        PposeOk;      // the last pose is one to capture (else the view is red, nothing kept)
 };
 
 static TCapApp *gApp = NULL;
@@ -209,11 +247,12 @@ void TKeyframeWorker::DoJob(void)
 //--------------------------------------------------------------------------------
 TCapApp::TCapApp(TCapPort *port) : Pport(port), Pencoder(appJPEGQuality), Pworker(*this), PjobMeta(), Pring(),
    Pcam(), Pintr(), Ploc(), Pjob(), Pverdict(svCovered), PcenterCfg(), PcornerCfg(), PfloorCfg(),
-   PvanishCfg(TVanishConfig::Default()), PaxisCheck(cAxisTolDeg), PaxisVerdict(avNoLines), Pplan(), Pedges(),
-   PcornerStep(0), PcornerCount(4), PcornerSlot(0), PcornerMask(0u), PbinAxis(), PbinDone(), PbinOrange(), PbinBlur(), PbinTries(), PplanWanted(false), PplanSketch(false), Pphase(rpNone), Pstation(), PbtnMain(), PbtnFinish(), PjobStampNs(0u), PbackArmedNs(0u), PkeySeq(0u),
+   PvanishCfg(TVanishConfig::Default()), PaxisCheck(cAxisTolDeg), PaxisVerdict(avNoLines), Pplan(), PguidePlan(), Pedges(),
+   PfocusAim(faLevel), PfocusTries(0), PfocusBand(0), PcornerStep(0), PcornerCount(4), PcornerSlot(0), PcornerMask(0u), PbinAxis(), PbinDone(), PbinOrange(), PbinBlur(), PbinTries(), ProomBlur(), ProomBlurCount(0), PguideCount(0), PguideDeg(), PguideConvex(), PplanWanted(false), PplanSketch(false), Pphase(rpNone), Pstation(), PbtnMain(), PbtnFinish(), PjobStampNs(0u), PfocusNs(0u), PbackArmedNs(0u), PkeySeq(0u),
    PstationCount(0u), ProomIndex(0u), PviewW(0), PviewH(0), Pdensity(256), PringHead(0), PringCount(0), PpreviewH(0), Prooms(0), PhfovDeg(60.f),
    PvfovDeg(60.f), PcamReady(false), PlocAllowed(false), PhasLoc(false), PhasPreview(false),
-   ProomOpen(false), PjobBusy(false), PcompleteSignaled(false), PfloorView(false), Pmagnetic(false), PsensorFresh(true)
+   ProomOpen(false), PjobBusy(false), PcompleteSignaled(false), PfloorView(false), Pmagnetic(false), PsensorFresh(true),
+   Pfocusing(false), PaheadDone(false), PposeOk(true)
 {
    ProomName[0] = '\0';
    PdevModel[0] = '\0';
@@ -479,7 +518,7 @@ void TCapApp::updatePreview(const TCamFrame &f)
 
 //--------------------------------------------------------------------------------
 // Copies the frame planes for the worker (planar Y, U, V) and posts the encode
-void TCapApp::queueKeyframe(const TCamFrame &f, const TMat4 &pose, const TAttitude &a)
+void TCapApp::queueKeyframe(const TCamFrame &f, const TMat4 &pose, const TAttitude &a, bool floorFrame)
 {
    const TYUVImage &src = f.yuv;
    int              cw = (src.width + 1)/2,
@@ -531,8 +570,8 @@ void TCapApp::queueKeyframe(const TCamFrame &f, const TMat4 &pose, const TAttitu
    PjobMeta.forward[1] = fwd.y;
    PjobMeta.forward[2] = fwd.z;
    PjobMeta.rollDeg = geomRollDeg(pose);
-   PjobMeta.spinBand = (BYTE)(PfloorView ? appFloorBand : Pspin->LastKeptBand()); // the floor view: its own band
-   PjobMeta.spinBin = (BYTE)Pspin->LastKeptBin();
+   PjobMeta.spinBand = (BYTE)(floorFrame ? appFloorBand : Pspin->LastKeptBand()); // the floor view: its own band
+   PjobMeta.spinBin = (BYTE)(floorFrame ? 0 : Pspin->LastKeptBin()); // one bin
    PjobMeta.stationIndex = (BYTE)Pstation.index;
    PjobMeta.stationKind = (BYTE)Pstation.kind;
    PjobMeta.cornerIndex = Pstation.kind == skCorner ? Pstation.corner : 0u;
@@ -618,6 +657,8 @@ void TCapApp::EncodePending(void)
 
       meta.blurPx = blur.medianPx;
       meta.blurMinPx = blur.sharpPx;
+      if (sameRoom && !isnan(blur.medianPx))
+         addRoomBlur(blur.medianPx);
       PaxisVerdict = measured && sameRoom ? PaxisCheck.Offer(vr, &dev) : avNoLines;
       meta.vanishFlags = measured ? vr.flags : 0u;
       meta.axisVerdict = (BYTE)PaxisVerdict;
@@ -664,11 +705,11 @@ void TCapApp::EncodePending(void)
                new photo whenever aimed at again. Off the axes (not on the floor view: a diagonal tile floor fills
                it) or blurred beyond the floor: autofocus still converging, a shaken hand */
             PbinOrange[band][bin] = (!floorFrame && binOffAxis(band, bin))
-                                    || (!isnan(blur.medianPx) && blur.medianPx > cBlurMaxPx);
+                                    || (!isnan(blur.medianPx) && blur.medianPx > blurFloorPx(cBlurOrangeRel, cBlurMaxPx));
          }
          if (Pspin && PbinOrange[band][bin])
-            Pspin->Reopen(band, bin);
-         else if (Pspin && PbinBlur[band][bin] > cBlurGoodPx && PbinTries[band][bin] < appBlurTries)
+            Pspin->Reopen(band, bin, true);
+         else if (Pspin && PbinBlur[band][bin] > blurFloorPx(cBlurRetakeRel, cBlurGoodPx) && PbinTries[band][bin] < appBlurTries)
          {
             PbinTries[band][bin]++;
             Pspin->Reopen(band, bin); // still green: a steadier look at it may bring a sharper photo
@@ -677,6 +718,8 @@ void TCapApp::EncodePending(void)
       if (measured && sameRoom) // the floor plan: center spin for the walls, every station for the camera height
          Playout.AddFrame(rec.cameraToWorld, vr, Pedges, PtiltBias.Bias(),
                           meta.stationKind == (BYTE)skCenter ? 0 : (int)meta.stationIndex);
+      if (measured && sameRoom && meta.stationKind == (BYTE)skCenter)
+         updateGuides();
    }
    Psession.WriteVanish(stamp, vrec);
 
@@ -697,6 +740,91 @@ void TCapApp::EncodePending(void)
       if (PplanWanted)
          solvePlan(); // the keyframe that closed the center spin is in: the plan can be made
    }
+   Pport->RequestPaint();
+}
+
+/*--------------------------------------------------------------------------------
+   Focus once per station, then held: the Moto's fixed 0.5 D was an APPROXIMATE calibration and
+   left whole rooms 4.5-6 px blurred (093519). No keyframe is kept while the lens moves.
+   The region follows what the pose is after (user, 2026-09-27): toward the ceiling, the triangle of
+   the upright view touching both top corners and the center (the creases sit at the walls' distance,
+   almost never hidden); toward the floor, the same triangle upside down; level, the middle only
+   (desks and screens crowd the edges). A triangle goes as three bands, narrower toward its apex,
+   the middle one first (a camera that takes one region keeps that).
+  --------------------------------------------------------------------------------*/
+void TCapApp::requestFocus(TFocusAim aim)
+{
+   const float band[3][2] = { { 0.17f, 0.32f }, { 0.02f, 0.17f }, { 0.32f, 0.47f } }; // from the anchoring edge
+   float       rects[12];
+   int         rot = ((Pcam.sensorRotDeg%360) + 360)%360,
+               count = aim == faLevel ? 1 : 3;
+
+   PfocusAim = aim;
+   for (int i = 0; i < count; i++)
+   {
+      float v0 = aim == faFloor ? 1.f - band[i][1] : band[i][0],
+            v1 = aim == faFloor ? 1.f - band[i][0] : band[i][1],
+            half = 0.5f*(1.f - 0.5f*(band[i][0] + band[i][1])/cFocusApexV), // the triangle's half width there
+            u0 = 0.5f - half,
+            u1 = 0.5f + half;
+
+      if (aim == faLevel)
+      {
+         u0 = 0.5f - cFocusLevelHalf;
+         u1 = 0.5f + cFocusLevelHalf;
+         v0 = 0.5f - cFocusLevelHalf;
+         v1 = 0.5f + cFocusLevelHalf;
+      }
+
+      int base = 4*i;
+
+      if (rot == 90) // upright (u right, v down) is the native image turned clockwise
+      {
+         rects[base + 0] = v0;
+         rects[base + 1] = 1.f - u1;
+         rects[base + 2] = v1;
+         rects[base + 3] = 1.f - u0;
+      }
+      else if (rot == 180)
+      {
+         rects[base + 0] = 1.f - u1;
+         rects[base + 1] = 1.f - v1;
+         rects[base + 2] = 1.f - u0;
+         rects[base + 3] = 1.f - v0;
+      }
+      else if (rot == 270)
+      {
+         rects[base + 0] = 1.f - v1;
+         rects[base + 1] = u0;
+         rects[base + 2] = 1.f - v0;
+         rects[base + 3] = u1;
+      }
+      else
+      {
+         rects[base + 0] = u0;
+         rects[base + 1] = v0;
+         rects[base + 2] = u1;
+         rects[base + 3] = v1;
+      }
+   }
+   PfocusTries++;
+   Pfocusing = PcamReady && Pport->Autofocus(rects, count);
+   PfocusNs = Pport->SensorClockNs();
+}
+
+//--------------------------------------------------------------------------------
+// A lens settled farther than a room or nearer than arm's length locked on the wrong thing: one more run
+void TCapApp::OnFocus(bool locked, float diopters)
+{
+   TMutexLock lock(Pmutex, thisInfo);
+   char       msg[64];
+   bool       odd = !(diopters >= cFocusMinDiopters && diopters <= cFocusMaxDiopters); // NaN too
+
+   snprintf(msg, sizeof(msg), "focus %s at %.2f D (try %d)", locked ? "locked" : "held unlocked", diopters, PfocusTries);
+   Pport->Log(msg);
+   Pfocusing = false;
+   if (odd && PfocusTries < appFocusTries)
+      requestFocus(PfocusAim);
    Pport->RequestPaint();
 }
 
@@ -724,11 +852,45 @@ void TCapApp::OnFrame(const TCamFrame &frame)
             Pstation.target = Pplan.valid ? Pplan.targetVertex[slot] : (BYTE)((slot + 2)%4);
          }
       }
-      Pverdict = Pspin->Offer(frame.stampNs, pose, a.accuracyDeg, !PjobBusy); // busy: observe only, never mark a bin we cannot save
+      if (Pfocusing && frame.stampNs - PfocusNs > (QWORD)appFocusMaxMs*1000000u)
+         Pfocusing = false; // the camera never answered: go on with the lens as it is
+
+      // the center spin moves on to the floor band: focus again, for the floor
+      int guided = Pspin->GuidedBand();
+
+      if (Pphase == rpCenter && guided >= 0 && guided != PfocusBand && !Pfocusing)
+      {
+         PfocusBand = guided;
+         PfocusTries = 0;
+         requestFocus(Pspin->BandPitchDeg(guided) > 5.f ? faCeiling
+                                                        : (Pspin->BandPitchDeg(guided) < -5.f ? faFloor : faLevel));
+      }
+
+      // busy or focusing: observe only, never mark a bin we cannot save sharp
+      Pverdict = Pspin->Offer(frame.stampNs, pose, a.accuracyDeg, !PjobBusy && !Pfocusing);
+      PposeOk = Pspin->PoseAllowed();
       if (Pverdict == svKeep)
       {
-         queueKeyframe(frame, pose, a);
+         queueKeyframe(frame, pose, a, PfloorView);
          Pport->Vibrate(15);
+      }
+
+      /* tilted down during a corner's fan: aimed at the room's middle it is the floor view, taken now instead of in
+         the next step; aimed elsewhere it is red and nothing is kept (user, 2026-09-27) */
+      if (Pphase == rpCorner && !PfloorView && Pahead && !PaheadDone && Pverdict == svOffBand
+          && Pspin->LastPitchDeg() < Pspin->BandPitchDeg(0))
+      {
+         Pahead->AimFan(floorViewHeadingDeg());
+
+         TSpinVerdict fv = Pahead->Offer(frame.stampNs, pose, a.accuracyDeg, !PjobBusy && !Pfocusing);
+
+         PposeOk = fv != svOffBand && fv != svOutside;
+         if (fv == svKeep)
+         {
+            PaheadDone = true;
+            queueKeyframe(frame, pose, a, true);
+            Pport->Vibrate(15);
+         }
       }
       if (Pverdict == svKeep)
          checkComplete();
@@ -749,7 +911,7 @@ void TCapApp::checkComplete(void)
       for (int bin = 0; bin < Pspin->HeadingBins(); bin++)
          if (!PbinDone[b][bin])
             return;
-   if (Pphase == rpCorner && !PfloorView)
+   if (Pphase == rpCorner && !PfloorView && !PaheadDone)
    {
       beginFloorView(); // the fan is in: from the same corner, the floor toward the middle of the room
       return;
@@ -776,6 +938,8 @@ void TCapApp::beginFloorView(void)
    memset(PbinOrange, 0, sizeof(PbinOrange));
    memset(PbinTries, 0, sizeof(PbinTries));
    Pverdict = svCovered;
+   PfocusTries = 0;
+   requestFocus(faFloor); // the floor lies at another distance than the fan
    Pport->Vibrate(60);
 }
 
@@ -819,6 +983,77 @@ float TCapApp::floorViewHeadingDeg(void) const
    TPlanPoint        t = floorViewTarget();
 
    return fmodf(Pplan.axisDeg + atan2f(t.w - c.w, t.u - c.u)*57.29578f + 720.f, 360.f);
+}
+
+/*--------------------------------------------------------------------------------
+   Corners found so far during the center spin: the walls the ceiling creases give (the plan solved on
+   what is in, complete or not), and wherever a wall across u and one across w reach each other, a
+   corner. Concave when both walls run from it back toward the spin point, convex (jutting into the
+   room) when both run away from it. Worker thread, under the app lock.
+  --------------------------------------------------------------------------------*/
+void TCapApp::updateGuides(void)
+{
+   Playout.Solve(Playout.AnchorDeg(), cCeilingM, PguidePlan);
+   PguideCount = 0;
+   for (int i = 0; i < PguidePlan.wallCount && i < layoutMaxWalls; i++)
+      for (int j = 0; j < PguidePlan.wallCount && j < layoutMaxWalls && PguideCount < appMaxGuides; j++)
+      {
+         if (PguidePlan.wallKind[i] != 0 || PguidePlan.wallKind[j] != 1)
+            continue;
+
+         float u = PguidePlan.wallOffset[i], // wall i: u constant, runs along w
+               w = PguidePlan.wallOffset[j]; // wall j: w constant, runs along u
+
+         if (w < PguidePlan.wallA0[i] - cGuideReachM || w > PguidePlan.wallA1[i] + cGuideReachM
+             || u < PguidePlan.wallA0[j] - cGuideReachM || u > PguidePlan.wallA1[j] + cGuideReachM)
+            continue;
+
+         float midW = 0.5f*(PguidePlan.wallA0[i] + PguidePlan.wallA1[i]),
+               midU = 0.5f*(PguidePlan.wallA0[j] + PguidePlan.wallA1[j]);
+         bool  backW = (midW - w)*w < 0.f, // wall i heads from the corner toward the spin point's side
+               backU = (midU - u)*u < 0.f;
+
+         PguideDeg[PguideCount] = fmodf(PguidePlan.axisDeg + atan2f(w, u)*57.29578f + 720.f, 360.f);
+         PguideConvex[PguideCount] = !backW && !backU;
+         PguideCount++;
+      }
+}
+
+//--------------------------------------------------------------------------------
+void TCapApp::addRoomBlur(float px)
+{
+   ProomBlur[ProomBlurCount%appBlurHistory] = px;
+   ProomBlurCount++;
+}
+
+/*--------------------------------------------------------------------------------
+   A blur floor that follows the camera: rel times the median blur of the latest keyframes,
+   never below minPx. A soft lens reads soft everywhere, and only a frame well above its own median
+   is a lost focus or a shaken hand. Until appBlurMinSamples keyframes are in, no verdict.
+  --------------------------------------------------------------------------------*/
+float TCapApp::blurFloorPx(float rel, float minPx) const
+{
+   float v[appBlurHistory];
+   int   n = ProomBlurCount < appBlurHistory ? ProomBlurCount : appBlurHistory;
+
+   if (n < appBlurMinSamples)
+      return 1e9f;
+   for (int i = 0; i < n; i++)
+   {
+      float x = ProomBlur[i];
+      int   k = i - 1;
+
+      while (k >= 0 && v[k] > x)
+      {
+         v[k + 1] = v[k];
+         k--;
+      }
+      v[k + 1] = x;
+   }
+
+   float median = n%2 ? v[n/2] : 0.5f*(v[n/2 - 1] + v[n/2]);
+
+   return fmaxf(minPx, rel*median);
 }
 
 //--------------------------------------------------------------------------------
@@ -877,6 +1112,7 @@ void TCapApp::startRoom(void)
    PaxisCheck.Reset();
    PaxisVerdict = avNoLines;
    Playout.Reset();
+   PguideCount = 0;
    Pplan = TLayoutPlan();
    PplanSketch = false;
    PplanWanted = false;
@@ -917,7 +1153,13 @@ void TCapApp::beginStation(TStationKind kind)
    memset(PbinTries, 0, sizeof(PbinTries));
    PcompleteSignaled = false;
    PfloorView = false;
+   PaheadDone = false;
+   PposeOk = true;
+   Pahead = kind == skCorner ? new TSpinTracker(PfloorCfg) : NULL; // the floor view, should it come early
    Pverdict = svCovered;
+   PfocusTries = 0;
+   PfocusBand = kind == skCenter ? PcenterCfg.bandCount - 1 : 0; // the center spin starts at the ceiling
+   requestFocus(kind == skCenter && PcenterCfg.bandCount > 1 ? faCeiling : faLevel);
 }
 
 //--------------------------------------------------------------------------------
@@ -1192,6 +1434,11 @@ void TCapApp::hintText(LPSTR out, size_t cap) const
    out[0] = '\0';
    if (!ProomOpen || !spin)
       return;
+   if (Pfocusing && (Pphase == rpCenter || Pphase == rpCorner))
+   {
+      snprintf(out, cap, "Focando: segure firme");
+      return;
+   }
    if (Pphase == rpWalk)
    {
       if (PplanWanted)
@@ -1226,6 +1473,8 @@ void TCapApp::hintText(LPSTR out, size_t cap) const
          else
             snprintf(out, cap, "Agora mire o centro do cômodo, olhando para o piso");
       }
+      else if (Pverdict == svOffBand && spin->LastPitchDeg() < spin->BandPitchDeg(0) && !PaheadDone)
+         snprintf(out, cap, PposeOk ? "Segure: foto do piso adiantada" : "Para o piso, mire o centro do cômodo");
       else if (Pverdict == svOffBand)
          snprintf(out, cap, "Deixe a câmera na horizontal, de frente para o canto");
       else if (!spin->Filled())
@@ -1514,7 +1763,7 @@ void TCapApp::drawPlan(TSurface &s, int x, int y, int size)
       sy[i] = cy - (int)((u*cs - w*sn - midY)*scale);
    }
    // at a station, a pose off its band paints the map red like the grid; the eye keeps its color
-   bool  tilted = Pphase == rpCorner && Pspin && !Pspin->PoseAllowed();
+   bool  tilted = Pphase == rpCorner && !PposeOk;
    DWORD wall = tilted ? canvasRGBA(235, 60, 50, 255) : canvasRGBA(255, 255, 255, 255);
 
    canvasFillRect(s, x, y, size, size, tilted ? canvasRGBA(220, 30, 30, 120) : canvasRGBA(0, 0, 0, 170));
@@ -1640,7 +1889,7 @@ void TCapApp::drawCoverage(TSurface &s, int cx, int cy, int radius)
          bestGap = 1e9f;
    /* a pose off the guided band turns the panels red and nothing is kept: the ceiling spin level at most, the floor
       spin the opposite, the corner fan level, the floor view tilted down (user 2026-09-27) */
-   bool  tilted = !Pspin->PoseAllowed();
+   bool  tilted = !PposeOk;
    DWORD edge = tilted ? canvasRGBA(235, 60, 50, 255) : canvasRGBA(255, 255, 255, 255),
          grid = tilted ? canvasRGBA(235, 60, 50, 230) : canvasRGBA(255, 255, 255, 110),
          aim = canvasRGBA(255, 210, 0, 255);
@@ -1718,24 +1967,55 @@ void TCapApp::drawCoverage(TSurface &s, int cx, int cy, int radius)
                canvasLine(s, xs[i], ys[i], xs[(i + 1)%4], ys[(i + 1)%4], scaleDp(3), aim);
       }
    }
-   if (PaxisCheck.HasReference())
-      for (int k = 0; k < 4; k++)
+   /* support lines only on corners actually found: where two ceiling walls met (center spin), or the corner
+      the station aims at (user, 2026-09-27: "se o sprite não acompanhar os cantos, se torna um ruído") */
+   float guides[appMaxGuides];
+   bool  jutting[appMaxGuides];
+   int   guideCount = 0;
+
+   if (Pphase == rpCenter)
+      for (int k = 0; k < PguideCount && guideCount < appMaxGuides; k++)
       {
-         float corner = PaxisCheck.ReferenceDeg() + 45.f + 90.f*(float)k,
-               d = fmodf(corner - heading + 540.f, 360.f) - 180.f;
-
-         if (fabsf(d) > 95.f)
-            continue;
-
-         int x = cx + (int)(d*unit),
-             reach = halfW/3;
-
-         canvasLine(s, x, yCeil, x, yFloor, scaleDp(2), edge);
-         canvasLine(s, x, yCeil, x - reach, yTop, scaleDp(2), edge);
-         canvasLine(s, x, yCeil, x + reach, yTop, scaleDp(2), edge);
-         canvasLine(s, x, yFloor, x - reach, yBottom, scaleDp(2), edge);
-         canvasLine(s, x, yFloor, x + reach, yBottom, scaleDp(2), edge);
+         guides[guideCount] = PguideDeg[k];
+         jutting[guideCount] = PguideConvex[k];
+         guideCount++;
       }
+   else if (Pphase == rpCorner && !PfloorView && Pplan.valid && !PplanSketch && PcornerSlot >= 0
+            && PcornerSlot < Pplan.stationCount)
+   {
+      int               tv = Pplan.targetVertex[PcornerSlot];
+      const TPlanPoint &c = Pplan.verts[Pplan.stationVertex[PcornerSlot]],
+                       &t = Pplan.verts[tv];
+
+      guides[guideCount] = fmodf(Pplan.axisDeg + atan2f(t.w - c.w, t.u - c.u)*57.29578f + 720.f, 360.f);
+      jutting[guideCount] = !Pplan.convex[tv]; // a reflex vertex of the polygon juts into the room
+      guideCount++;
+   }
+
+   /* a room corner lies farther than the walls beside it: its creases leave the corner outward, up to the ceiling
+      ("\ /") and down to the floor ("/ \"); a corner jutting into the room is nearer, so they run back toward the
+      middle band ("/ \" above, "\ /" below) */
+   for (int k = 0; k < guideCount; k++)
+   {
+      float corner = guides[k],
+            d = fmodf(corner - heading + 540.f, 360.f) - 180.f;
+
+      if (fabsf(d) > 95.f)
+         continue;
+
+      int x = cx + (int)(d*unit),
+          reach = halfW/3,
+          top = jutting[k] ? yTop : yCeil,      // the corner's own ceiling point
+          topEnd = jutting[k] ? yCeil : yTop,   // where the creases go from it
+          bottom = jutting[k] ? yBottom : yFloor,
+          bottomEnd = jutting[k] ? yFloor : yBottom;
+
+      canvasLine(s, x, top, x, bottom, scaleDp(2), edge);
+      canvasLine(s, x, top, x - reach, topEnd, scaleDp(2), edge);
+      canvasLine(s, x, top, x + reach, topEnd, scaleDp(2), edge);
+      canvasLine(s, x, bottom, x - reach, bottomEnd, scaleDp(2), edge);
+      canvasLine(s, x, bottom, x + reach, bottomEnd, scaleDp(2), edge);
+   }
 
    // what the camera sees now, and the way to the next region when it is off screen
    float pitchNow = geomPitchDeg(poseOf(Pring[(PringHead + appRingSize - 1)%appRingSize]).Forward());

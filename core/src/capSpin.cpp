@@ -130,6 +130,7 @@ void TSpinTracker::Reset(void)
       {
          Pbin[band][bin] = false;
          Pretake[band][bin] = false;
+         Pwrong[band][bin] = false;
          Pkept[band][bin] = 0.f;
       }
    PhasLast = false;
@@ -190,20 +191,24 @@ int TSpinTracker::GuidedBand(void) const
 }
 
 //--------------------------------------------------------------------------------
-int TSpinTracker::allowedBand(float pitchDeg) const
+int TSpinTracker::allowedBand(float pitchDeg, float headingDeg) const
 {
    int band = bandOf(pitchDeg),
        guided = GuidedBand();
 
-   if (guided >= 0 && band != guided)
-      return -1;
-   return band;
+   if (guided < 0 || band == guided)
+      return band;
+
+   // off the guided band only to retake a wrong (orange) frame; a green one stays red (user, 2026-09-27)
+   int bin = band >= 0 ? binOf(headingDeg) : -1;
+
+   return bin >= 0 && Pwrong[band][bin] ? band : -1;
 }
 
 //--------------------------------------------------------------------------------
 bool TSpinTracker::PoseAllowed(void) const
 {
-   return !PhasLast || allowedBand(PlastPitch) >= 0;
+   return !PhasLast || allowedBand(PlastPitch, PlastHeading) >= 0;
 }
 
 //--------------------------------------------------------------------------------
@@ -294,7 +299,7 @@ TSpinVerdict TSpinTracker::Offer(QWORD stampNs, const TMat4 &cameraToWorld, floa
    if (accuracyDeg == accuracyDeg && accuracyDeg > Pcfg.maxAccuracyDeg) // NaN = unknown, accepted
       return svBadCompass;
 
-   int band = allowedBand(pitch); // a pose off the guided band is red on screen: never kept
+   int band = allowedBand(pitch, heading); // a pose off the guided band is red on screen: never kept
 
    if (band < 0)
       return svOffBand;
@@ -314,6 +319,7 @@ TSpinVerdict TSpinTracker::Offer(QWORD stampNs, const TMat4 &cameraToWorld, floa
    if (Pbin[band][bin] && Pretake[band][bin] && allowKeep) // a frame found wrong: this steady view replaces it
    {
       Pretake[band][bin] = false;
+      Pwrong[band][bin] = false;
       Pkept[band][bin] = heading;
       PkeptBand = band;
       PkeptBin = bin;
@@ -330,10 +336,13 @@ TSpinVerdict TSpinTracker::Offer(QWORD stampNs, const TMat4 &cameraToWorld, floa
 }
 
 //--------------------------------------------------------------------------------
-void TSpinTracker::Reopen(int band, int bin)
+void TSpinTracker::Reopen(int band, int bin, bool wrong)
 {
    if (band >= 0 && band < Pcfg.bandCount && bin >= 0 && bin < Pcfg.headingBins && Pbin[band][bin])
+   {
       Pretake[band][bin] = true;
+      Pwrong[band][bin] = wrong;
+   }
 }
 
 //--------------------------------------------------------------------------------

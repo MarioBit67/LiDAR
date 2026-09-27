@@ -169,6 +169,16 @@ static void testSpin(void)
    checkThat(guided.BandFilled(1) == moto.headingBins && guided.GuidedBand() == 0);
    gns += 1000000000u;
    checkThat(guided.Offer(gns, headPitchPose(0.f, 10.f), NAN) == svOffBand && !guided.PoseAllowed());
+
+   // an orange ceiling bin may be retaken during the floor spin; once retaken (or merely green) it is red again
+   guided.Reopen(1, 0, true);
+   gns += 1000000000u;
+   checkThat(guided.Offer(gns, headPitchPose(0.f, 10.f), NAN) == svKeep);
+   gns += 1000000000u;
+   checkThat(guided.Offer(gns, headPitchPose(0.f, 10.f), NAN) == svOffBand);
+   guided.Reopen(1, 0);
+   gns += 1000000000u;
+   checkThat(guided.Offer(gns, headPitchPose(0.f, 10.f), NAN) == svOffBand); // a sharper-photo retake stays in order
    gns += 1000000000u;
    checkThat(guided.Offer(gns, headPitchPose(0.f, -10.f), NAN) == svKeep);
 

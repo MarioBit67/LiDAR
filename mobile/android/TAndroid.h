@@ -37,6 +37,7 @@ class TAndroid : public TCapPort
    void PumpSensors(void);
    void Tick(void);
    void DeliverImage(AImageReader *reader); // camera thread
+   void DeliverResult(const ACameraMetadata *result); // camera thread: a capture result while focusing
 
    // -- TCapPort --
    void  SetSink(TCapSink *sink) override;
@@ -44,6 +45,7 @@ class TAndroid : public TCapPort
    int   ListCameras(TCamInfo *out, int max) override;
    bool  StartCamera(int index, int maxPixels, float focusDiopters, int maxExposureHz) override;
    void  StopCamera(void) override;
+   bool  Autofocus(const float *rects, int count) override;
    void  StartSensors(void) override;
    void  StopSensors(void) override;
    void  StartLocation(void) override;
@@ -69,6 +71,7 @@ class TAndroid : public TCapPort
    void   pollLocation(void);
    void   paintNow(void);
    void   applyResize(void);
+   void   holdFocus(float diopters);
 
    struct android_app     *Papp;
    TCapSink               *Psink;
@@ -90,11 +93,15 @@ class TAndroid : public TCapPort
                            Pdensity;
    QWORD                   PlastFixNs,
                            PlastPollNs,
-                           PlastPaintNs;
+                           PlastPaintNs,
+                           PfocusStartNs; // the running focus began (0: none running)
    bool                    Pmagnetic,
                            Pasked,
                            Pdirty,
-                           Pvisible;
+                           Pvisible,
+                           PmanualLens;   // the open camera can hold a focus distance
+   LONG                    Pactive[4];    // active pixel array: left, top, width, height (focus regions live there)
+   int                     PmaxAfRegions; // focus rectangles the camera takes at once
 
    ACameraManager         *PcamMgr; // NDK handles
    ACameraDevice          *Pdevice;
