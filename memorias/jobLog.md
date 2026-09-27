@@ -288,3 +288,23 @@ Entradas mais novas no fim.
 - O vão do escritório em 012809 NÃO aparece no giro central. PRÓXIMO: paredes pelas estações de canto
   (resseção pelas paredes conhecidas, depois paredes novas).
 - Regra 15 aplicada à lista de tarefas: em operação no topo, pendentes no meio, resolvidos no final.
+
+## 2026-09-27 - PAREDES PELAS ESTAÇÕES DE CANTO (1a versão)
+- TRoomLayout::AddFrame recebe o índice da estação (0 = giro central; PframeStation).
+- Solve:
+  - Depois das paredes do giro central, cada estação é localizada pelas paredes conhecidas (layoutResect, por eixo).
+    Cada vinco propõe W - s*d; vence a proposta com mais vincos casando uma parede conhecida (tolerância
+    max(0,15 m, 6%)), com pelo menos 2 casamentos por eixo.
+  - Estação fora das paredes conhecidas é rejeitada.
+  - Os vincos da estação entram como se vistos do ponto do giro (offset su + s*d, faixa deslocada), e as paredes
+    são refeitas. plan.stationLines conta esses vincos.
+- RESULTADO nas sessões atuais: quase nada entra (0 vincos; 012809 tinha 1 estação localizada FORA da sala).
+  - Os leques de canto eram nivelados (pitch -2 a -10): o teto aparece pouco e só as paredes a 6 m (0-5 vincos
+    por estação, quase sempre de um eixo só).
+  - Correção na captura: o leque do canto passa a mirar +12 graus (cCornerPitchDeg, faixa aceita -5..+29) e a dica
+    diz "Incline para cima (linha do teto)". O desenho do leque (banda única) segue cobrindo a parede inteira.
+- Linhas de base inalteradas (202726 2,94 x 3,09; 003708 5,94 x 5,85 com 6 cantos).
+- capTest: o L sintético agora espera 8 estações (mapa do usuário). 0 falhas.
+- Achado de ferramenta: o capTest usa o cache do abtestcache (build/Release/.abtestcache); para ver o detalhe de
+  uma falha, apague o cache e rode de novo.
+- APK instalado. PRÓXIMO: recapturar a sala em L com os cantos inclinados e medir quantas estações se localizam.

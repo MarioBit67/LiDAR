@@ -18,6 +18,8 @@ static const float cDegToRad = 0.01745329252f,
                    cMinCeilPitchDeg = 5.f,   // frames aimed at the ceiling band give creases at any elevation
                    cCreaseViewDeg = 25.f,    // level frames: up to this above their aim (half the view less a margin)
                    cMaxAimDeg = 35.f,        // corner station aim: at most this off the corner bisector (the diagonal)
+                   cResectTolM = 0.15f,      // a station crease matches a known wall within this (or this share of
+                   cResectTolFrac = 0.06f,   // its distance)
                    cSecondAimDeg = 25.f,     // a second aim from the same corner: at least this apart from the first
                    cMinAreaM2 = 1.f,
                    cDoorHeadM = 2.10f,       // door and window heads: the most reliable height of a building
@@ -51,7 +53,7 @@ struct TPlanWall {
 };
 
 //--------------------------------------------------------------------------------
-TRoomLayout::TRoomLayout(void) : Pcount(0u), Pcap(0u), PframeStart(), PframePitch(), PframeCenter(), PframeAxis(),
+TRoomLayout::TRoomLayout(void) : Pcount(0u), Pcap(0u), PframeStart(), PframePitch(), PframeStation(), PframeAxis(),
    Pframes(0), PanchorDeg(NAN), Precent(), PrecentCount(0)
 {
 }
@@ -95,7 +97,7 @@ static float layoutMedian(const float *v, int n)
    L room lost its whole ceiling band to a first axis 5.8 degrees off).
   --------------------------------------------------------------------------------*/
 void TRoomLayout::AddFrame(const TMat4 &cameraToWorld, const TVanishResult &r, const TVanishEdges &edges,
-                           const TVec3 &tiltBias, bool centerSpin)
+                           const TVec3 &tiltBias, int station)
 {
    if (isnan(r.roomAxisDeg) || Pframes >= layoutMaxFrames)
       return;
@@ -149,7 +151,7 @@ void TRoomLayout::AddFrame(const TMat4 &cameraToWorld, const TVanishResult &r, c
    float *out = Pdata();
 
    PframePitch[Pframes] = geomPitchDeg(cameraToWorld.Forward());
-   PframeCenter[Pframes] = centerSpin;
+   PframeStation[Pframes] = (BYTE)(station > 255 ? 255 : station);
    PframeStart[Pframes] = Pcount;
    for (DWORD e = 0; e < edges.count && Pcount < Pcap; e++)
    {
@@ -953,6 +955,121 @@ static void layoutStations(TLayoutPlan &plan)
    }
 }
 
+/*--------------------------------------------------------------------------------
+   Where one corner station stood, on one axis: every crease of that axis (distance d on side s) and
+   every known wall of it (offset W) propose W - s*d; the proposal most creases agree with (a known
+   wall within tolerance) wins, refined by the mean of its matches. False with fewer than two.
+  --------------------------------------------------------------------------------*/
+static bool layoutResect(const TPlanLine *st, int m, int kind, const TPlanWall *walls, int n, float scale, float &at)
+{
+   float bestScore = 0.f;
+   int   bestCount = 0;
+
+   for (int i = 0; i < m; i++)
+   {
+      if (st[i].half/2 != kind)
+         continue;
+      for (int j = 0; j < n; j++)
+      {
+         if (walls[j].kind != kind)
+            continue;
+
+         float si = (st[i].half & 1) ? -1.f : 1.f,
+               c = walls[j].offset - si*st[i].q*scale,
+               score = 0.f,
+               sum = 0.f;
+         int   count = 0;
+
+         for (int k = 0; k < m; k++)
+         {
+            if (st[k].half/2 != kind)
+               continue;
+
+            float sk = (st[k].half & 1) ? -1.f : 1.f,
+                  d = st[k].q*scale,
+                  o = c + sk*d,
+                  tol = fmaxf(cResectTolM, cResectTolFrac*d),
+                  bestErr = tol;
+            int   match = -1;
+
+            for (int w = 0; w < n; w++)
+               if (walls[w].kind == kind && fabsf(walls[w].offset - o) < bestErr)
+               {
+                  bestErr = fabsf(walls[w].offset - o);
+                  match = w;
+               }
+            if (match < 0)
+               continue;
+            score += st[k].weight;
+            sum += walls[match].offset - sk*d;
+            count++;
+         }
+         if (score > bestScore)
+         {
+            bestScore = score;
+            bestCount = count;
+            at = sum/(float)count;
+         }
+      }
+   }
+   return bestCount >= 2;
+}
+
+/*--------------------------------------------------------------------------------
+   Corner stations see what the spin point could not - the far side of an L, the walls of its notch
+   face on. A station is placed by the walls already known (layoutResect on both axes), then all its
+   creases join the spin point's, rewritten as if seen from the spin point: offset su + s*d, along
+   range shifted by the station's other coordinate. Returns the new line count.
+  --------------------------------------------------------------------------------*/
+static int layoutStationLines(const TPlanLine *st, int m, const TPlanWall *walls, int n, float scale,
+                              TPlanLine *lines, int count, int cap)
+{
+   float pos[2] = {};
+
+   if (!layoutResect(st, m, 0, walls, n, scale, pos[0]) || !layoutResect(st, m, 1, walls, n, scale, pos[1]))
+      return count;
+
+   // a station stands inside the room: outside every known wall on an axis is a wrong match
+   for (int kind = 0; kind < 2; kind++)
+   {
+      float lo = 1e9f,
+            hi = -1e9f;
+
+      for (int j = 0; j < n; j++)
+         if (walls[j].kind == kind)
+         {
+            lo = walls[j].offset < lo ? walls[j].offset : lo;
+            hi = walls[j].offset > hi ? walls[j].offset : hi;
+         }
+      if (pos[kind] < lo || pos[kind] > hi)
+         return count;
+   }
+   for (int i = 0; i < m && count < cap; i++)
+   {
+      int   kind = st[i].half/2;
+      float s = (st[i].half & 1) ? -1.f : 1.f,
+            d = st[i].q*scale,
+            o = pos[kind] + s*d,
+            sn = o < 0.f ? -1.f : 1.f,
+            dist = fabsf(o);
+
+      if (dist < cMinWallM)
+         continue;
+
+      TPlanLine &l = lines[count++];
+
+      l = st[i];
+      l.frame = -1 - l.frame; // not one of the spin point's frames: no height pairs with them
+      l.half = kind*2 + (o < 0.f ? 1 : 0);
+      l.q = dist/scale;
+      l.r0 = (pos[1 - kind] + st[i].r0*s*d)/(sn*dist);
+      l.r1 = (pos[1 - kind] + st[i].r1*s*d)/(sn*dist);
+      l.top = false;
+      l.crease = true;
+   }
+   return count;
+}
+
 //--------------------------------------------------------------------------------
 float TRoomLayout::AnchorDeg(void) const
 {
@@ -994,14 +1111,43 @@ bool TRoomLayout::Solve(float axisDeg, float ceilingM, TLayoutPlan &out) const
    for (int f = 0; f < Pframes; f++)
       if (FrameKept(f))
          lineCount = layoutFrameLines(data, PframeStart[f], PframeStart[f + 1], axisDeg, f,
-                                      layoutCreaseTop(PframePitch[f], PframeCenter[f]), lines(), lineCount,
+                                      layoutCreaseTop(PframePitch[f], PframeStation[f] == 0u), lines(), lineCount,
                                       layoutMaxLines);
    out.cameraHeightM = layoutPairHeight(lines(), lineCount, ceilingM, out.heightSolved, out.heightCorners);
    if (!out.heightSolved)
       out.cameraHeightM = layoutLineHeight(lines(), lineCount, ceilingM, out.heightSolved);
 
    TPlanWall walls[layoutMaxWalls];
-   int       n = layoutLineWalls(lines(), lineCount, ceilingM, out.cameraHeightM, walls, layoutMaxWalls);
+   int       n = layoutLineWalls(lines(), lineCount, ceilingM, out.cameraHeightM, walls, layoutMaxWalls),
+             spinLines = lineCount,
+             stations = 0;
+
+   // corner stations, placed by these walls, add the walls the spin point could not see
+   for (int f = 0; f < Pframes; f++)
+      stations = PframeStation[f] > stations ? PframeStation[f] : stations;
+   if (stations > 0)
+   {
+      TAlloc<TPlanLine> st((size_t)layoutMaxLines);
+
+      for (int s = 1; s <= stations; s++)
+      {
+         int m = 0,
+             creases = 0;
+
+         for (int f = 0; f < Pframes; f++)
+            if (PframeStation[f] == s && FrameKept(f))
+               m = layoutFrameLines(data, PframeStart[f], PframeStart[f + 1], axisDeg, f,
+                                    layoutCreaseTop(PframePitch[f], true), st(), m, layoutMaxLines);
+         for (int i = 0; i < m; i++)
+            if (st[i].crease)
+               st[creases++] = st[i];
+         lineCount = layoutStationLines(st(), creases, walls, n, ceilingM - out.cameraHeightM, lines(), lineCount,
+                                        layoutMaxLines);
+      }
+   }
+   out.stationLines = lineCount - spinLines;
+   if (lineCount > spinLines)
+      n = layoutLineWalls(lines(), lineCount, ceilingM, out.cameraHeightM, walls, layoutMaxWalls);
 
    out.wallCount = n;
    for (int i = 0; i < n; i++)

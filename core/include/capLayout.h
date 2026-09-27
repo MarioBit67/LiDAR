@@ -60,6 +60,7 @@ struct TLayoutPlan {
               wallA1[layoutMaxWalls],
               wallWeight[layoutMaxWalls];
    int        heightCorners, // room corners (floor-to-ceiling edges) the camera height was measured on (0: floor lines)
+              stationLines,  // creases the corner stations added (placed by the walls the spin point saw)
               wallCount,
               vertexCount;
    TPlanPoint verts[layoutMaxVerts]; // clockwise seen from above
@@ -76,7 +77,7 @@ class TRoomLayout
 
    void  Reset(void);
    void  AddFrame(const TMat4 &cameraToWorld, const TVanishResult &r, const TVanishEdges &edges,
-                 const TVec3 &tiltBias, bool centerSpin); // tiltBias: TTiltBias::Bias(); corner stations: height only
+                 const TVec3 &tiltBias, int station); // tiltBias: TTiltBias::Bias(); station 0: the center spin
    bool  Solve(float axisDeg, float ceilingM, TLayoutPlan &out) const;
    DWORD Count(void) const { return Pcount; }
    float AnchorDeg(void) const; // plan axis: the median of the stored frames' room axes
@@ -92,7 +93,7 @@ class TRoomLayout
                  Pcap;
    DWORD         PframeStart[layoutMaxFrames + 1]; // first stored edge of each accepted keyframe
    float         PframePitch[layoutMaxFrames];      // elevation the keyframe aims at
-   bool          PframeCenter[layoutMaxFrames];     // taken from the spin point (walls); else a corner station
+   BYTE          PframeStation[layoutMaxFrames];    // 0: the center spin; k: corner station k (placed by the known walls)
    float         PframeAxis[layoutMaxFrames];       // its own room axis, unwrapped (the edges are turned onto the anchor)
    int           Pframes;
    float         PanchorDeg,

@@ -1,6 +1,8 @@
 #include "capSpin.h"
 #include "libDiscipline.h"
 
+static const float cCornerPitchDeg = 12.f; // corner fans: ceiling creases of the far walls mid-picture, the floor still in view
+
 //--------------------------------------------------------------------------------
 TSpinConfig TSpinConfig::UltraWide(void)
 {
@@ -69,7 +71,7 @@ TSpinConfig TSpinConfig::ForCorner(float hfovDeg, float vfovDeg)
    TSpinConfig c = UltraWide();
 
    c.bandCount = 1;
-   c.bandPitchDeg[0] = 0.f;
+   c.bandPitchDeg[0] = cCornerPitchDeg; // aimed a little up: the far creases (and the notch of an L) mid-picture
    c.bandHalfDeg = 0.25f*vfovDeg;
    c.fanDeg = 60.f;
    c.headingBins = (int)ceilf(c.fanDeg/(0.5f*hfovDeg)); // bins no wider than half a frame

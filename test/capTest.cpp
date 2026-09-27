@@ -655,7 +655,7 @@ static bool spinLayout(const float *poly, int n, float axisDeg, float ceilingM, 
 
          renderPlanRoom(luma(), w, h, k, pose, axisDeg, poly, n);
          if (vanishDetect(luma(), w, h, w, k, pose, cfg, r, &edges))
-            layout.AddFrame(pose, r, edges, noTilt, true);
+            layout.AddFrame(pose, r, edges, noTilt, 0);
       }
    return layout.Solve(axisDeg, ceilingM, plan);
 }
@@ -689,7 +689,9 @@ static void testLayout(void)
    checkThat(spinLayout(ell, 6, 17.f, 2.6f, plan));
    printPlan("L", plan);
    checkThat(closeTo(plan.extentU, 5.f, 0.2f) && closeTo(plan.extentW, 4.f, 0.2f) && closeTo(plan.areaM2, 16.f, 0.8f));
-   checkThat(plan.vertexCount == 6 && plan.stationCount == 5); // five convex corners, the reflex one is no station
+   /* five convex corners plus the reflex one; the corner facing it aims at both arms and back at it (user's map,
+      2026-09-27) */
+   checkThat(plan.vertexCount == 6 && plan.stationCount == 8);
 
    // a wrong ceiling assumption (2.80 for a 2.60 room): the 2.10 m door head measures the scale error
    checkThat(spinLayout(rect, 4, 17.f, 2.8f, plan));

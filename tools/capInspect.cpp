@@ -542,7 +542,7 @@ static void inspectMeasure(const TImageRecord &img, const TFrameMeta &meta, bool
    if (ok && rectDir)
       inspectRectify(img, vr, axis.HasReference() ? axis.ReferenceDeg() : vr.roomAxisDeg, rectDir, index);
    if (ok)
-      layout.AddFrame(img.cameraToWorld, vr, edges, tilt.Bias(), center);
+      layout.AddFrame(img.cameraToWorld, vr, edges, tilt.Bias(), center ? 0 : (int)meta.stationIndex);
    if (useApp)
    {
       axis.Offer(vr, &dev); // the plan needs this tool's own room reference
@@ -600,7 +600,8 @@ static bool inspectPlan(LPCSTR outDir, DWORD room, const TRoomLayout &layout, co
           plan.heightSolved ? "solved" : "default", plan.ceilingM, plan.vertexCount, plan.complete ? "" : " (incomplete)");
    printf("    door head: %s, scale %.3f (assumed ceiling %.2f m)\n", plan.doorFound ? "found" : "none", plan.doorScale,
           plan.assumedCeilingM);
-   printf("    camera height from %d room corners\n", plan.heightCorners);
+   printf("    camera height from %d room corners; %d creases from the corner stations\n", plan.heightCorners,
+          plan.stationLines);
    for (int i = 0; i < plan.vertexCount; i++)
       printf("    corner %d: u %.2f w %.2f %s\n", i, plan.verts[i].u, plan.verts[i].w, plan.convex[i] ? "" : "(reflex)");
    for (int i = 0; i < plan.stationCount; i++)

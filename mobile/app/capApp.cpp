@@ -611,7 +611,8 @@ void TCapApp::EncodePending(void)
          PbinDone[meta.spinBand][meta.spinBin] = true;
       }
       if (measured && sameRoom) // the floor plan: center spin for the walls, every station for the camera height
-         Playout.AddFrame(rec.cameraToWorld, vr, Pedges, PtiltBias.Bias(), meta.stationKind == (BYTE)skCenter);
+         Playout.AddFrame(rec.cameraToWorld, vr, Pedges, PtiltBias.Bias(),
+                          meta.stationKind == (BYTE)skCenter ? 0 : (int)meta.stationIndex);
    }
    Psession.WriteVanish(stamp, vrec);
 
@@ -1030,7 +1031,10 @@ void TCapApp::hintText(LPSTR out, size_t cap) const
    }
    if (Pphase == rpCorner)
    {
-      if (!spin->Filled())
+      if (Pverdict == svOffBand)
+         snprintf(out, cap, spin->LastPitchDeg() < spin->BandPitchDeg(0) ? "Incline para cima (linha do teto)"
+                                                                          : "Incline um pouco para baixo");
+      else if (!spin->Filled())
          snprintf(out, cap, Pplan.valid ? "Aponte para onde a seta do mapa indica e pare"
                                         : "Aponte para o canto oposto e pare");
       else if (Pverdict == svOutside)
@@ -1285,7 +1289,7 @@ void TCapApp::drawCoverage(TSurface &s, int cx, int cy, int radius)
       float pitch = Pspin->BandPitchDeg(b);
       int   inner = pitch > 5.f ? yCeil : yFloor,
             outer = pitch > 5.f ? yTop : yBottom;
-      bool  middle = pitch >= -5.f && pitch <= 5.f;
+      bool  middle = bands == 1 || (pitch >= -5.f && pitch <= 5.f); // a single band (corner fan) spans the wall
 
       for (int bin = 0; bin < bins; bin++)
       {
