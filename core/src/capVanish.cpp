@@ -788,12 +788,17 @@ TAxisVerdict TAxisCheck::Offer(const TVanishResult &r, float *deviationDeg)
       Punverified++;
       return avNoLines;
    }
-   if (Pcount < axisCheckMax)
+   /* full: the oldest measure leaves (the reference follows the last axisCheckWindow ones - a store that stopped
+      taking new ones froze the reference while the gyroscope drifted on, and every later frame turned orange) */
+   if (Pcount == axisCheckMax)
    {
-      Pvalues[Pcount] = r.roomAxisDeg;
-      Psound[Pcount] = sound;
-      Pcount++;
+      memmove(Pvalues, Pvalues + 1, sizeof(float)*(axisCheckMax - 1));
+      memmove(Psound, Psound + 1, sizeof(bool)*(axisCheckMax - 1));
+      Pcount--;
    }
+   Pvalues[Pcount] = r.roomAxisDeg;
+   Psound[Pcount] = sound;
+   Pcount++;
    updateReference();
    if (!PhasRef)
       return avPending;

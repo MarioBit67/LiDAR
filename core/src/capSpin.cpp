@@ -4,7 +4,9 @@
 static const float cCornerPitchDeg = 0.f,     // corner fans: a natural level pose, a frontal view of the corner
                    cCornerLevelHalfDeg = 10.f, // the corner fan accepts this far from level
                    cFloorViewPitchDeg = -35.f, // the floor view from a corner: the middle of the room, tiles in perspective
-                   cSmallRoomReachDeg = 60.f;  // outer bands reach this far up / down (a 1 m powder room)
+                   cSmallRoomReachDeg = 60.f,  // outer bands reach this far up / down (a 1 m powder room)
+                   cCenterBinDeg = 10.f,       // center spin: heading step between kept views (36 per band)
+                   cCenterAimDeg = 25.f;       // center spin: the ceiling and floor bands aim this far off the horizon (their creases)
 
 //--------------------------------------------------------------------------------
 TSpinConfig TSpinConfig::UltraWide(void)
@@ -43,7 +45,7 @@ TSpinConfig TSpinConfig::Wide(void)
 //--------------------------------------------------------------------------------
 TSpinConfig TSpinConfig::ForFov(float hfovDeg, float vfovDeg)
 {
-   const float span = 110.f,  // pitch -55..+55: near-wall floor and ceiling creases at eye height
+   const float span = 150.f,  // pitch -75..+75: floor, horizon and ceiling sweeps from one spot (user, 2026-09-28)
                overlap = 0.8f;
    TSpinConfig c = UltraWide();
    int         bands = 1;
@@ -59,7 +61,7 @@ TSpinConfig TSpinConfig::ForFov(float hfovDeg, float vfovDeg)
    for (int i = 0; i < bands; i++)
       c.bandPitchDeg[i] = -0.5f*spacing*(float)(bands - 1) + spacing*(float)i;
    c.bandHalfDeg = bands > 1 ? 0.5f*spacing : 0.25f*vfovDeg;
-   c.headingBins = (int)ceilf(360.f/(0.5f*hfovDeg));
+   c.headingBins = (int)ceilf(360.f/cCenterBinDeg); // a view every 10 degrees, 36 per band (user, 2026-09-28)
    if (c.headingBins < 12)
       c.headingBins = 12;
    if (c.headingBins > spinMaxBins)
@@ -67,6 +69,24 @@ TSpinConfig TSpinConfig::ForFov(float hfovDeg, float vfovDeg)
    c.maxRateDps = 0.5f*hfovDeg; // half a frame width per second keeps motion blur low
    c.reachDownDeg = -cSmallRoomReachDeg; // a small room: floor and ceiling creases right below and above
    c.reachUpDeg = cSmallRoomReachDeg;
+
+   /* three bands (user, 2026-09-28): accepted ceiling +10..+75, horizon -20..+20, floor -75..-10; the guides aim at
+      the creases, not the bare ceiling or floor (those frames are thrown away) */
+   if (bands == 3)
+   {
+      const float lo[3] = { -75.f, -20.f, 10.f },
+                  hi[3] = { -10.f, 20.f, 75.f },
+                  aim[3] = { -cCenterAimDeg, 0.f, cCenterAimDeg };
+
+      for (int i = 0; i < 3; i++)
+      {
+         c.bandLoDeg[i] = lo[i];
+         c.bandHiDeg[i] = hi[i];
+         c.bandPitchDeg[i] = aim[i];
+      }
+      c.reachDownDeg = 0.f;
+      c.reachUpDeg = 0.f;
+   }
    return c;
 }
 
@@ -79,9 +99,9 @@ TSpinConfig TSpinConfig::ForCorner(float hfovDeg, float vfovDeg)
    c.bandPitchDeg[0] = cCornerPitchDeg;
    c.bandHalfDeg = cCornerLevelHalfDeg; // level means level: beyond this the app turns the view red
    c.fanDeg = 60.f;
-   c.headingBins = (int)ceilf(c.fanDeg/(0.5f*hfovDeg)); // bins no wider than half a frame
-   if (c.headingBins < 3)
-      c.headingBins = 3;
+   c.headingBins = (int)ceilf(c.fanDeg/(0.25f*hfovDeg)); // bins a quarter frame wide: the middle views refine the corner (user, 2026-09-28)
+   if (c.headingBins < 5)
+      c.headingBins = 5;
    c.maxRateDps = 0.5f*hfovDeg;
    return c;
 }
@@ -172,10 +192,19 @@ int TSpinTracker::BandFilled(int band) const
 }
 
 //--------------------------------------------------------------------------------
+// The pitch lies in the band: its own range when the config sets one, else around its center
+bool TSpinTracker::inBand(int band, float pitchDeg) const
+{
+   if (Pcfg.bandLoDeg[band] < Pcfg.bandHiDeg[band])
+      return pitchDeg >= Pcfg.bandLoDeg[band] && pitchDeg <= Pcfg.bandHiDeg[band];
+   return fabsf(pitchDeg - Pcfg.bandPitchDeg[band]) <= Pcfg.bandHalfDeg;
+}
+
+//--------------------------------------------------------------------------------
 int TSpinTracker::bandOf(float pitchDeg) const
 {
    for (int band = 0; band < Pcfg.bandCount; band++)
-      if (fabsf(pitchDeg - Pcfg.bandPitchDeg[band]) <= Pcfg.bandHalfDeg)
+      if (inBand(band, pitchDeg))
          return band;
 
    // beyond the outer bands, as far as the config reaches (user, 2026-09-27: a 1 m powder room's floor needs -60)
@@ -208,6 +237,8 @@ int TSpinTracker::allowedBand(float pitchDeg, float headingDeg) const
    int band = bandOf(pitchDeg),
        guided = GuidedBand();
 
+   if (guided >= 0 && inBand(guided, pitchDeg)) // overlapping ranges: the guided band takes the pose
+      return guided;
    if (guided < 0 || band == guided)
       return band;
 
@@ -215,6 +246,28 @@ int TSpinTracker::allowedBand(float pitchDeg, float headingDeg) const
    int bin = band >= 0 ? binOf(headingDeg) : -1;
 
    return bin >= 0 && Pwrong[band][bin] ? band : -1;
+}
+
+//--------------------------------------------------------------------------------
+bool TSpinTracker::At(int band, int bin) const
+{
+   return PhasLast && band >= 0 && band < Pcfg.bandCount && inBand(band, PlastPitch) && binOf(PlastHeading) == bin;
+}
+
+//--------------------------------------------------------------------------------
+bool TSpinTracker::Locate(int &band, int &bin) const
+{
+   band = PhasLast ? allowedBand(PlastPitch, PlastHeading) : -1;
+   bin = band >= 0 ? binOf(PlastHeading) : -1;
+   return band >= 0 && bin >= 0;
+}
+
+//--------------------------------------------------------------------------------
+int TSpinTracker::PitchSide(int band, float pitchDeg) const
+{
+   if (band < 0 || band >= Pcfg.bandCount || inBand(band, pitchDeg))
+      return 0;
+   return pitchDeg < Pcfg.bandPitchDeg[band] ? -1 : 1;
 }
 
 //--------------------------------------------------------------------------------

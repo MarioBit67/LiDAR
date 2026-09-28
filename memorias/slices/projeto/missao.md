@@ -22,7 +22,7 @@ associação de cada frame ao modelo (cada imagem sabe de onde e para onde olhou
 MÉTRICA PRINCIPAL (usuário, 2026-09-27): a ÁREA DE VASSOURA do imóvel é a informação mais desejada, e quanto mais
 precisa, mais robusta a solução no mercado. Critério de decisão:
 - toda mudança na planta é julgada pelo efeito na área e nas medidas das salas de referência;
-- referências: 202726, real 3,00 x 3,20; escritório 2,40 x 3,00, pé-direito 2,70.
+- referências: 202726, real 3,00 x 3,20; escritório 2,40 x 3,00, pé-direito 2,70; dormitório 064701, planta 3,03 x 3,37 aprovada pelo usuário ("medidas perfeitas", 2026-09-28).
 Desempates previstos:
 - a distância até o piso (LiDAR no iOS) separa tampos de mesa do piso;
 - no Android, o vinco do teto de cada parede e o padrão de azulejos confirmam a linha do piso.

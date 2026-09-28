@@ -8,7 +8,7 @@
 #include <time.h>
 #include "libDiscipline.h"
 
-static LPCSTR cPackage = "io.aeroblox.lidar",
+static LPCSTR cPackage = "io.sorena.lidar",
               cLogTag = "lidar",
               cPermCamera = "android.permission.CAMERA",
               cPermLocation = "android.permission.ACCESS_FINE_LOCATION",
@@ -671,7 +671,7 @@ void TAndroid::StartLocation(void)
    jniFrameBegin(16);
    PlocMgr = jniGlobal(systemService("location"));
 
-   TJArg action = jniStr("io.aeroblox.lidar.GNSS"),
+   TJArg action = jniStr("io.sorena.lidar.GNSS"),
          args[4];
 
    args[0] = jniObjArg(jniActivity());

@@ -50,6 +50,40 @@ static const float cMosaicGain = 0.5f,     // per round: two overlapping frames 
                    cRatioRange = 1.2f,     // log ratio range of the vote: factors 0.3 .. 3.3
                    cCornerFill = 0.02f;    // corner-station views where the center spin also sees: a gentle feather
 
+static bool mosaicPlanFixed = true; // the bundle holds walls and camera height on the plan (--free-plan: they move)
+static char mosaicFaceNames[layoutMaxVerts + 1][8]; // --face-names: walls in plan order, then the floor ("" = default)
+static FILE *mosaicPointsFile = NULL; // open during a corner fit's first measure: the RANSAC cloud of that frame
+static LPCSTR mosaicOutDir = NULL;
+
+//--------------------------------------------------------------------------------
+void mosaicSetFaceNames(LPCSTR list)
+{
+   int n = 0;
+
+   memset(mosaicFaceNames, 0, sizeof(mosaicFaceNames));
+   for (LPCSTR p = list; *p && n <= layoutMaxVerts; n++)
+   {
+      int len = 0;
+
+      while (p[len] && p[len] != ',')
+         len++;
+      snprintf(mosaicFaceNames[n], sizeof(mosaicFaceNames[n]), "%.*s", len < 7 ? len : 7, p);
+      p += len;
+      if (*p == ',')
+         p++;
+   }
+}
+
+//--------------------------------------------------------------------------------
+// A face's name for files and prints: the user's (--face-names), else parede<K> / piso
+void mosaicFaceLabel(int face, LPSTR out, size_t cap)
+{
+   if (face >= 0 && face <= layoutMaxVerts && mosaicFaceNames[face][0])
+      snprintf(out, cap, "%s", mosaicFaceNames[face]);
+   else
+      snprintf(out, cap, "parede%d", face);
+}
+
 // One wall of the plan as an orthophoto canvas
 struct TMosaicWall {
    bool  constU;
@@ -99,10 +133,10 @@ static void mosaicWallGeometry(const TLayoutPlan &plan, const TVec3 &ud, const T
 //--------------------------------------------------------------------------------
 // World point of canvas pixel (c, r): spin point at the origin, y relative to the camera height
 static TVec3 mosaicPoint(const TMosaicWall &wl, const TVec3 &ud, const TVec3 &wd, float ceilingM, float heightM,
-                         int c, int r)
+                         float c, float r)
 {
-   float s = wl.s0 + wl.sdir*((float)c + 0.5f)/(float)mosaicPxPerM,
-         z = ceilingM - ((float)r + 0.5f)/(float)mosaicPxPerM - heightM,
+   float s = wl.s0 + wl.sdir*(c + 0.5f)/(float)mosaicPxPerM,
+         z = ceilingM - (r + 0.5f)/(float)mosaicPxPerM - heightM,
          pu = wl.constU ? wl.offset : s,
          pw = wl.constU ? s : wl.offset;
    TVec3 p = { pu*ud.x + pw*wd.x, z, pu*ud.z + pw*wd.z };
@@ -121,6 +155,7 @@ static float mosaicSample(const TMosaicFrame &f, TVec3 p, float bgr[3])
 
    p.x -= f.camX;
    p.z -= f.camZ;
+   p.y -= f.camY;
    p = vanishRotate(p, back);
 
    float ka = p.x*f.worldA.x + p.z*f.worldA.z,
@@ -395,7 +430,7 @@ static void mosaicRefineWall(TMosaicFrame *frames, int count, const TMosaicWall 
          {
             size_t i = (size_t)r*wl.cols + c;
             float  bgr[3],
-                   s = mosaicSample(frames[f], mosaicPoint(wl, ud, wd, plan.ceilingM, plan.cameraHeightM, c, r), bgr);
+                   s = mosaicSample(frames[f], mosaicPoint(wl, ud, wd, plan.ceilingM, plan.cameraHeightM, (float)c, (float)r), bgr);
 
             wt[i] = s;
             l[i] = s > 0.f ? 0.114f*bgr[0] + 0.587f*bgr[1] + 0.299f*bgr[2] : 0.f;
@@ -639,7 +674,7 @@ static void mosaicJoint(TMosaicFrame *frames, int count, const TMosaicWall *wall
             {
                size_t i = (size_t)r*wl.cols + c;
                float  bgr[3],
-                      s = mosaicSample(frames[f], mosaicPoint(wl, ud, wd, plan.ceilingM, plan.cameraHeightM, c, r), bgr);
+                      s = mosaicSample(frames[f], mosaicPoint(wl, ud, wd, plan.ceilingM, plan.cameraHeightM, (float)c, (float)r), bgr);
 
                valid[i] = s > 0.f ? 1u : 0u;
                luma[i] = s > 0.f ? 0.114f*bgr[0] + 0.587f*bgr[1] + 0.299f*bgr[2] : 0.f;
@@ -813,6 +848,7 @@ static bool bundleProject(const TMosaicFrame &f, TVec3 p, float &u, float &v)
 
    p.x -= f.camX;
    p.z -= f.camZ;
+   p.y -= f.camY;
    p = vanishRotate(p, back);
 
    float ka = p.x*f.worldA.x + p.z*f.worldA.z,
@@ -1419,8 +1455,8 @@ static float bundleSolve(const TMosaicFrame *frames, int count, const TMosaicWal
             ata[(size_t)p*np + p] *= 1.f + lambda;
          if (!mosaicSolve(ata(), atb(), step(), np))
             break;
-         for (int p = 0; p < np; p++)
-            moved[p] = theta[p] + step[p];
+         for (int p = 0; p < np; p++) // a held plan: its walls and the ceiling above the camera never step
+            moved[p] = mosaicPlanFixed && p >= 3*count && p <= 3*count + wallCount ? theta[p] : theta[p] + step[p];
          bundleResiduals(frames, count, walls, wallCount, ud, wd, obs, nObs, use, ceilingM,
                          moved(), prior, stations, trial());
 
@@ -1605,7 +1641,7 @@ static void mosaicElect(const TMosaicFrame *frames, int count, const TMosaicWall
       for (int r = 0; r < wl.rows; r += mosaicEqualStep)
          for (int c = 0; c < wl.cols; c += mosaicEqualStep)
          {
-            TVec3 p = mosaicPoint(wl, ud, wd, plan.ceilingM, plan.cameraHeightM, c, r);
+            TVec3 p = mosaicPoint(wl, ud, wd, plan.ceilingM, plan.cameraHeightM, (float)c, (float)r);
             float elected[3] = {},
                   weight = 0.f;
             int   views = 0;
@@ -1669,9 +1705,1186 @@ static void mosaicElect(const TMosaicFrame *frames, int count, const TMosaicWall
    }
 }
 
+/*--------------------------------------------------------------------------------
+   The room corner in the picture: the plan vertex whose floor-to-ceiling edge projects inside it
+   with most of its length (at least minIn of 10 points, 5% off the border; a tie goes to the edge nearer
+   the picture's middle) - the frame shows X, Y and Z of the room at once, the ones the fit trusts
+   (user, 2026-09-28). A floor tile grid measures both axes too, but no corner. -1: none.
+  --------------------------------------------------------------------------------*/
+static int mosaicSeenCorner(const TMosaicFrame &f, const TLayoutPlan &plan, const TVec3 &ud, const TVec3 &wd, int minIn)
+{
+   int   best = -1,
+         bestIn = minIn - 1;
+   float bestOff = 1e9f;
+
+   for (int k = 0; k < plan.vertexCount; k++)
+   {
+      int   inView = 0;
+      float off = 0.f;
+
+      for (int s = 0; s < 10; s++)
+      {
+         TVec3 p = { plan.verts[k].u*ud.x + plan.verts[k].w*wd.x,
+                     plan.ceilingM*((float)s + 0.5f)/10.f - plan.cameraHeightM,
+                     plan.verts[k].u*ud.z + plan.verts[k].w*wd.z };
+         float u,
+               v;
+
+         if (bundleProject(f, p, u, v) && u > 0.05f*(float)f.w && u < 0.95f*(float)f.w && v > 0.05f*(float)f.h
+             && v < 0.95f*(float)f.h)
+         {
+            inView++;
+            off += fabsf(u - f.k.cx) + fabsf(v - f.k.cy);
+         }
+      }
+      if (inView < minIn)
+         continue;
+      off /= (float)inView;
+      if (inView > bestIn || (inView == bestIn && off < bestOff))
+      {
+         best = k;
+         bestIn = inView;
+         bestOff = off;
+      }
+   }
+   return best;
+}
+
+//--------------------------------------------------------------------------------
+// The plan vertex nearest to where a frame looks, in azimuth from its camera (a named corner frame whose edge falls outside)
+static int mosaicAimedCorner(const TMosaicFrame &f, const TLayoutPlan &plan, const TVec3 &ud, const TVec3 &wd)
+{
+   TVec3 ahead = { 0.f, 0.f, -1.f },
+         fw = bundleToWorld(f, f.delta, ahead);
+   int   best = -1;
+   float bestCos = -2.f;
+
+   for (int k = 0; k < plan.vertexCount; k++)
+   {
+      float dx = plan.verts[k].u*ud.x + plan.verts[k].w*wd.x - f.camX,
+            dz = plan.verts[k].u*ud.z + plan.verts[k].w*wd.z - f.camZ,
+            cs = (dx*fw.x + dz*fw.z)/(sqrtf(dx*dx + dz*dz)*sqrtf(fw.x*fw.x + fw.z*fw.z) + 1e-6f);
+
+      if (cs > bestCos)
+      {
+         bestCos = cs;
+         best = k;
+      }
+   }
+   return best;
+}
+
+//--------------------------------------------------------------------------------
+// Point (u, w) inside the plan polygon (even-odd rule)
+static bool mosaicInside(const TLayoutPlan &plan, float u, float w)
+{
+   bool inside = false;
+
+   for (int i = 0; i < plan.vertexCount; i++)
+   {
+      const TPlanPoint &p = plan.verts[i],
+                       &q = plan.verts[(i + plan.vertexCount - 1)%plan.vertexCount];
+
+      if ((p.u > u) != (q.u > u) && w < p.w + (q.w - p.w)*(u - p.u)/(q.u - p.u))
+         inside = !inside;
+   }
+   return inside;
+}
+
+// The floor canvas seen from above: up and right in plan axes (u, w), the top and left edges, the size
+struct TFloorCanvas {
+   float upU,
+         upW,
+         rightU,
+         rightW,
+         top,
+         left;
+   int   cols,
+         rows;
+};
+
+/*--------------------------------------------------------------------------------
+   The floor canvas P (user, 2026-09-28: N up). The wall named N (--face-names) is the top edge - up
+   is its outward side - and clockwise from it L is on the right, S at the bottom, O on the left, a
+   view from above, not mirrored. Unnamed walls: u up, w right. 4 mm per pixel over the plan.
+  --------------------------------------------------------------------------------*/
+static void mosaicFloorCanvas(const TLayoutPlan &plan, TFloorCanvas &fc)
+{
+   float hi = -1e9f,
+         lo = 1e9f,
+         rl = 1e9f,
+         rh = -1e9f;
+
+   fc.upU = 1.f;
+   fc.upW = 0.f;
+   for (int i = 0; i < plan.vertexCount; i++)
+      if (!strcmp(mosaicFaceNames[i], "N"))
+      {
+         const TPlanPoint &p = plan.verts[i],
+                          &q = plan.verts[(i + 1)%plan.vertexCount];
+         bool              constU = fabsf(p.u - q.u) < fabsf(p.w - q.w);
+         float             side = (constU ? p.u + q.u : p.w + q.w) >= 0.f ? 1.f : -1.f;
+
+         fc.upU = constU ? side : 0.f;
+         fc.upW = constU ? 0.f : side;
+      }
+   fc.rightU = -fc.upW; // clockwise from up, seen from above (w is clockwise of u)
+   fc.rightW = fc.upU;
+   for (int i = 0; i < plan.vertexCount; i++)
+   {
+      float a = plan.verts[i].u*fc.upU + plan.verts[i].w*fc.upW,
+            b = plan.verts[i].u*fc.rightU + plan.verts[i].w*fc.rightW;
+
+      hi = fmaxf(hi, a);
+      lo = fminf(lo, a);
+      rh = fmaxf(rh, b);
+      rl = fminf(rl, b);
+   }
+   fc.top = hi;
+   fc.left = rl;
+   fc.cols = (int)((rh - rl)*(float)mosaicPxPerM) + 1;
+   fc.rows = (int)((hi - lo)*(float)mosaicPxPerM) + 1;
+}
+
+//--------------------------------------------------------------------------------
+// Plan point (u, w) of floor canvas pixel (c, r)
+static void mosaicFloorAt(const TFloorCanvas &fc, int c, int r, float &pu, float &pw)
+{
+   float a = fc.top - ((float)r + 0.5f)/(float)mosaicPxPerM,
+         b = fc.left + ((float)c + 0.5f)/(float)mosaicPxPerM;
+
+   pu = fc.upU*a + fc.rightU*b;
+   pw = fc.upW*a + fc.rightW*b;
+}
+
+/*--------------------------------------------------------------------------------
+   The fifth face (user, 2026-09-28): the floor seen straight down from the ceiling, 4 mm per pixel,
+   plan axes (u up, w right), cut to the polygon. Every frame placed by the refinement (rotations,
+   station positions, spin radius and camera height fitted on the ceiling creases and corners - the
+   gyroscope only started them) that reaches the floor adds its crop, weighted by the picture falloff
+   times sin^3 of the depression: the steep views are the sharp ones and furniture leans least in
+   them. piso_<U>x<W>m.bmp. Furniture is laid flat as floor, as it is.
+  --------------------------------------------------------------------------------*/
+static void mosaicFloor(const TMosaicFrame *frames, int count, const TLayoutPlan &plan, const TVec3 &ud, const TVec3 &wd,
+                        LPCSTR outDir)
+{
+   float        h = plan.cameraHeightM;
+   TFloorCanvas fc;
+
+   if (plan.vertexCount < 3 || !(h > 0.3f))
+      return;
+   mosaicFloorCanvas(plan, fc);
+
+   int           cols = fc.cols,
+                 rows = fc.rows,
+                 used = 0;
+   size_t        pixels = (size_t)cols*rows;
+   TAlloc<float> acc(pixels*4u);
+   TAlloc<BYTE>  seen((size_t)count);
+   char          path[mosaicPathMax];
+
+   memset(acc(), 0, sizeof(float)*pixels*4u);
+   memset(seen(), 0, (size_t)count);
+   for (int r = 0; r < rows; r++)
+      for (int c = 0; c < cols; c++)
+      {
+         float pu,
+               pw;
+
+         mosaicFloorAt(fc, c, r, pu, pw);
+         if (!mosaicInside(plan, pu, pw))
+            continue;
+
+         TVec3  p = { pu*ud.x + pw*wd.x, -h, pu*ud.z + pw*wd.z };
+         float *o = acc() + ((size_t)r*cols + c)*4u;
+
+         for (int f = 0; f < count; f++)
+         {
+            float bgr[3],
+                  s = frames[f].xyz ? mosaicSample(frames[f], p, bgr) : 0.f; // the merge takes only XYZ frames
+
+            if (s <= 0.f)
+               continue;
+
+            float dx = p.x - frames[f].camX,
+                  dz = p.z - frames[f].camZ,
+                  sn = h/sqrtf(dx*dx + h*h + dz*dz);
+
+            s *= sn*sn*sn;
+            o[0] += s*bgr[0];
+            o[1] += s*bgr[1];
+            o[2] += s*bgr[2];
+            o[3] += s;
+            seen[f] = 1u;
+         }
+      }
+   for (int f = 0; f < count; f++)
+      used += seen[f] ? 1 : 0;
+   snprintf(path, sizeof(path), "%s/piso_%.2fx%.2fm.bmp", outDir, (float)rows/(float)mosaicPxPerM,
+            (float)cols/(float)mosaicPxPerM);
+   mosaicWriteBMP(path, acc(), cols, rows);
+   printf("  floor: %d of %d frames on the floor, %dx%d px, camera %.3f m\n", used, count, cols, rows, h);
+}
+
+enum {
+   mosaicFitMaxObs    = 4000,
+   mosaicFitRounds    = 1,  // measure once (the elected lines are the observations), solve, then one check measure
+   mosaicFitIters     = 30,
+   mosaicFitParams    = 6,  // world rotation (3), camera height offset and - a corner station seeing ceiling AND floor
+                            // creases (their spread on the wall fixes the distance) - station x, z; else it stays
+   mosaicFitCreaseReach = 300, // crease columns this near the corner (1.2 m)
+   mosaicFitCornerReach = 60,  // corner edge searched +-24 cm around the plan corner (wider: the jambs win)
+   mosaicFitMaxCands  = 8192, // Sobel peaks of one band
+   mosaicRansacIters  = 400,
+   mosaicRansacLines  = 3,    // lines taken out one after the other
+   mosaicFitMinPoints = 12    // a line needs this many peaks
+};
+
+static const float cFitSigmaObs = 0.005f,  // meters on the wall
+                   cFitSigmaDelta = 0.03f, // radians off the frame's vanishing rotation
+                   cFitSigmaHeight = 0.15f,
+                   cFitSigmaStation = 0.6f,  // a corner station starts a quarter of the way in from a plan corner
+                   cFitEdge = 40.f,        // Sobel response (weights 1-2-1, 2 pixels apart) of a crease or corner edge
+                   cFitRansacTol = 1.5f,   // pixels off a RANSAC line
+                   cFitMaxSlope = 0.14f,   // lines within 8 degrees of level (creases) or of plumb (corner edge),
+                   cFitMaxSlopeFine = 0.035f, // 2 degrees once the first solve set the rotation
+                   cFitMinSupport = 0.25f, // share of the strongest line a candidate needs (the true crease may be short)
+                   cFitMissing = 50.f,     // error score of a wall without a crease, or without the edge
+                   cFitPointWeight = 3.f,  // the corner point where the two creases meet, standing in for a missing edge (9 line points)
+                   cFitMinCrossing = 0.2f; // sine of the angle the two creases must cross at in the picture
+
+// The lines a corner frame is measured on
+enum TFitKind {
+   fkCeiling,
+   fkFloor,
+   fkCorner
+};
+
+// One measured point of the corner in the picture: on a crease or on the corner edge of a wall
+struct TFitObs {
+   float    u,
+            v;
+   int      wall;
+   TFitKind kind;
+   float    weight;  // 1 for a line point; the corner point where two creases meet weighs cFitPointWeight
+};
+
+//--------------------------------------------------------------------------------
+// Luma of a covered canvas pixel; -1 outside or not seen
+static float mosaicCanvasLuma(const float *acc, int cols, int rows, int c, int r)
+{
+   if (c < 0 || r < 0 || c >= cols || r >= rows)
+      return -1.f;
+
+   const float *o = acc + ((size_t)r*cols + c)*4u;
+
+   return o[3] > 0.f ? 0.114f*o[0] + 0.587f*o[1] + 0.299f*o[2] : -1.f;
+}
+
+/*--------------------------------------------------------------------------------
+   Sobel at a canvas pixel: the vertical luma step (rows, weights 1-2-1 across three columns) and the
+   horizontal one (columns, 1-2-1 across three rows); false when any sample is not seen.
+  --------------------------------------------------------------------------------*/
+static bool mosaicCanvasStep(const float *acc, int cols, int rows, int c, int r, float &along, float &across)
+{
+   along = 0.f;
+   across = 0.f;
+   for (int d = -1; d <= 1; d++)
+   {
+      float up = mosaicCanvasLuma(acc, cols, rows, c + d, r - 1),
+            dn = mosaicCanvasLuma(acc, cols, rows, c + d, r + 1),
+            lf = mosaicCanvasLuma(acc, cols, rows, c - 1, r + d),
+            rt = mosaicCanvasLuma(acc, cols, rows, c + 1, r + d);
+
+      if (up < 0.f || dn < 0.f || lf < 0.f || rt < 0.f)
+         return false;
+      along += (dn - up)*(d ? 1.f : 2.f); // Sobel
+      across += (rt - lf)*(d ? 1.f : 2.f);
+   }
+   return true;
+}
+
+//--------------------------------------------------------------------------------
+// Subpixel peak of three samples around a local maximum (parabola), in [-0.5, 0.5]
+static float mosaicPeakOffset(float before, float at, float after)
+{
+   float den = before - 2.f*at + after;
+
+   if (!(den < -1e-6f))
+      return 0.f;
+
+   float off = 0.5f*(before - after)/den;
+
+   return off < -0.5f ? -0.5f : (off > 0.5f ? 0.5f : off);
+}
+
+//--------------------------------------------------------------------------------
+// One frame onto one wall canvas, raw colors (weight 1 where seen)
+static void mosaicRenderWall(const TMosaicFrame &f, const TMosaicWall &wl, const TLayoutPlan &plan, const TVec3 &ud,
+                             const TVec3 &wd, float *acc)
+{
+   memset(acc, 0, sizeof(float)*(size_t)wl.cols*wl.rows*4u);
+   for (int r = 0; r < wl.rows; r++)
+      for (int c = 0; c < wl.cols; c++)
+      {
+         TVec3  p = mosaicPoint(wl, ud, wd, plan.ceilingM, plan.cameraHeightM, (float)c, (float)r);
+         float  bgr[3],
+               *o = acc + ((size_t)r*wl.cols + c)*4u;
+
+         if (mosaicSample(f, p, bgr) <= 0.f)
+            continue;
+         o[0] = bgr[0];
+         o[1] = bgr[1];
+         o[2] = bgr[2];
+         o[3] = 1.f;
+      }
+}
+
+//--------------------------------------------------------------------------------
+// Canvas column of plan vertex k on a wall
+static float mosaicCornerColumn(const TMosaicWall &wl, const TLayoutPlan &plan, int k)
+{
+   float s = wl.constU ? plan.verts[k].w : plan.verts[k].u;
+
+   return (s - wl.s0)*wl.sdir*(float)mosaicPxPerM - 0.5f;
+}
+
+/*--------------------------------------------------------------------------------
+   RANSAC for one straight line y = a*x + b among the points still free (used == 0), slope within
+   maxSlope: pairs of points at least 10 apart propose the line, the one with most points within
+   cFitRansacTol wins. Deterministic (fixed seed). Returns the count of its points.
+  --------------------------------------------------------------------------------*/
+static int mosaicRansacLine(const float *x, const float *y, int n, LPCBYTE used, float maxSlope, float &a, float &b)
+{
+   DWORD seed = 12345u;
+   int   unused = 0,
+         best = 0;
+
+   for (int i = 0; i < n; i++)
+      unused += used[i] ? 0 : 1;
+   if (unused < 2)
+      return 0;
+   for (int it = 0; it < mosaicRansacIters; it++)
+   {
+      seed = seed*1664525u + 1013904223u;
+
+      int i = (int)((seed >> 8)%(DWORD)n);
+
+      seed = seed*1664525u + 1013904223u;
+
+      int j = (int)((seed >> 8)%(DWORD)n);
+
+      if (used[i] || used[j] || fabsf(x[j] - x[i]) < 10.f)
+         continue;
+
+      float ta = (y[j] - y[i])/(x[j] - x[i]),
+            tb = y[i] - ta*x[i];
+      int   count = 0;
+
+      if (fabsf(ta) > maxSlope)
+         continue;
+      for (int p = 0; p < n; p++)
+         count += !used[p] && fabsf(y[p] - (ta*x[p] + tb)) <= cFitRansacTol ? 1 : 0;
+      if (count > best)
+      {
+         best = count;
+         a = ta;
+         b = tb;
+      }
+   }
+   return best;
+}
+
+/*--------------------------------------------------------------------------------
+   The corner as the frame's own rectified view shows it on one wall (user, 2026-09-28: Sobel peaks,
+   RANSAC for the real lines). Candidates are every Sobel peak (to a subpixel) of the band: near the
+   corner, the horizontal edges of the top (ceiling crease) or bottom (floor crease) 35% of the
+   canvas, and the vertical edges within +-24 cm of the plan corner (corner edge). RANSAC takes out
+   up to three lines one after the other; among those with at least cFitMinSupport of the strongest (user:
+   on the ceiling the top line wins, the ones below are furniture - wardrobes, shelves - or the
+   molding's own lower edge), the crease is the highest (ceiling) or the
+   lowest (floor), the corner edge the one nearest the plan corner. Its points are refitted by least
+   squares, go back to picture points, and the line is printed against where it must be: creases
+   level on the top and bottom canvas rows, the edge vertical on the corner column. error: degrees +
+   centimeters off; a wall without any crease or without the edge costs cFitMissing each.
+  --------------------------------------------------------------------------------*/
+static int mosaicCornerMeasure(const TMosaicFrame &f, const TMosaicWall &wl, int wall, const TLayoutPlan &plan, int k,
+                               const TVec3 &ud, const TVec3 &wd, const float *acc, TFitObs *obs, int nObs, LPCSTR name,
+                               float maxSlope, float &error, int &creases, int &edges, int &kinds)
+{
+   static LPCSTR cWhat[3] = { "ceiling crease", "floor crease", "corner edge" };
+   int           cols = wl.cols,
+                 rows = wl.rows,
+                 found[3] = { 0, 0, 0 };
+   float         ck = mosaicCornerColumn(wl, plan, k);
+   TAlloc<float> px((size_t)mosaicFitMaxCands),
+                 py((size_t)mosaicFitMaxCands);
+   TAlloc<BYTE>  used((size_t)mosaicFitMaxCands);
+
+   for (int kind = fkCeiling; kind <= fkCorner; kind++)
+   {
+      int n = 0;
+
+      if (kind != fkCorner)
+         for (int c = (int)ck - mosaicFitCreaseReach; c <= (int)ck + mosaicFitCreaseReach; c += 2)
+            for (int step = 1; c >= 1 && c + 1 < cols && step < rows*35/100 && n < mosaicFitMaxCands; step++)
+            {
+               int   r = kind == fkCeiling ? step : rows - 1 - step, // the ceiling from the top, the floor from the bottom
+                     dir = kind == fkCeiling ? 1 : -1;
+               float along,
+                     across,
+                     before,
+                     after,
+                     dummy;
+
+               if (!mosaicCanvasStep(acc, cols, rows, c, r, along, across)
+                   || !mosaicCanvasStep(acc, cols, rows, c, r - dir, before, dummy)
+                   || !mosaicCanvasStep(acc, cols, rows, c, r + dir, after, dummy))
+                  continue;
+               if (fabsf(along) < cFitEdge || fabsf(along) < 2.f*fabsf(across)
+                   || fabsf(along) < fabsf(before) || fabsf(along) < fabsf(after))
+                  continue; // not a peak of a horizontal edge
+               px[n] = (float)c;
+               py[n] = (float)r + (float)dir*mosaicPeakOffset(fabsf(before), fabsf(along), fabsf(after));
+               n++;
+            }
+      else
+         for (int r = rows/10; r < rows*9/10; r += 2)
+            for (int c = (int)ck - mosaicFitCornerReach; c <= (int)ck + mosaicFitCornerReach && n < mosaicFitMaxCands; c++)
+            {
+               float along,
+                     across,
+                     left,
+                     right,
+                     dummy;
+
+               if (!mosaicCanvasStep(acc, cols, rows, c, r, along, across)
+                   || !mosaicCanvasStep(acc, cols, rows, c - 1, r, dummy, left)
+                   || !mosaicCanvasStep(acc, cols, rows, c + 1, r, dummy, right))
+                  continue;
+               if (fabsf(across) < cFitEdge || fabsf(across) < 2.f*fabsf(along)
+                   || fabsf(across) < fabsf(left) || fabsf(across) < fabsf(right))
+                  continue; // not a peak of a vertical edge
+               px[n] = (float)r; // the edge as column = a*row + b
+               py[n] = (float)c + mosaicPeakOffset(fabsf(left), fabsf(across), fabsf(right));
+               n++;
+            }
+
+      // the real lines, strongest first
+      float la[mosaicRansacLines],
+            lb[mosaicRansacLines];
+      int   lc[mosaicRansacLines],
+            lines = 0,
+            strongest = 0,
+            pick = -1;
+
+      memset(used(), 0, (size_t)n);
+      for (int l = 0; l < mosaicRansacLines; l++)
+      {
+         int count = mosaicRansacLine(px(), py(), n, used(), maxSlope, la[l], lb[l]);
+
+         if (count < mosaicFitMinPoints)
+            break;
+         lc[l] = count;
+         strongest = count > strongest ? count : strongest;
+         for (int p = 0; p < n; p++)
+            if (fabsf(py[p] - (la[l]*px[p] + lb[l])) <= cFitRansacTol)
+               used[p] = 1u;
+         lines++;
+      }
+      for (int l = 0; l < lines; l++)
+      {
+         float edgeCm = 100.f*(kind == fkCeiling ? la[l]*ck + lb[l] + 0.5f : (float)rows - 0.5f - (la[l]*ck + lb[l]));
+
+         if (kind != fkCorner) // every line the band holds, for the tie-break check
+            printf("      %s line %d: %d peaks, slope %+.2f deg, %.1f cm from the %s edge at the corner\n", cWhat[kind], l,
+                   lc[l], atanf(la[l])*57.29578f, edgeCm/(float)mosaicPxPerM, kind == fkCeiling ? "top" : "bottom");
+         if ((float)lc[l] < cFitMinSupport*(float)strongest)
+            continue;
+         if (pick < 0)
+         {
+            pick = l;
+            continue;
+         }
+
+         float mid = 0.5f*(float)rows,
+               at = kind == fkCorner ? fabsf(la[l]*mid + lb[l] - ck) : la[l]*ck + lb[l],
+               was = kind == fkCorner ? fabsf(la[pick]*mid + lb[pick] - ck) : la[pick]*ck + lb[pick];
+
+         if ((kind == fkFloor) ? at > was : at < was) // ceiling: highest; floor: lowest; edge: nearest the corner
+            pick = l;
+      }
+      // the cloud and the elected line, back on the full picture (the fit's first measure: pontos_NNN.csv)
+      for (int p = 0; mosaicPointsFile && p < n; p++)
+      {
+         int   line = -1;
+         float u,
+               v,
+               c = kind == fkCorner ? py[p] : px[p],
+               r = kind == fkCorner ? px[p] : py[p];
+         TVec3 q = mosaicPoint(wl, ud, wd, plan.ceilingM, plan.cameraHeightM, c, r);
+
+         for (int l = 0; l < lines && line < 0; l++)
+            if (fabsf(py[p] - (la[l]*px[p] + lb[l])) <= cFitRansacTol)
+               line = l;
+         if (bundleProject(f, q, u, v))
+            fprintf(mosaicPointsFile, "%s,%s,%.1f,%.1f,%d,%d\r\n", cWhat[kind], name, 2.f*u + 0.5f, 2.f*v + 0.5f, line,
+                    line >= 0 && line == pick ? 1 : 0);
+      }
+      if (pick < 0)
+      {
+         printf("    %s %s: not found (%d peaks)\n", name, cWhat[kind], n);
+         continue;
+      }
+
+      // least squares on the chosen line's points
+      float sx = 0.f,
+            sy = 0.f,
+            sxx = 0.f,
+            sxy = 0.f,
+            a = la[pick],
+            b = lb[pick];
+      int   m = 0;
+
+      for (int p = 0; p < n; p++)
+         if (fabsf(py[p] - (la[pick]*px[p] + lb[pick])) <= cFitRansacTol)
+         {
+            sx += px[p];
+            sy += py[p];
+            sxx += px[p]*px[p];
+            sxy += px[p]*py[p];
+            m++;
+         }
+
+      float det = (float)m*sxx - sx*sx;
+
+      if (fabsf(det) > 1e-3f)
+      {
+         a = ((float)m*sxy - sx*sy)/det;
+         b = (sy - a*sx)/(float)m;
+      }
+
+      float tilt = atanf(a)*57.29578f,
+            off = kind == fkCorner ? 100.f*(a*0.5f*(float)rows + b - ck)/(float)mosaicPxPerM
+                                   : (kind == fkCeiling ? 100.f*(a*ck + b + 0.5f)/(float)mosaicPxPerM
+                                                        : 100.f*((float)rows - 0.5f - (a*ck + b))/(float)mosaicPxPerM);
+
+      found[kind] = 1;
+      error += fabsf(tilt) + fabsf(off); // degrees and centimeters off the canvas border
+      printf("    %s %s: %d points (%d lines), %s %+.2f deg, %+.1f cm %s\n", name, cWhat[kind], m, lines,
+             kind == fkCorner ? "tilt" : "slope", tilt, off,
+             kind == fkCorner ? "off the corner at mid-height"
+                              : (kind == fkCeiling ? "below the ceiling at the corner" : "above the floor at the corner"));
+      for (int p = 0; p < n && nObs < mosaicFitMaxObs; p++)
+      {
+         if (fabsf(py[p] - (a*px[p] + b)) > cFitRansacTol)
+            continue;
+
+         float u,
+               v,
+               c = kind == fkCorner ? py[p] : px[p],
+               r = kind == fkCorner ? px[p] : py[p];
+         TVec3 q = mosaicPoint(wl, ud, wd, plan.ceilingM, plan.cameraHeightM, c, r);
+
+         if (!bundleProject(f, q, u, v))
+            continue;
+         obs[nObs].u = u;
+         obs[nObs].v = v;
+         obs[nObs].wall = wall;
+         obs[nObs].kind = (TFitKind)kind;
+         obs[nObs].weight = 1.f;
+         nObs++;
+      }
+   }
+   if (!found[fkCeiling] && !found[fkFloor])
+      error += cFitMissing;
+   if (!found[fkCorner])
+      error += cFitMissing;
+   creases += found[fkCeiling] + found[fkFloor];
+   kinds |= (found[fkCeiling] ? 1 : 0) | (found[fkFloor] ? 2 : 0); // 1: a ceiling crease, 2: a floor crease
+   edges += found[fkCorner];
+   return nObs;
+}
+
+/*--------------------------------------------------------------------------------
+   The corner seen where its creases meet (user, 2026-09-28: the vertical crease has little contrast,
+   the corner seen on the ceiling confirms it). The picture points of each wall's crease of one kind
+   (ceiling or floor) are fitted to a line in the picture (principal axis) and the two lines are
+   intersected: the top (or foot) of the corner, where both creases end. It must sit on the plan
+   vertex at the ceiling (or floor) height: printed as the offset along wall A and in height, added
+   to the error and appended as an observation (along and height on wall A) when it stands in for a
+   missing edge (stand); with both edges found it only confirms them. found: the lines
+   crossed inside the picture.
+  --------------------------------------------------------------------------------*/
+static int mosaicCornerPoint(const TMosaicFrame &f, const TMosaicWall *walls, int wallA, int wallB, const TLayoutPlan &plan,
+                             int k, const TVec3 &ud, const TVec3 &wd, float radius, TFitKind kind, TFitObs *obs, int nObs,
+                             LPCSTR nameA, bool stand, float &error, bool &found)
+{
+   float mu[2] = { 0.f, 0.f },
+         mv[2] = { 0.f, 0.f },
+         du[2],
+         dv[2];
+   int   cnt[2] = { 0, 0 };
+
+   found = false;
+   for (int side = 0; side < 2; side++)
+   {
+      int   wall = side ? wallB : wallA;
+      float cuu = 0.f,
+            cvv = 0.f,
+            cuv = 0.f;
+
+      for (int i = 0; i < nObs; i++)
+         if (obs[i].wall == wall && obs[i].kind == kind && obs[i].weight == 1.f)
+         {
+            mu[side] += obs[i].u;
+            mv[side] += obs[i].v;
+            cnt[side]++;
+         }
+      if (cnt[side] < 8)
+         return nObs;
+      mu[side] /= (float)cnt[side];
+      mv[side] /= (float)cnt[side];
+      for (int i = 0; i < nObs; i++)
+         if (obs[i].wall == wall && obs[i].kind == kind && obs[i].weight == 1.f)
+         {
+            float a = obs[i].u - mu[side],
+                  b = obs[i].v - mv[side];
+
+            cuu += a*a;
+            cvv += b*b;
+            cuv += a*b;
+         }
+
+      float angle = 0.5f*atan2f(2.f*cuv, cuu - cvv);
+
+      du[side] = cosf(angle);
+      dv[side] = sinf(angle);
+   }
+
+   float det = dv[0]*du[1] - du[0]*dv[1]; // [d0 -d1] (t s) = p1 - p0
+
+   if (fabsf(det) < cFitMinCrossing)
+      return nObs; // nearly parallel in the picture: no reliable crossing
+
+   float pu = mu[1] - mu[0],
+         pv = mv[1] - mv[0],
+         t = (pv*du[1] - pu*dv[1])/det,
+         u = mu[0] + t*du[0],
+         v = mv[0] + t*dv[0];
+
+   if (u < 0.f || v < 0.f || u >= (float)f.w || v >= (float)f.h)
+      return nObs; // the corner falls outside the picture
+
+   const TMosaicWall &wl = walls[wallA];
+   TVec3              nrm = wl.constU ? ud : wd,
+                      hit;
+
+   if (!bundleHit(f, f.delta, radius, f.stationX, f.stationZ, u, v, nrm, wl.offset, hit))
+      return nObs;
+
+   float along = 100.f*((wl.constU ? hit.x*wd.x + hit.z*wd.z : hit.x*ud.x + hit.z*ud.z)
+                        - (wl.constU ? plan.verts[k].w : plan.verts[k].u))*wl.sdir,
+         height = 100.f*(hit.y + f.camY - (kind == fkCeiling ? plan.ceilingM - plan.cameraHeightM : -plan.cameraHeightM));
+
+   found = true;
+   printf("    %s corner where the creases meet: %+.1f cm along %s, %+.1f cm in height%s\n",
+          kind == fkCeiling ? "ceiling" : "floor", along, nameA, height, stand ? "" : " (check only: the edges were found)");
+   if (!stand)
+      return nObs; // the faint vertical edge was found on both walls: the crossing only confirms it
+   error += fabsf(along) + fabsf(height);
+   for (int c = 0; c < 2 && nObs < mosaicFitMaxObs; c++)
+   {
+      obs[nObs].u = u;
+      obs[nObs].v = v;
+      obs[nObs].wall = wallA;
+      obs[nObs].kind = c ? kind : fkCorner;
+      obs[nObs].weight = cFitPointWeight;
+      nObs++;
+   }
+   return nObs;
+}
+
+//--------------------------------------------------------------------------------
+// Residuals of the corner fit: observations on the walls (meters / sigma), then the priors
+static int mosaicFitResiduals(const TMosaicFrame &f, const TMosaicWall *walls, const TLayoutPlan &plan, int k,
+                              const TVec3 &ud, const TVec3 &wd, const TFitObs *obs, int nObs, float radius,
+                              const float *theta, const float *start, int np, float *res)
+{
+   TVec3 delta = { theta[0], theta[1], theta[2] };
+   int   n = 0;
+
+   for (int i = 0; i < nObs; i++)
+   {
+      const TMosaicWall &wl = walls[obs[i].wall];
+      TVec3              nrm = wl.constU ? ud : wd,
+                         hit;
+      float              r = 0.f;
+
+      if (bundleHit(f, delta, radius, np > 4 ? theta[4] : f.stationX, np > 4 ? theta[5] : f.stationZ, obs[i].u, obs[i].v,
+                    nrm, wl.offset, hit))
+      {
+         if (obs[i].kind == fkCorner)
+            r = ((wl.constU ? hit.x*wd.x + hit.z*wd.z : hit.x*ud.x + hit.z*ud.z)
+                 - (wl.constU ? plan.verts[k].w : plan.verts[k].u))/cFitSigmaObs;
+         else if (obs[i].kind == fkCeiling)
+            r = (hit.y + theta[3] - (plan.ceilingM - plan.cameraHeightM))/cFitSigmaObs;
+         else
+            r = (hit.y + theta[3] + plan.cameraHeightM)/cFitSigmaObs;
+      }
+      res[n++] = r*obs[i].weight;
+   }
+   for (int i = 0; i < 3; i++)
+      res[n++] = (theta[i] - start[i])/cFitSigmaDelta;
+   res[n++] = theta[3]/cFitSigmaHeight;
+   for (int i = 4; i < np; i++)
+      res[n++] = (theta[i] - start[i])/cFitSigmaStation;
+   return n;
+}
+
+/*--------------------------------------------------------------------------------
+   Corner fit of one XYZ frame (user, 2026-09-28: the frame shows the three axes of the corner, so
+   its rectification fixes rotation as well as perspective - the ceiling crease level, the corner
+   edge vertical). The frame is rendered on the two walls of its corner, the crease and the edge are
+   measured there and taken back to picture points; its world rotation and camera height are then
+   solved (Gauss-Newton, Levenberg damping) so those points land on the plan's crease line and corner
+   line. The plan stays; so does the station, unless the frame belongs to a corner station and shows a
+   ceiling and a floor crease (user: frame 42 - the ceiling gives the corner, the floor line from the
+   left meets it): their spread on the wall fixes the distance, and the station x, z are solved too.
+   One measure on the vanishing-point pose (user: the RANSAC picks there are the right ones), a solve on
+   those fixed observations, then a check measure that is printed and never replaces the solve.
+  --------------------------------------------------------------------------------*/
+static void mosaicCornerFit(TMosaicFrame &f, int k, const TMosaicWall *walls, const TLayoutPlan &plan, const TVec3 &ud,
+                            const TVec3 &wd)
+{
+   int   n = plan.vertexCount,
+         wallA = (k + n - 1)%n,
+         wallB = k,
+         maxPixels = walls[wallA].cols*walls[wallA].rows > walls[wallB].cols*walls[wallB].rows
+                     ? walls[wallA].cols*walls[wallA].rows : walls[wallB].cols*walls[wallB].rows,
+         np = 4; // rotation and camera height; a corner station seeing both creases frees its x, z (6)
+   float radius = sqrtf((f.camX - f.stationX)*(f.camX - f.stationX) + (f.camZ - f.stationZ)*(f.camZ - f.stationZ)),
+         start[mosaicFitParams] = { f.delta.x, f.delta.y, f.delta.z, 0.f, f.stationX, f.stationZ };
+   char  nameA[16],
+         nameB[16];
+
+   TAlloc<float>   acc((size_t)maxPixels*4u);
+   TAlloc<TFitObs> obs((size_t)mosaicFitMaxObs);
+
+   mosaicFaceLabel(wallA, nameA, sizeof(nameA));
+   mosaicFaceLabel(wallB, nameB, sizeof(nameB));
+
+   TVec3 bestDelta = f.delta; // a round counts only if its own re-measure is better (a new view can lock on another edge)
+   float bestCamX = f.camX,
+         bestCamZ = f.camZ,
+         bestCamY = f.camY,
+         bestStationX = f.stationX,
+         bestStationZ = f.stationZ,
+         bestError = 1e9f;
+
+   printf("  corner fit frame %03d: corner %d, walls %s and %s\n", f.index, k, nameA, nameB);
+   for (int round = 0; round <= mosaicFitRounds; round++)
+   {
+      int   nObs = 0,
+            creases = 0,
+            edges = 0,
+            kinds = 0;
+      float error = 0.f,
+            slope = round ? cFitMaxSlopeFine : cFitMaxSlope;
+      bool  top = false,
+            foot = false;
+
+      printf("   round %d:\n", round);
+      if (round == 0 && mosaicOutDir)
+      {
+         char path[mosaicPathMax];
+
+         snprintf(path, sizeof(path), "%s/pontos_%03d.csv", mosaicOutDir, f.index);
+         mosaicPointsFile = fopen(path, "wb");
+         if (mosaicPointsFile)
+            fprintf(mosaicPointsFile, "kind,wall,u,v,line,elected\r\n"); // full-picture pixels, stored orientation
+      }
+      mosaicRenderWall(f, walls[wallA], plan, ud, wd, acc());
+      nObs = mosaicCornerMeasure(f, walls[wallA], wallA, plan, k, ud, wd, acc(), obs(), nObs, nameA, slope, error, creases,
+                                 edges, kinds);
+      mosaicRenderWall(f, walls[wallB], plan, ud, wd, acc());
+      nObs = mosaicCornerMeasure(f, walls[wallB], wallB, plan, k, ud, wd, acc(), obs(), nObs, nameB, slope, error, creases,
+                                 edges, kinds);
+      if (mosaicPointsFile)
+      {
+         fclose(mosaicPointsFile);
+         mosaicPointsFile = NULL;
+      }
+      nObs = mosaicCornerPoint(f, walls, wallA, wallB, plan, k, ud, wd, radius, fkCeiling, obs(), nObs, nameA, edges < 2,
+                               error, top);
+      nObs = mosaicCornerPoint(f, walls, wallA, wallB, plan, k, ud, wd, radius, fkFloor, obs(), nObs, nameA, edges < 2,
+                               error, foot);
+      if (top || foot)
+         error -= cFitMissing*(float)(2 - edges); // confirmed where its creases meet: the faint vertical edge may be missing
+      printf("    error %.2f (degrees + centimeters over the lines found)\n", error);
+      if (round > 0 && round < mosaicFitRounds && error >= bestError) // the check measure never undoes the solve
+      {
+         printf("    worse than round %d: its pose is kept\n", round - 1);
+         f.delta = bestDelta;
+         f.camX = bestCamX;
+         f.camZ = bestCamZ;
+         f.camY = bestCamY;
+         f.stationX = bestStationX;
+         f.stationZ = bestStationZ;
+         break;
+      }
+      bestError = error;
+      bestDelta = f.delta;
+      bestCamX = f.camX;
+      bestCamZ = f.camZ;
+      bestCamY = f.camY;
+      bestStationX = f.stationX;
+      bestStationZ = f.stationZ;
+      if (round == 0 && !creases) // a crease holds the rotation; the edge alone would let it spin
+      {
+         printf("    no crease: the frame keeps its vanishing-point pose\n");
+         break;
+      }
+      if (round == 0 && f.station > 0 && (kinds & 3) == 3)
+      {
+         np = 6; // ceiling and floor creases on the walls: their spread tells the distance, the station is found too
+         printf("    ceiling and floor creases in view: the station position is solved too\n");
+      }
+      if (round == mosaicFitRounds || nObs < 20)
+         break; // the last round only measures the result
+
+      int           nr = nObs + np;
+      float         theta[mosaicFitParams] = { f.delta.x, f.delta.y, f.delta.z, f.camY, f.stationX, f.stationZ },
+                    lambda = 1e-3f;
+      TAlloc<float> res((size_t)nr),
+                    trial((size_t)nr),
+                    jac((size_t)nr*np);
+
+      for (int it = 0; it < mosaicFitIters; it++)
+      {
+         float cost = 0.f,
+               ata[mosaicFitParams*mosaicFitParams],
+               atb[mosaicFitParams],
+               step[mosaicFitParams],
+               moved[mosaicFitParams];
+
+         mosaicFitResiduals(f, walls, plan, k, ud, wd, obs(), nObs, radius, theta, start, np, res());
+         for (int i = 0; i < nr; i++)
+            cost += res[i]*res[i];
+         for (int p = 0; p < np; p++)
+         {
+            float eps = p < 3 ? 1e-4f : 1e-3f,
+                  keepTheta = theta[p];
+
+            theta[p] = keepTheta + eps;
+            mosaicFitResiduals(f, walls, plan, k, ud, wd, obs(), nObs, radius, theta, start, np, trial());
+            theta[p] = keepTheta;
+            for (int i = 0; i < nr; i++)
+               jac[(size_t)i*np + p] = (trial[i] - res[i])/eps;
+         }
+
+         bool improved = false;
+
+         for (int attempt = 0; attempt < 6 && !improved; attempt++)
+         {
+            memset(ata, 0, sizeof(ata));
+            memset(atb, 0, sizeof(atb));
+            for (int i = 0; i < nr; i++)
+               for (int p = 0; p < np; p++)
+               {
+                  float jp = jac[(size_t)i*np + p];
+
+                  atb[p] -= jp*res[i];
+                  for (int q = 0; q < np; q++)
+                     ata[p*np + q] += jp*jac[(size_t)i*np + q];
+               }
+            for (int p = 0; p < np; p++)
+               ata[p*np + p] *= 1.f + lambda;
+            if (!mosaicSolve(ata, atb, step, np))
+               break;
+            memcpy(moved, theta, sizeof(moved));
+            for (int p = 0; p < np; p++)
+               moved[p] = theta[p] + step[p];
+            mosaicFitResiduals(f, walls, plan, k, ud, wd, obs(), nObs, radius, moved, start, np, trial());
+
+            float newCost = 0.f;
+
+            for (int i = 0; i < nr; i++)
+               newCost += trial[i]*trial[i];
+            if (newCost < cost)
+            {
+               memcpy(theta, moved, sizeof(theta));
+               lambda = fmaxf(1e-6f, 0.3f*lambda);
+               improved = true;
+            }
+            else
+               lambda *= 10.f;
+         }
+         if (!improved)
+            break;
+      }
+      f.delta.x = theta[0];
+      f.delta.y = theta[1];
+      f.delta.z = theta[2];
+      f.camY = theta[3];
+      f.stationX = theta[4];
+      f.stationZ = theta[5];
+
+      TVec3 c = bundleCenter(f, f.delta, radius, f.stationX, f.stationZ);
+
+      f.camX = c.x;
+      f.camZ = c.z;
+      printf("    -> %d points; rotation change %.2f deg, camera height %+.1f cm", nObs,
+             57.29578f*sqrtf((theta[0] - start[0])*(theta[0] - start[0]) + (theta[1] - start[1])*(theta[1] - start[1])
+                             + (theta[2] - start[2])*(theta[2] - start[2])),
+             100.f*f.camY);
+      if (np > 4)
+         printf(", station (%+.2f, %+.2f) m, moved %.2f m", f.stationX, f.stationZ,
+                sqrtf((f.stationX - start[4])*(f.stationX - start[4]) + (f.stationZ - start[5])*(f.stationZ - start[5])));
+      printf("\n");
+   }
+}
+
+/*--------------------------------------------------------------------------------
+   Frame by frame, its share of the room's five target images (user, 2026-09-28): four walls and the
+   floor, each on the canvas of its final orthophoto (4 mm per pixel; walls: column along the wall
+   seen from inside, row from the ceiling down; floor: the canvas P, N up (mosaicFloorCanvas),
+   cut to the polygon), sampled with the refined pose, raw colors (no gains). A face the
+   frame covers at least cMinCoverage of becomes comp_NNN_<face>.bmp (with --face-names: <frame><name>.bmp,
+   e.g. 8N.bmp) on the WHOLE canvas, black where unseen, so the components stack as they are; comp.csv
+   tells what each covers (bounding box on the canvas) and whether the frame is XYZ (merged) or
+   partial (placed, waiting for the subpixel matching).
+  --------------------------------------------------------------------------------*/
+static void mosaicComponents(const TMosaicFrame *frames, int count, const TMosaicWall *walls, const TLayoutPlan &plan,
+                             const TVec3 &ud, const TVec3 &wd, const int *corner, LPCSTR outDir)
+{
+   TFloorCanvas fc;
+   char         path[mosaicPathMax];
+
+   mosaicFloorCanvas(plan, fc);
+
+   int floorCols = fc.cols,
+       floorRows = fc.rows,
+       maxPixels = floorCols*floorRows,
+       written = 0;
+
+   for (int i = 0; i < plan.vertexCount; i++)
+      maxPixels = walls[i].cols*walls[i].rows > maxPixels ? walls[i].cols*walls[i].rows : maxPixels;
+
+   TAlloc<float> canvas((size_t)maxPixels*4u);
+
+   snprintf(path, sizeof(path), "%s/comp.csv", outDir);
+
+   FILE *csv = fopen(path, "wb");
+
+   if (!csv)
+      return;
+   fprintf(csv, "frame,station,class,face,col0,row0,cols,rows,coveredPx,share,file\r\n");
+   for (int f = 0; f < count; f++)
+   {
+      const TMosaicFrame &fr = frames[f];
+      char                line[256];
+      size_t              used = 0u;
+
+      line[0] = '\0';
+      for (int face = 0; face <= plan.vertexCount; face++)
+      {
+         bool onFloor = face == plan.vertexCount;
+         int  cols = onFloor ? floorCols : walls[face].cols,
+              rows = onFloor ? floorRows : walls[face].rows,
+              c0 = cols,
+              c1 = -1,
+              r0 = rows,
+              r1 = -1,
+              covered = 0,
+              n = plan.vertexCount,
+              k = corner[f];
+
+         if (cols <= 0 || rows <= 0 || (k >= 0 && !onFloor && face != k && face != (k + n - 1)%n)) // a corner: its two walls
+            continue;
+         memset(canvas(), 0, sizeof(float)*(size_t)cols*rows*4u);
+         for (int r = 0; r < rows; r++)
+            for (int c = 0; c < cols; c++)
+            {
+               TVec3 p;
+
+               if (onFloor)
+               {
+                  float pu,
+                        pw;
+
+                  mosaicFloorAt(fc, c, r, pu, pw);
+                  if (!mosaicInside(plan, pu, pw))
+                     continue;
+                  p.x = pu*ud.x + pw*wd.x;
+                  p.y = -plan.cameraHeightM;
+                  p.z = pu*ud.z + pw*wd.z;
+               }
+               else
+                  p = mosaicPoint(walls[face], ud, wd, plan.ceilingM, plan.cameraHeightM, (float)c, (float)r);
+
+               float  bgr[3],
+                      s = mosaicSample(fr, p, bgr),
+                     *o = canvas() + ((size_t)r*cols + c)*4u;
+
+               if (s <= 0.f)
+                  continue;
+               o[0] = bgr[0];
+               o[1] = bgr[1];
+               o[2] = bgr[2];
+               o[3] = 1.f;
+               covered++;
+               c0 = c < c0 ? c : c0;
+               c1 = c > c1 ? c : c1;
+               r0 = r < r0 ? r : r0;
+               r1 = r > r1 ? r : r1;
+            }
+
+         float share = (float)covered/(float)(cols*rows);
+
+         if (share < cMinCoverage)
+            continue;
+
+         int  cw = c1 - c0 + 1,
+              ch = r1 - r0 + 1;
+         char faceName[16],
+              file[64];
+
+         if (mosaicFaceNames[face][0])
+            snprintf(faceName, sizeof(faceName), "%s", mosaicFaceNames[face]);
+         else if (onFloor)
+            snprintf(faceName, sizeof(faceName), "piso");
+         else
+            snprintf(faceName, sizeof(faceName), "parede%d", face);
+         if (mosaicFaceNames[face][0])
+            snprintf(file, sizeof(file), "%d%s.bmp", fr.index, faceName); // the user's naming: 8N, 8L...
+         else
+            snprintf(file, sizeof(file), "comp_%03d_%s.bmp", fr.index, faceName);
+         snprintf(path, sizeof(path), "%s/%s", outDir, file);
+         mosaicWriteBMP(path, canvas(), cols, rows); // the whole target canvas: the components stack as they are
+         fprintf(csv, "%d,%d,%s,%s,%d,%d,%d,%d,%d,%.4f,%s\r\n", fr.index, fr.station, fr.xyz ? "xyz" : "partial", faceName, c0,
+                 r0, cw, ch, covered, share, file);
+         written++;
+         used += (size_t)snprintf(line + used, sizeof(line) - used, " %s %.0f%%", faceName, 100.f*share);
+         if (used >= sizeof(line))
+            used = sizeof(line) - 1u;
+      }
+      printf("  components frame %03d station %d (%s):%s\n", fr.index, fr.station, fr.xyz ? "xyz" : "partial",
+             line[0] ? line : " none");
+   }
+   fclose(csv);
+   printf("  components: %d crops from %d frames (comp.csv)\n", written, count);
+}
+
+/*--------------------------------------------------------------------------------
+   The preliminary merge (user, 2026-09-28): only the XYZ corner frames, and from each only its three
+   trusted images - the floor and the two walls that meet at the corner it sees (vertex k ends wall
+   k-1 and starts wall k). Walls weigh the picture falloff times the cosine of the angle of attack,
+   the floor times sin^3 of the depression; raw colors, no gains. prelim_parede_K_<length>m.bmp and
+   prelim_piso_<U>x<W>m.bmp, with how much of each canvas the corners already fill.
+  --------------------------------------------------------------------------------*/
+static void mosaicCornerMerge(const TMosaicFrame *frames, int count, const int *corner, const TMosaicWall *walls,
+                              const TLayoutPlan &plan, const TVec3 &ud, const TVec3 &wd, LPCSTR outDir)
+{
+   int          n = plan.vertexCount;
+   float        h = plan.cameraHeightM;
+   char         path[mosaicPathMax];
+   TFloorCanvas fc;
+
+   mosaicFloorCanvas(plan, fc);
+   for (int face = 0; face <= n; face++)
+   {
+      bool          onFloor = face == n;
+      int           cols = onFloor ? fc.cols : walls[face].cols,
+                    rows = onFloor ? fc.rows : walls[face].rows,
+                    used = 0,
+                    filled = 0,
+                    inside = 0;
+      TAlloc<float> acc((size_t)(cols > 0 ? cols : 1)*(rows > 0 ? rows : 1)*4u);
+
+      if (cols <= 0 || rows <= 0)
+         continue;
+      memset(acc(), 0, sizeof(float)*(size_t)cols*rows*4u);
+      for (int f = 0; f < count; f++)
+      {
+         int k = corner[f];
+
+         if (k < 0 || (!onFloor && face != k && face != (k + n - 1)%n))
+            continue;
+         used++;
+         for (int r = 0; r < rows; r++)
+            for (int c = 0; c < cols; c++)
+            {
+               TVec3 p;
+
+               if (onFloor)
+               {
+                  float pu,
+                        pw;
+
+                  mosaicFloorAt(fc, c, r, pu, pw);
+                  if (!mosaicInside(plan, pu, pw))
+                     continue;
+                  p.x = pu*ud.x + pw*wd.x;
+                  p.y = -h;
+                  p.z = pu*ud.z + pw*wd.z;
+               }
+               else
+                  p = mosaicPoint(walls[face], ud, wd, plan.ceilingM, h, (float)c, (float)r);
+
+               float  bgr[3],
+                      s = mosaicSample(frames[f], p, bgr),
+                     *o = acc() + ((size_t)r*cols + c)*4u;
+
+               if (s <= 0.f)
+                  continue;
+
+               float dx = p.x - frames[f].camX,
+                     dz = p.z - frames[f].camZ,
+                     dist = sqrtf(dx*dx + p.y*p.y + dz*dz + 1e-9f);
+
+               if (onFloor)
+                  s *= (h/dist)*(h/dist)*(h/dist);
+               else
+               {
+                  TVec3 nrm = walls[face].constU ? ud : wd;
+
+                  s *= fabsf(dx*nrm.x + dz*nrm.z)/dist;
+               }
+               o[0] += s*bgr[0];
+               o[1] += s*bgr[1];
+               o[2] += s*bgr[2];
+               o[3] += s;
+            }
+      }
+      for (int r = 0; r < rows; r++)
+         for (int c = 0; c < cols; c++)
+         {
+            float pu = 0.f,
+                  pw = 0.f;
+
+            if (onFloor)
+               mosaicFloorAt(fc, c, r, pu, pw);
+
+            bool in = !onFloor || mosaicInside(plan, pu, pw);
+
+            inside += in ? 1 : 0;
+            filled += in && acc[((size_t)r*cols + c)*4u + 3u] > 0.f ? 1 : 0;
+         }
+      if (onFloor)
+         snprintf(path, sizeof(path), "%s/prelim_piso_%.2fx%.2fm.bmp", outDir, (float)rows/(float)mosaicPxPerM,
+                  (float)cols/(float)mosaicPxPerM);
+      else
+         snprintf(path, sizeof(path), "%s/prelim_parede_%d_%.2fm.bmp", outDir, face, (float)cols/(float)mosaicPxPerM);
+      mosaicWriteBMP(path, acc(), cols, rows);
+      printf("  preliminary %s%d: %d corner frames, %.0f%% filled\n", onFloor ? "floor" : "wall ", onFloor ? 0 : face,
+             used, inside ? 100.f*(float)filled/(float)inside : 0.f);
+   }
+}
+
 //--------------------------------------------------------------------------------
 void mosaicWalls(TMosaicFrame *frames, int count, int centers, const TLayoutPlan &given, int rounds,
-                 int bundleRounds, int jointRounds, float spinRadiusM, LPCSTR outDir)
+                 int bundleRounds, int jointRounds, float spinRadiusM, bool fixPlan, LPCSTR outDir)
 {
    TLayoutPlan plan = given; // the bundle adjustment refines the plan too
    float       a = plan.axisDeg*0.01745329f;
@@ -1679,6 +2892,8 @@ void mosaicWalls(TMosaicFrame *frames, int count, int centers, const TLayoutPlan
                wd = { cosf(a), 0.f, sinf(a) };
    TMosaicWall walls[layoutMaxVerts];
 
+   mosaicPlanFixed = fixPlan;
+   mosaicOutDir = outDir;
    mosaicWallGeometry(plan, ud, wd, walls);
    for (int it = 0; it < rounds; it++) // each frame against the mosaic of the others
    {
@@ -1713,7 +2928,34 @@ void mosaicWalls(TMosaicFrame *frames, int count, int centers, const TLayoutPlan
       mosaicJoint(frames, centers, walls, plan.vertexCount, ud, wd, plan, it + 1);
 
    TAlloc<float> gains((size_t)plan.vertexCount*count*3u);
+   TAlloc<int>   corner((size_t)count);
+   int           merged = 0;
 
+   /* the merge takes the XYZ frames only: both room axes measured AND a room corner in the picture, seen with the
+      refined pose. The XZ / YZ ones (a stretch of one wall, the floor alone) are placed but wait for the subpixel
+      matching on furniture and decoration */
+   for (int f = 0; f < count; f++)
+   {
+      corner[f] = frames[f].xyz ? mosaicSeenCorner(frames[f], plan, ud, wd, 3) : -1;
+      if (frames[f].picked) // named by the user: the corner most in view, else the one it aims at
+      {
+         corner[f] = mosaicSeenCorner(frames[f], plan, ud, wd, 1);
+         if (corner[f] < 0)
+            corner[f] = mosaicAimedCorner(frames[f], plan, ud, wd);
+      }
+      frames[f].xyz = corner[f] >= 0;
+      if (corner[f] >= 0)
+         printf("  corner frame %03d station %d: corner %d, walls %d and %d%s\n", frames[f].index, frames[f].station,
+                corner[f], (corner[f] + plan.vertexCount - 1)%plan.vertexCount, corner[f],
+                frames[f].picked ? " (named)" : "");
+      merged += frames[f].xyz ? 1 : 0;
+   }
+   printf("  merge: %d of %d frames are XYZ (a room corner in view)\n", merged, count);
+   for (int f = 0; f < count; f++) // each corner frame fixed by its own three axes before it gives its components
+      if (corner[f] >= 0)
+         mosaicCornerFit(frames[f], corner[f], walls, plan, ud, wd);
+   mosaicComponents(frames, count, walls, plan, ud, wd, corner(), outDir);
+   mosaicCornerMerge(frames, count, corner(), walls, plan, ud, wd, outDir);
    mosaicElect(frames, count, walls, plan.vertexCount, ud, wd, plan, gains());
 
    // final orthophotos with the refined rotations
@@ -1731,9 +2973,9 @@ void mosaicWalls(TMosaicFrame *frames, int count, int centers, const TLayoutPlan
          for (int r = 0; r < wl.rows; r++)
             for (int c = 0; c < wl.cols; c++)
             {
-               TVec3  p = mosaicPoint(wl, ud, wd, plan.ceilingM, plan.cameraHeightM, c, r);
+               TVec3  p = mosaicPoint(wl, ud, wd, plan.ceilingM, plan.cameraHeightM, (float)c, (float)r);
                float  bgr[3],
-                      s = mosaicSample(frames[f], p, bgr),
+                      s = frames[f].xyz ? mosaicSample(frames[f], p, bgr) : 0.f,
                      *o = acc() + ((size_t)r*wl.cols + c)*4u;
 
                if (s <= 0.f)
@@ -1758,4 +3000,5 @@ void mosaicWalls(TMosaicFrame *frames, int count, int centers, const TLayoutPlan
       snprintf(path, sizeof(path), "%s/parede_%d_%.2fm.bmp", outDir, i, (float)wl.cols/(float)mosaicPxPerM);
       mosaicWriteBMP(path, acc(), wl.cols, wl.rows);
    }
+   mosaicFloor(frames, count, plan, ud, wd, outDir);
 }

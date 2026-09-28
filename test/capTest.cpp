@@ -149,26 +149,31 @@ static void testSpin(void)
    TSpinConfig moto = TSpinConfig::ForFov(54.f, 68.5f), // Moto G9 Play main camera, portrait
                ultra = TSpinConfig::ForFov(95.f, 115.f);
 
-   checkThat(moto.bandCount == 2 && moto.headingBins == 14);
-   checkThat(closeTo(moto.bandPitchDeg[0], -20.75f, 0.01f) && closeTo(moto.bandPitchDeg[1], 20.75f, 0.01f));
-   checkThat(ultra.bandCount == 1 && ultra.headingBins == 12);
+   checkThat(moto.bandCount == 3 && moto.headingBins == 36);
+   checkThat(closeTo(moto.bandPitchDeg[0], -25.f, 0.01f) && closeTo(moto.bandPitchDeg[1], 0.f, 0.01f)
+             && closeTo(moto.bandPitchDeg[2], 25.f, 0.01f) && moto.bandLoDeg[2] == 10.f && moto.bandHiDeg[0] == -10.f);
+   checkThat(ultra.bandCount == 2 && ultra.headingBins == 36);
 
    // one band at a time, ceiling first: down while the ceiling is due is red and never kept, then the opposite
    TSpinTracker guided(moto);
    QWORD        gns = 1000000000u;
+   const int    top = moto.bandCount - 1;
+   const float  up = moto.bandPitchDeg[top],
+                down = moto.bandPitchDeg[top - 1],
+                h0 = 0.5f*360.f/(float)moto.headingBins; // bin 0's center: a bin edge is as near the last bin as minSepFrac allows
 
-   checkThat(guided.GuidedBand() == 1);
-   checkThat(guided.Offer(gns, headPitchPose(0.f, -10.f), NAN) == svOffBand && !guided.PoseAllowed());
+   checkThat(guided.GuidedBand() == top);
+   checkThat(guided.Offer(gns, headPitchPose(h0, down), NAN) == svOffBand && !guided.PoseAllowed());
    gns += 1000000000u;
-   checkThat(guided.Offer(gns, headPitchPose(0.f, 10.f), NAN) == svKeep && guided.PoseAllowed());
+   checkThat(guided.Offer(gns, headPitchPose(h0, up), NAN) == svKeep && guided.PoseAllowed());
    for (int bin = 1; bin < moto.headingBins; bin++)
    {
-      gns += 2000000000u; // 26-degree bins, 2 s apart: slower than the blur limit
-      guided.Offer(gns, headPitchPose(((float)bin + 0.5f)*360.f/(float)moto.headingBins, 10.f), NAN);
+      gns += 2000000000u; // 10-degree bins, 2 s apart: slower than the blur limit
+      guided.Offer(gns, headPitchPose(((float)bin + 0.5f)*360.f/(float)moto.headingBins, up), NAN);
    }
-   checkThat(guided.BandFilled(1) == moto.headingBins && guided.GuidedBand() == 0);
+   checkThat(guided.BandFilled(top) == moto.headingBins && guided.GuidedBand() == top - 1);
    gns += 1000000000u;
-   checkThat(guided.Offer(gns, headPitchPose(0.f, 10.f), NAN) == svOffBand && !guided.PoseAllowed());
+   checkThat(guided.Offer(gns, headPitchPose(h0, up), NAN) == svOffBand && !guided.PoseAllowed());
 
    // a small room: the floor view takes a pose tilted down to -60, not beyond
    TSpinTracker floorView(TSpinConfig::ForFloorView(54.f, 68.5f));
@@ -178,23 +183,23 @@ static void testSpin(void)
    checkThat(floorView.Offer(6000000000u, headPitchPose(90.f, -63.f), NAN) == svOffBand);
 
    // an orange ceiling bin may be retaken during the floor spin; once retaken (or merely green) it is red again
-   guided.Reopen(1, 0, true);
+   guided.Reopen(top, 0, true);
    gns += 1000000000u;
-   checkThat(guided.Offer(gns, headPitchPose(0.f, 10.f), NAN) == svKeep);
+   checkThat(guided.Offer(gns, headPitchPose(h0, up), NAN) == svKeep);
    gns += 1000000000u;
-   checkThat(guided.Offer(gns, headPitchPose(0.f, 10.f), NAN) == svOffBand);
-   guided.Reopen(1, 0);
+   checkThat(guided.Offer(gns, headPitchPose(h0, up), NAN) == svOffBand);
+   guided.Reopen(top, 0);
    gns += 1000000000u;
-   checkThat(guided.Offer(gns, headPitchPose(0.f, 10.f), NAN) == svOffBand); // a sharper-photo retake stays in order
+   checkThat(guided.Offer(gns, headPitchPose(h0, up), NAN) == svOffBand); // a sharper-photo retake stays in order
    gns += 1000000000u;
-   checkThat(guided.Offer(gns, headPitchPose(0.f, -10.f), NAN) == svKeep);
+   checkThat(guided.Offer(gns, headPitchPose(h0, down), NAN) == svKeep);
 
    // corner station: the first steady frame sets the aim; only a 60-degree fan around it counts
    TSpinTracker corner(TSpinConfig::ForCorner(54.f, 68.5f));
    QWORD        cns = 1000000000u;
    int          cornerKept = 0;
 
-   checkThat(corner.Total() == 3);
+   checkThat(corner.Total() == 5);
    for (int i = 0; i <= 120; i++) // sweep 100..160 degrees (aim at 130 first) at 1 degree/s
    {
       float h = i == 0 ? 130.f : 100.f + (float)(i - 1)*0.5f;
@@ -203,7 +208,7 @@ static void testSpin(void)
          cornerKept++;
       cns += 500000000u;
    }
-   checkThat(corner.Complete() && cornerKept == 3);
+   checkThat(corner.Complete() && cornerKept == 5);
    checkThat(corner.Offer(cns - 250000000u, yawPose(190.f), NAN) == svTooFast); // 30 degrees in 0.25 s
    checkThat(corner.Offer(cns + 1000000000u, yawPose(190.f), NAN) == svOutside);
 
@@ -841,6 +846,19 @@ static void testVanish(void)
    checkThat(fabsf(vanishAxisDiffDeg(check.ReferenceDeg(), axisDeg)) < 0.3f);
    checkThat(check.Offer(rDrift, &dev) == avMisaligned && closeTo(dev, 3.f, 0.4f));
    checkThat(check.Aligned() == 3 && check.Misaligned() == 1 && check.Unverified() == 1);
+
+   /* a long spin with the gyroscope drifting slowly (0.1 degree per frame, 25 degrees over 250 frames): the reference
+      follows past the store's size, so no frame is judged off (the store once stopped taking new measures at 128) */
+   TAxisCheck    slow(2.f);
+   TVanishResult rs = r;
+   int           off = 0;
+
+   for (int i = 0; i < 250; i++)
+   {
+      rs.roomAxisDeg = fmodf(axisDeg + 0.1f*(float)i, 90.f);
+      off += slow.Offer(rs, &dev) == avMisaligned ? 1 : 0;
+   }
+   checkThat(off == 0 && closeTo(slow.DriftDeg(), 24.9f, 0.6f));
 
    // the summary survives the LIDARCAP round trip inside the fixed 300-byte block
    TFrameMeta meta = {},

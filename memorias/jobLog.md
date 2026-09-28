@@ -36,7 +36,7 @@ Entradas mais novas no fim.
 - ACHADO: o ppCheck trata arquivo com marcadores JNI como shim (sem literais além de 0/1; #define é o lugar das constantes; LONGLONG não é reconhecido como tipo - usar QWORD/LONG). Separação: capJNI.cpp genérico sem literais; nomes/assinaturas em TAndroid.cpp.
 - ANDROID: APK completo gerado por `mobile/android/buildAndroid.sh` (todo TU via ppCompile sobre o clang do NDK r27c, API 26, glue vendorizada, alias `--defsym=android_main=androidMain`, aapt2 + aapt add + zipalign + apksigner, keystore de debug própria em `keys/`). Instalado no Moto: abre, desenha a UI comum (texto com acentos via Canvas/JNI) e pede câmera + localização. App seguiu vivo após as permissões; teste da câmera interrompido por quedas do USB/adb (não houve reboot - uptime 27 dias).
 - ACHADO: `TBlock::operator->` não é const; em método const use `Pspin()`.
-- PRÓXIMO: validar câmera/prévia/giro/gravação no aparelho quando o adb voltar; `adb pull /sdcard/Android/data/io.aeroblox.lidar/files/` para inspecionar a sessão.
+- PRÓXIMO: validar câmera/prévia/giro/gravação no aparelho quando o adb voltar; `adb pull /sdcard/Android/data/io.sorena.lidar/files/` para inspecionar a sessão.
 - PRIMEIRA CAPTURA REAL (escritório do usuário, Moto G9 Play): 2 sessões; a 2a com 28/28 bins (2 faixas x 14), 4000x3000, 1-2,7 MB/JPEG, ~77 s, 7623 poses, 0 fixes de GPS (interno). Ferramenta desktop `tools/capInspect.cpp` extrai JPEGs + frames.csv/poses.csv. Vincos teto/parede, cantos, batentes e rodapé visíveis.
 - PROBLEMAS vistos nas fotos: borrão de movimento (limite 27 graus/s era folgado: fx 2944 px = 51 px/grau) e foco perdido no teto liso (AF contínuo caçando). Bug: após encoder ocupado, o 1o frame passava sem checagem de velocidade.
 - CORREÇÃO: "pare e fotografe" (maxRate = 4 px de borrão a 1/30 s ~ 2,4 graus/s, derivado da intrínseca), Offer em todo frame (allowKeep=false quando ocupado), foco FIXO 0,5 D (2 m) quando MANUAL_SENSOR (intrínseca constante), AE travado em 30 fps (exposição <= 1/30 s). Reinstalado.
@@ -922,3 +922,579 @@ Entradas mais novas no fim.
   - 150306 inalterada.
 - APK instalado.
 - WISH LIST criada (slices/projeto/wishlist.md): 1o item = VISTA SINTÉTICA no lugar da câmera, a partir das 4 imagens de referência (vistas retificadas agrupadas por parede) e da posição (giroscópio + teto). Usuário: não precisa ser agora; futuro próximo.
+
+## 2026-09-28 - PISO: VISTA SUPERIOR POR QUADRO E O QUINTO PLANO
+- Usuário: todo quadro abaixo do horizonte traz algum piso. Os recortes se integram numa vista única, perpendicular,
+  a partir do teto. Cada quadro colabora com 1 ou 2 paredes e, às vezes, com o piso: são 5 planos por cômodo.
+- capInspect `--floor`:
+  - cada quadro que alcança o piso (>= 3% dos raios, até 4,5 m) é reprojetado no plano do piso, 4 mm/px, eixos da
+    planta (u para cima, w à direita, vista de cima sem espelhar);
+  - saída piso_NNN.bmp, com a rotação dos pontos de fuga, ou do giroscópio quando eles discordam em > 12 graus
+    (piso diagonal);
+  - o giro central soma direto na planta, recortado no polígono (piso_room<N>.bmp e _limpo.bmp);
+  - peso das amostras: sen^3 da depressão (as vistas íngremes são as nítidas).
+- DESCARTADO: localizar as estações de canto por correlação dos gradientes do piso contra o mosaico do giro.
+  - 132058: escores 0,01-0,05, abaixo do segundo colocado. Ruído.
+  - Usuário: o giroscópio só dá a orientação grosseira; o encaixe fino vem dos cantos e vincos, sobretudo do teto,
+    derivados para as outras dimensões.
+  - O piso agora sai também do `--walls` (capMosaic mosaicFloor, piso_<U>x<W>m.bmp), com as poses refinadas pelo
+    ajuste de feixe (rotação, estação, raio, altura da câmera).
+- Diretiva XYZ (usuário): o encaixe confiável começa nos quadros de canto, que mostram X, Y e Z numa captura só.
+  As vistas XZ/YZ (meio de parede) são preparadas (retificadas por quadro), mas ainda não entram no merge. Elas
+  entram depois, com subpixel sobre móveis e decoração.
+  - Critério implementado (TMosaicFrame.xyz): vertical e os dois eixos medidos pela própria imagem, E a aresta
+    piso-teto de algum vértice da planta projetada dentro da foto (>= 3 de 10 pontos, 5% da borda).
+  - A grade de ladrilhos sozinha também mede os dois eixos: o rótulo dela é "xy", fora do merge.
+  - Só os XYZ entram nas ortofotos de parede e de piso.
+- 132058: 29 de 42 quadros XYZ.
+- DORMITÓRIO 064701 (capturado de manhã; baixado para build/sessions/pull/, conferido byte a byte e apagado do
+  celular):
+  - planta 3,03 x 3,37, pé-direito ajustado a 2,70 pela porta, câmera 1,49;
+  - o mosaico do giro central (só XYZ) mostra ladrilhos diagonais nítidos e coerentes, com buraco sob o ponto do
+    giro e onde só havia quadros "xy";
+  - o do feixe cobre quase tudo, mas dobra ladrilhos na metade esquerda.
+- ACHADO: o ajuste de feixe deriva a altura da câmera (1,49 -> 1,84 m em 5 rodadas) e encolhe a sala
+  (2,90 x 3,21). A escala do piso depende de h: o módulo do ladrilho serve de régua para conferir. Pendente.
+- build/norm.sh passou a cobrir tools/*.h.
+
+## 2026-09-28 - COMPONENTES POR QUADRO DAS 5 IMAGENS-ALVO
+- Usuário: o exercício agora é, quadro a quadro, extrair os componentes das 5 imagens-alvo (4 paredes + piso).
+- capMosaic mosaicComponents (dentro do `--walls`, depois do ajuste de feixe):
+  - cada quadro amostrado com a pose refinada sobre a tela de cada face (a mesma das ortofotos finais, 4 mm/px);
+  - uma face coberta em >= 3% vira comp_NNN_<parede K | piso>.bmp, recortado no que o quadro cobre, com as cores
+    cruas (sem ganho);
+  - comp.csv traz quadro, estação, classe (xyz = entra no merge; partial = posicionado, aguarda subpixel), face,
+    col0/row0/cols/rows na tela, pixels e fração.
+- A composição (`--walls`) passou a excluir a estação de portas (o operador anda) e as fotos substituídas
+  (rtElect).
+- Dormitório 064701:
+  - 37 quadros, 22 XYZ, 83 componentes;
+  - cada quadro de canto rende 2 paredes + piso: parede frontal e nivelada, batentes verticais, ladrilhos
+    quadrados;
+  - os quadros de piso dos cantos (046, 050, 056) ficam fora: rotação só pelo giroscópio (piso diagonal).
+- Usuário: "as medidas estão perfeitas". ASSUMIDO: a planta do Solve, 3,03 x 3,37 m, pé-direito 2,70 pela porta,
+  câmera 1,49.
+  - O ajuste de feixe deriva: a câmera vai a 1,73 e a sala a 3,19 x 3,47 (+5% / +3%).
+  - PRÓXIMO: ancorar a geometria da planta no feixe (só rotações e estações livres) ou restringir a altura da
+    câmera.
+
+## 2026-09-28 - MERGE PRELIMINAR SÓ COM CANTOS XYZ
+- Usuário: a montagem mais básica começa pelos cantos XYZ. Cada canto dá 3 imagens de alta confiança: o piso e as
+  duas paredes que se encontram nele. O merge preliminar usa APENAS essas.
+  - Quadros escolhidos pelo usuário: 0, 3, 4, 8-15, 17-18, 33-34 e, talvez, 42-44. Nenhum outro participa.
+- capMosaic mosaicCornerMerge:
+  - cada quadro XYZ contribui só com o piso e as paredes k-1 e k do canto k que ele vê;
+  - o canto é o vértice cuja aresta piso-teto mais aparece na foto; empate, o mais central; para um quadro
+    nomeado sem aresta à vista, o vértice mais alinhado à mira (mosaicAimedCorner);
+  - peso: queda da imagem x cosseno (paredes), x sen^3 (piso); cores cruas;
+  - saídas prelim_parede_K_<m>m.bmp e prelim_piso_<U>x<W>m.bmp.
+- capInspect `--corner-frames 0,3,4,8-15,...`: só os quadros listados entram em `--walls` (feixe e merge). Um
+  quadro nomeado vence a eleição do app: 8-12 e 14 eram refotos do bin 2, e o app elegeu a 13.
+- PLANTA FIXA no feixe (padrão; `--free-plan` restaura): o passo do solver não mexe nas paredes nem na altura; só
+  rotações, estações e raio se movem.
+  - DESCARTADO: prior apertado (sigma 5 mm). Não segurou: a câmera foi a 1,75.
+  - Agora 3,032 x 3,365 e câmera 1,485 fixos.
+- 064701, sem 42-44 (15 quadros, só o giro central):
+  - paredes 62/63/40/39% preenchidas, piso 21%;
+  - moldura contínua, janela e armário limpos.
+- Com 42-44 (estação 1):
+  - parede 1 e piso chegam a 100% e 52%;
+  - MAS a parede 2 ganha, à direita, um pedaço da parede vizinha em perspectiva (moldura inclinada).
+  - Causa: a posição da estação 1 que o feixe achou está errada. As observações de canto e de vinco de piso do
+    feixe estão desligadas (cBundleCornerWeight = cBundleFloorWeight = 0).
+  - PRÓXIMO: localizar as estações de canto pela aresta do canto e pelos vincos do teto (ressecção), antes dos
+    pares.
+- Saídas em build/sessions/imovel_20260928_064701_cantos e _cantos42.
+
+## 2026-09-28 - NOMES DAS 5 IMAGENS-ALVO (DORMITÓRIO 064701)
+- Usuário: a parede do armário com a porta é N; em sentido horário vêm L, S e O. O (janela) é a conferência. P é
+  o piso.
+- Na planta do Solve (paredes em sentido horário): N = parede 1, L = parede 2, S = parede 3, O = parede 0 (a janela
+  apareceu mesmo na parede 0 do merge preliminar).
+- São nomes do cômodo, não da bússola: o Moto não tem magnetômetro (headingRef arbitrary).
+- A pasta de saída foi esvaziada a pedido, ficaram só os frame_NNN.jpg. A captura bruta segue em
+  build/sessions/pull/.
+
+## 2026-09-28 - ENCAIXE DE CANTO POR QUADRO (QUADRO 8 -> 8O, 8N)
+- Pastas N/L/S/O/P em build/sessions/imovel_20260928_064701. Os componentes saem em tela cheia de cada face,
+  nomeados <quadro><face>.bmp (`--face-names O,N,L,S,P`).
+- Usuário: o quadro 8 mostra os três eixos do canto. Então a retificação corrige a rotação também: vinco do teto
+  horizontal na borda superior da tela, quina vertical na borda lateral.
+- capMosaic mosaicCornerFit, para cada quadro de canto, antes dos componentes:
+  - projeta o quadro nas duas paredes do canto;
+  - mede o vinco do teto (1a aresta horizontal forte de cima para baixo, até 1,2 m do canto) e a aresta da quina
+    (aresta vertical mais forte a +-24 cm do canto), com reta robusta;
+  - leva os pontos de volta à imagem e resolve rotação (3) + altura da câmera (TMosaicFrame.camY) por
+    Gauss-Newton/Levenberg, para caírem na linha do teto e no vértice da planta;
+  - planta e estação fixas;
+  - uma rodada só vale se a nova medida melhorar; senão volta à melhor e para.
+  - DESCARTADO: soltar também a estação (x, z). Com um quadro só, distância e altura se trocam: a estação andou
+    1,9 m.
+- Quadro 8:
+
+  | | antes | depois |
+  |---|---|---|
+  | vinco do teto em O | +0,40°, 13,3 cm abaixo | 0,07°, 0,9 cm |
+  | quina em O | 1,03°, -5,8 cm | -0,11°, -2,3 cm |
+  | vinco do teto em N | 3,05°, 11,2 cm | 0,00°, 0,6 cm |
+  | quina em N | não achada | 0,19°, 0,9 cm |
+
+  Rotação corrigida em 2,3°; câmera +19 cm (o celular erguido para o teto). Erro total 39,8 -> 5,1.
+- Encaixe de canto estendido a toda a lista do usuário (0, 3, 4, 8-15, 17-18, 33-34, 42-44):
+  - cada quadro de canto dá só as duas paredes do canto + piso;
+  - o vinco do PISO entra na medida, varrido de baixo para cima e com alvo na borda inferior;
+  - uma parede sem vinco ou sem quina custa 50 no erro (com 5, sumir uma linha "melhorava" o erro);
+  - o encaixe exige ao menos um vinco. Só a quina deixa a rotação girar: o quadro 33 girou 92 graus.
+  - DESCARTADO: busca da quina a +-40 cm. Pega batentes de armário e janela (quadro 8: erro 5 -> 59). Voltou a
+    +-24 cm.
+- Erro final (graus + cm; +100 quando as duas quinas não aparecem):
+  - 0: 101,4; 3: 102,9; 4: 101,3 — vincos a ~1 cm, quina fora da busca;
+  - 8: 5,1; 9: 10,9; 10: 6,0; 11: 10,6; 12: 4,7; 13: 4,9; 14: 7,9; 15: 5,7; 17: 12,5; 18: 14,1;
+  - 33: sem encaixe (pose dos pontos de fuga). Usuário: a porta aberta esconde a linha real do piso em N; o
+    "vinco do piso" medido ali é borda da folha ou rodapé;
+  - 34: 26,6;
+  - estação 1: 42: 65,0; 43: sem encaixe; 44: 6,8. A posição da estação não é medida (fixa no palpite inicial).
+- Pastas: N 15 quadros, L 5, S 3, O 11, P 5.
+- Detecção por Sobel (1-2-1) + pico subpixel + RANSAC (usuário), dentro do encaixe de canto:
+  - todos os picos da faixa viram candidatos; até 3 retas por família;
+  - no teto vence a MAIS ALTA (usuário: as de baixo são móveis, armários, estantes, ou a borda de baixo da
+    moldura); na quina, a mais perto do vértice;
+  - inclinação máxima de 8 graus;
+  - a nuvem e a reta eleita vão para pontos_NNN.csv.
+- Visualizações sobre a foto original (usuário, passo a passo), em build/sessions/imovel_20260928_064701:
+  - vetores_042.png: arestas do detector de pontos de fuga (vertical / A / B). A quina N/L quase não tem vertical;
+    o topo da quina é o encontro das molduras.
+  - ransac_9..11.png: o RANSAC elege a borda de cima da moldura em O e N nos três ("perfeito", usuário). A aresta
+    vertical é instável: no 11, a de N pegou o puxador do armário.
+- TEORIA DO USUÁRIO (piso oculto), capInspect `--hidden-floor N` -> oculto_NNN.csv / oculto_42.png:
+  - as retas de cada família são picos do ângulo em torno do seu ponto de fuga;
+  - topo da quina = moldura A mais alta x moldura B mais alta;
+  - vertical até o ponto de fuga vertical; pé da quina na reta A mais baixa (piso de N);
+  - piso de L = pé da quina -> ponto de fuga B (móveis, escrivaninha, caixas e porta dão esse ponto).
+  - 42: topo (1493, 381), pé (1494, 2826) atrás da porta; a linha de L deduzida passa rente à base das caixas.
+- Encaixe agora mede UMA vez (as retas eleitas na pose dos pontos de fuga são as observações), resolve e só
+  confere depois. Remedir trocava as retas eleitas e fazia N flutuar.
+  - Resultado 8-15: O a 0-2 cm do teto; N sistematicamente 5-7 cm abaixo (mesmo sinal em todos).
+  - Leitura: erro de geometria fixa. O ponto do giro está ~9 cm fora em relação a N (distância N/O).
+  - PRÓXIMO candidato: soltar o ponto do giro (comum a todos os quadros do giro) no encaixe.
+- Calibração do piso oculto (42), usuário: no piso o desempate é pelo MAIS BAIXO (frisos do rodapé acima); o
+  cantos_42 usava o topo do rodapé.
+  - Causa: a junção rodapé/piso tem arestas esparsas (<40) e nem virava reta; o limite de 12 retas por família
+    (em ordem de ângulo) cortava outras.
+  - Agora: reta >= 15 arestas E >= 400 px de extensão; até 32 retas por família; teto e piso comparados na mesma
+    vertical (centro da imagem).
+  - 42: topo da quina (1545, 348) no encontro das bordas de cima das molduras; pé (1541, 2870) na junção
+    rodapé/piso de N prolongada.
+  - Nota: a moldura sai da parede, então o encontro das bordas de cima fica à frente da quina real (~10 px no 42).
+- Piso oculto com PÉ ESPERADO (usuário: o 52 determina as duas linhas de piso ocultas sob a cama):
+  - distância até a quina = (teto - câmera)/tan(elevação do topo da quina); o pé fica a altura da câmera abaixo,
+    na mesma vertical (`--hidden-heights H h`, padrão 2,70 / 1,49 do dormitório);
+  - uma linha de piso visível só vale se cruzar a vertical a <= 120 px do pé esperado; senão é móvel;
+  - cada linha de piso oculta vai do pé ao ponto de fuga da sua família, do mesmo lado da sua moldura.
+  - 42 (conferência): pé esperado y 2965, piso de N visto a 2870 (94 px, ~10 cm na escala da vertical):
+    confirma a teoria; o de N vence, e L é deduzido dele.
+  - 52: as duas candidatas eram bordas da cama (733 e 1294 px fora), rejeitadas; os pisos de S e O saem do pé
+    esperado (916, 3103) rumo aos pontos de fuga (bordas da cama e janela dão B).
+  - sobel_42.png / sobel_52.png: Sobel em pé, retas por família, eleitas em amarelo, ocultas em magenta tracejado.
+- Quadros de canto como conjunto (usuário: 51-53 veem o mesmo canto S/O/P; posições previsíveis separam
+  estrutura de ruído; pontos de fuga + candidatos dão interseções confiáveis). `--hidden-floor` aceita lista.
+  - Com teto E piso vistos no mesmo quadro: distância = H/(tan e_topo + tan e_pé), altura = distância*tan e_pé,
+    sem supor nada.
+  - 51: 3,66 m e câmera 1,56; 53: 3,63 m e 1,48. Distância estável (3 cm); a altura do celular varia 8 cm entre
+    fotos. Com altura fixa 1,49: 3,87 / 3,61 (a suposição criava os 26 cm de diferença).
+  - 42: 3,20 m, câmera 1,44.
+  - 52 (piso oculto): só com a altura suposta (3,86 m).
+  - PRÓXIMO candidato: a altura medida nos quadros vizinhos da mesma estação vale para o quadro sem piso.
+- Rodapé vencido (usuário: o Sobel do topo do rodapé engana, o pé ficava ~7 cm acima; ponto de fuga = filtro
+  zero; de duas retas do feixe, a um pouco mais baixa vence mesmo mais tênue; critério do teto "indiscutível").
+  inspectFloorProfile:
+  - 201 pontos ao longo da reta eleita; a borda (luma, 3 px) é lida na resolução cheia até 12 cm x 1,5 abaixo;
+  - cada pico local vota no seu deslocamento, se tiver >= 10 níveis e >= 40% da borda mais forte do próprio ponto
+    (o grão da foto não vota);
+  - vence a pilha mais forte a >= 3 cm abaixo com >= 50% dos votos da própria reta; a reta desce para lá,
+    mantendo o ponto de fuga;
+  - a aceitação como piso (e não móvel) é julgada antes do refinamento.
+  - DESCARTADOS: média do perfil (o ventilador e as juntas apagam o pico); "pilha mais baixa que conta" (subia até
+    as juntas do piso, no fim do alcance).
+  - 42: a eleita já era a junção (fundo ~15 votos contra 171), não muda.
+  - 51: desce 65 px (8,5 cm); 53: 70 px (8,6 cm).
+  - Estação 3: 51 = 3,57 m / câmera 1,58; 53 = 3,54 m / 1,51 (antes 3,66 / 3,63 no topo do rodapé).
+  - rodape_53.png mostra a reta na base do rodapé de azulejo.
+- Busca formal do piso (usuário): vertical pelo teto; dois pontos de fuga horizontais (móveis + linhas reais de
+  piso colaboram); feixe de candidatas em cada direção; o pé esperado (grosseiro) descarta as que cruzam a vertical
+  a mais de 10% da altura da quina; entre as restantes, vence a que cruza mais baixo (descarta frisos e rodapés);
+  depois o refinamento por votos. Topo da quina fora da imagem = não é quadro de canto (48, 59, 60).
+- Teste nos 4 cantos (distância até a quina / câmera, com teto + piso):
+  - S/O (51-53): 3,57 / 3,59 / 3,54 m; câmera 1,51-1,58. Convergiu. No 52, o piso de O vem do de S (cama).
+  - O/N (57): 2,98 m, câmera 1,52. Pé exatamente no encontro visível dos rodapés.
+  - N/L (42, 43): 3,20 / 2,82 m (o 44 mira O/N).
+  - L/S (47, 49): 3,22 / 3,55 m, câmera 1,58 / 1,42. INCONSISTENTE: o pé do 49 cai sobre a mala e as retas de piso
+    ficam atrás de malas e aquecedor. É o canto crítico previsto pelo usuário.
+  - PRÓXIMO: consistência por estação (mesma estação, mesma quina -> mesma distância) para eleger os quadros
+    confiáveis; o canto sem piso herda a altura medida nos vizinhos.
+- Acidente: um splice por número de linha pegou o `for` errado e corrompeu capInspect.cpp; reconstruído a partir
+  do próprio arquivo (conta de linhas conferida). Regra: localizar o trecho por âncora única antes de cortar.
+- DECISÃO POR ESTAÇÃO (usuário, 2026-09-28: o quadro central tem voto dobrado; um vizinho girado à direita perde a
+  esquerda e vice-versa; o peso forte de um vizinho vai para o central; a quina do teto guia a homografia):
+  - Passada 1 (cega): cada quadro acha a sua quina. Central = quina mais perto do centro da imagem.
+  - Passada 2: a quina do central (raio levado pelo giroscópio) é prevista em cada vizinho; só concorrem molduras a
+    <= 150 px dela. Com uma moldura só, a quina é o ponto dela mais perto da previsão; sem nenhuma, a previsão;
+    pode cair até 10% fora da imagem. Coleta das candidatas de piso de cada quadro.
+  - Homografia do piso guiada pela quina: cada quadro tem a sua pose contra a própria quina (eixos pelos pontos de
+    fuga, sinais pelo giroscópio; posição pelo raio do topo da quina + pé-direito + altura da câmera). Linha real
+    de piso cai igual em todos os quadros; móvel acima do piso se espalha (paralaxe).
+  - Decisão no central: as candidatas da estação votam onde cruzam a vertical da quina do central, com peso =
+    arestas x vista do lado da parede x 2 no próprio central; vence a pilha mais baixa com >= 30% da mais forte
+    perto do pé esperado.
+  - Coerência: as duas paredes têm um pé só; se discordam em > 3% da altura da quina, vale a pilha mais forte e a
+    outra é deduzida do pé dela. A reta decidida volta pela homografia a cada vizinho (passada final).
+  - Resultado (altura da câmera por quadro): estação 1 (N/L) 1,41-1,42 (42, 43, 44; N com 340 votos vence, L
+    deduzido); estação 2 (L/S) 1,57-1,59; estação 3 (S/O) 1,56 nos três; estação 4 (O/N) 1,52 nos quatro. Os
+    quadros 44, 48, 59, 60 (quina na borda ou fora) agora entram.
+  - O 44 levou ao 42 o vetor forte do piso de N (pilha 54 -> 340).
+- PREMISSA ZERO (usuário: o topo da quina sai antes de tudo; as linhas de topo convergem na interseção e os pontos
+  de fuga dão a vertical; sem ele o resto fica comprometido). No 57 o topo estava ~100 px fora: as retas do
+  detector de pontos de fuga (imagem <= 800 px) fundem as bordas finas da moldura; o desempate "mais alta" era
+  comparado longe do apoio das retas; e o central (57) trancava o próprio erro como previsão da estação.
+  - inspectCornerTop, em resolução cheia, na metade de cima:
+    - cada pixel cuja borda (degrau a +-2 px) corre para o ponto de fuga da família soma na reta do feixe
+      (ângulos relativos ao centro da imagem, sem salto em +-pi; bins de 0,5 px);
+    - picos subpixel = cada borda da moldura separada; até 96 por família (a persiana do 52 gera dezenas);
+    - um par (A, B) fecha a quina quando as duas bordas continuam fortes logo a partir do cruzamento (média >= 5
+      nos 250 px do lado da parede); vence o cruzamento mais alto.
+  - Fallbacks (quina fora da imagem): par das retas do detector que chegam ao cruzamento (<= 150 px), uma moldura +
+    previsão da estação, só a previsão.
+  - 57: topo (1556, 286), junção visível ~(1545, 278); as bordas de cima das duas molduras (teto_57.png).
+  - 52: (821, 1010); 49: (628, 701); 42/43/47/53 como antes.
+  - Estação 2: A (2198 px) e B (2450 px) discordam; B (61 votos) vence e A é deduzido. Câmera 1,58.
+- Refino caso a caso, estação 1 (usuário: o 44 é indiscutível; o voto do vetor forte para o pé é gigantesco):
+  - candidatas de piso agora da varredura em RESOLUÇÃO CHEIA abaixo do topo, com peso = força da reta (as arestas
+    esparsas do detector de pontos de fuga davam à base inteira do armário o peso de um segmento de móvel);
+  - pilhas agrupadas em +-12 px (o segmento do 43 caía 20 px ao lado do 42);
+  - "termina no pé": apoio do lado da parede até a vertical e não além dele (junta de ladrilho atravessa, móvel
+    termina em qualquer lugar). Vira PESO do voto (1 - além/ao longo), não filtro;
+  - DESCARTADOS: exigir 2 quadros por pilha (derrubava a pilha do 44 quando a porta ocluía o 42); filtro duro de
+    término (tirava o segmento do 42); "a pilha mais baixa" (descia às juntas do piso na varredura cheia);
+    "a pilha mais forte por parede" (cada parede elegia sozinha um móvel visto por um só quadro).
+  - PÉ CONJUNTO: as duas linhas de piso se encontram num pé só -> histograma do pé com (sqrt A + sqrt B)^2.
+    Estação 1: N (44) e L (42 + 43) concordam em 2490 px, enquanto as melhores pilhas individuais (2434 e 2594)
+    eram de quadro único.
+  - Resultado: câmera 1,46-1,49 (est. 1), 1,48-1,49 (est. 2), 1,48 (est. 3), 1,44-1,49 (est. 4). A planta dava
+    1,49 m. A variação anterior (1,41-1,59) era ruído do método.
+- REGRA (usuário): reta eleita só deriva de pontos Sobel do próprio quadro; o transporte pela homografia leva
+  CONFIANÇA, não geometria ("quase chute estatístico").
+  - A reta da estação virou previsão. A eleita é a reta da própria varredura do quadro que cruza a vertical a <= 3%
+    da altura da quina da previsão (a mais forte). Sem reta própria ali, a parede fica "oculta aqui"; só o pé
+    transportado é mantido, para as ocultas.
+  - Refinamento do rodapé só desce se a pilha de destino tiver >= 2x a mediana do perfil. No 44 o perfil é plano
+    (ladrilhos): antes descia 135 px no ruído.
+  - 44: a eleita de N é a própria base do armário (linha verde de cima).
+  - 42: N oculto (a porta tapa o trecho junto ao pé); L encaixou na base da ESCRIVANINHA. A reta Sobel está no
+    lugar certo da imagem, mas é outra reta do mundo, mais afastada da parede.
+  - PRÓXIMO: representar cada reta no mundo (distância da parede, altura) para distinguir junção, base de móvel e
+    topo de rodapé.
+
+- 2026-09-28 — Piso oculto: a homografia transfere só PESO de voto, nunca geometria (decisão do usuário).
+  - Cada quadro elege entre as SUAS candidatas (Sobel próprio). Peso próprio = força × ends × vista da parede ×
+    (2 se central). Herdado = candidatas dos vizinhos levadas ao quadro que cruzam a vertical a ≤ 1,2% da altura do
+    canto da candidata (a mais próxima leva). Eleição conjunta A/B: (√A+√B)² com pés concordando (3%); sozinha vale.
+  - Alavanca: exige peso próprio > 0 (levanta vetor fraco, nunca cria um ausente; ex.: B do 44, vista 0% → oculta).
+  - Premissa do usuário: a estação gira o corpo no lugar (mesmo centro, altura, distâncias) → transferência por
+    ROTAÇÃO PURA (H = K R K⁻¹) pelos eixos do canto de cada quadro (pontos de fuga), sem plano do piso nem distância.
+    Descartado: transferência pelo plano do piso com cada quadro posicionado pelo próprio canto.
+  - Filtro preliminar afrouxado: cFloorLineMin 200, cFloorHold 2, inspectPencilMax 32.
+  - Estação 1: 44 A = base do armário (própria 3696 + 16744 do 42); 42 A = segmento curto (1267 + 17881 do 44);
+    43 A = fiapo (297 + 31485 de 42/44). Altura da câmera no passe final: 1,41–1,57 m (planta 1,49).
+- 2026-09-28 — Geometria do piso SEMPRE de nuvem própria (usuário: vetor de piso do 43 "arbitrário, sem nuvem").
+  - Causa: a candidata era desenhada com 1200 px fixos a partir do pé, e a força vinha da varredura da reta inteira.
+    Zoom (nuvem_43A.png): a "nuvem" era textura do piso costurada por lacunas de até 150 px.
+  - Medido: na textura, a média do degrau é ~13 e ≤ 14/50 amostras ≥ 16 a cada 150 px; nas arestas reais, 30–50/50.
+  - Agora (inspectLineRun): a candidata é o trecho contínuo mais longo de amostras fortes (≥ cFloorRunStep 16, lacuna
+    ≤ cFloorRunGapPx 12 px), em qualquer ponto ao longo da parede (algo pode tapar a reta junto ao canto).
+    Força = soma desses degraus × ends. O mínimo é de 20 amostras fortes.
+  - O refinamento do rodapé só vale se a reta refinada tiver a própria corrida; senão fica a candidata.
+  - Desenho: a reta sólida = a corrida; o prolongamento até o pé é tracejado ("ext"); os pontos vão ao csv ("sup").
+    A oculta vai do pé para o lado da parede (res.side), não em direção ao ponto de fuga.
+  - Estação 1: 42 A = base do armário à esquerda (1086–1608 px do pé, 172 amostras); 43 A = fiapo na borda (22);
+    44 A = trecho da base (83). A herança continua: 44 A própria 2252 + 26590 do 42.
+- 2026-09-28 — Giro central refeito para teste de panorama (usuário: três giros, teto/horizonte/piso, de um ponto fixo).
+  - ForFov: faixa de pitch ±75 (antes ±55). Com a lente do Moto (68,5 graus na vertical) dá 3 camadas: −40,75 / 0 / +40,75.
+  - Grade dobrada: 2 × ceil(360/(meia largura)) = 28 posições por camada (12,9 graus; cada vista cobre ~3/4 da
+    vizinha). Total de 84 quadros.
+  - Sinalização laranja/verde mantida (retomada). appKeepSuperseded = 0: a retomada sobrescreve, e a foto
+    substituída sai do log (Compact no fim). O usuário dispensou o log de retomadas.
+  - capTest: a primeira pose do teste guiado foi para o centro da posição 0 (numa borda, ela ficava a minSepFrac
+    exato da última posição). APK instalado no aparelho USB 0073660111.
+- 2026-09-28 — Estação de canto: 5 vistas no mesmo leque de 60 graus (antes 3), a um quarto de quadro (12 graus). As
+  vistas intermediárias refinam as medidas do canto (usuário). ForCorner com mínimo de 5; capTest atualizado; APK
+  instalado.
+- 2026-09-28 — Panorama do giro central (capInspect --panorama).
+  - Equiretangular a 0,08 grau/px (4500x2250); cada quadro entra pela rotação do sensor, sem profundidade.
+    Mistura com peso em pena (1 − distância à borda, em u e v).
+  - Sessão 064701: 28 quadros (2 camadas × 14), 7 s. Só pelo giroscópio, o friso do teto fica contínuo nas 360
+    graus. Há fantasma só perto da câmera (cama, roupas): é a paralaxe do giro sobre o tronco.
+  - Mapeamento de volta ao quadro (usuário): panorama_room<N>.csv tem R (mundo→câmera) e o pinhole de cada quadro;
+    panorama_room<N>_owner.u16 tem o quadro dono de cada pixel. panorama_mapa_quadros.png mostra os donos.
+  - PRÓXIMO: Sobel/RANSAC no panorama → vetores → de volta aos quadros para refinar a rotação de cada um.
+- 2026-09-28 — Captura nova imovel_20260928_112140 (teste de panorama): 113 imagens, 12 estações, 258 MB.
+  - Baixada por Wi-Fi (ANDROID_SERIAL=192.168.15.22:5555; o USB cai, o usuário pediu Wi-Fi sempre). Tamanhos
+    conferidos e sessão apagada do celular (Regra 16). A imovel_20260928_110026 (15 MB, 11:00) continua no aparelho,
+    não baixada.
+  - Giro central: 84 quadros = 3 camadas × 28 (pitch medido: teto 23–35, horizonte −8–9, piso −25–44).
+  - Panorama só pelo giroscópio: com 3/4 de sobreposição, o erro de rotação aparece como duplicação (janela,
+    batente da porta à esquerda, cama). É a base para o refinamento por vetores.
+  - Saídas em build/sessions/imovel_20260928_112140/: panorama_giroscopio(.png/_prev), panorama_mapa_quadros.png,
+    panorama_room0.csv, panorama_room0_owner.u16.
+  - VIOLAÇÃO DA REGRA 1: nesta sessão usei python para editar fonte (substituições). Não repetir: editar com a
+    ferramenta Edit ou sed.
+- 2026-09-28 — Registro do panorama (usuário: "costura coerente, sem fantasmas"; "mínimos quadrados até o ruído
+  ~zero").
+  - Tentativa 1: Gauss-Newton fotométrico direto (alta frequência normalizada, pirâmide 1/32–1/8, Huber). RMS
+    2,2→2,0 e correção máxima de 2 graus: não converge, porque o rumo do giroscópio erra ~10 graus entre vistas
+    (fantasma da janela), fora do alcance de um método local. O usuário achou o refinado "absurdamente melhor"
+    (mistura mais seca, potência 4), mas o recorte da janela ainda mostra contorno duplo e puxadores dobrados.
+  - Tentativa 2: busca por pares (rumo × inclinação, NCC; 1/32 ±15 graus a cada 1, depois 1/16 ±1,5 a cada 0,25)
+    → mínimos quadrados globais das rotações pelas medidas dos pares → Gauss-Newton fino. Reporta o resíduo da
+    rede em graus e px.
+  - ppCheck: double é proibido (fp64 poisoned); tudo em float.
+- 2026-09-28 — DESCARTADO: busca por pares + rede global. 292 de 575 pares ficaram fracos (NCC < 0,3) e a correção
+  divergiu (média 15, pior 52 graus); provável serrilhado das persianas e do piso na alta frequência a 1/32.
+  Retirada; fica o Gauss-Newton fotométrico (correção de até 2 graus), que o usuário aprovou.
+- 2026-09-28 — Faces planas do giro central (capInspect --faces; usuário: "no N/S/L/O/P use o mesmo critério de
+  mesclagem, deslizante em vez de rotativo"; o 360 é circular e não serve ao RANSAC).
+  - Cada parede do plano (origem no ponto do giro, câmera à altura do plano) e o piso ganham uma tela plana de
+    2 mm/px. As retas saem retas. Pena^4 e rotações do registro; owner.u16 por face (volta ao quadro).
+  - Sessão 112140, na ordem do plano: parede0=N (armário e porta), 1=L (porta aberta e mesa), 2=S (roupas),
+    3=O (janela) → --face-names N,L,S,O,P. O piso tem um buraco preto no nadir (ninguém olha para baixo de si).
+  - Resta: puxadores duplicados no alto do armário e um halo na janela (exposição e erro residual de ~1–2 graus).
+    PRÓXIMO: RANSAC nas faces → vetores → de volta aos quadros para zerar o resíduo.
+- 2026-09-28 — App: a vibração vira alerta (usuário: "vibre no laranja ou no vazado no meio"). Saem os 15 ms de toda
+  captura do giro/leque; entra um pulso de 150 ms (appAlertMs) quando a posição fica laranja ou quando sobra uma
+  vazia entre duas feitas na camada (anel no giro, linear no leque), uma vez por vazada. O codificador marca
+  Palert e a thread da câmera vibra (JNI). APK instalado por Wi-Fi.
+- 2026-09-28 — Giro central a cada 6 graus: 60 posições por camada, 180 quadros por giro (usuário: "o fantasma ainda
+  participa nitidamente"). cCenterBinDeg = 6 em ForFov. Na opinião dada ao usuário, a densidade encolhe as zonas
+  de mistura, mas o fantasma vem do erro de rotação residual (1–2 graus) e da paralaxe do tronco; o que zera é o
+  ajuste pelas retas. Custo: ~400 MB por sessão; com o codificador ocupado, girar rápido deixa vazadas (agora
+  vibram). capTest verde; APK instalado por Wi-Fi.
+- 2026-09-28 — Alinhamento subpixel das faces (usuário: "posição esperada pelo giroscópio, subpixel por Gauss e
+  mínimos quadrados, 4 graus de liberdade por quadro: horizontal, vertical, rotação e escala; os dois últimos
+  pequenos mas conhecidos").
+  - Cada quadro é retificado sozinho em cada face (4 mm/px, magnitude de borda) e movido pela sua semelhança
+    d(P) = (tx + a x − b y, ty + b x + a y) em torno do meio da face.
+  - Pares sobrepostos → deslocamento do par (grosso ×4, depois fino) → ladrilhos de 0,32 m com busca ±3 px e
+    pico gaussiano → d_j(P) − d_i(P) = −s.
+  - Mínimos quadrados por face; âncora em d = 0 (1e-3 no deslocamento, 1e-2 em rotação/escala); peso Cauchy com
+    escala pela mediana (Huber deixava a cauda puxar). 5 rodadas de medir, resolver e renderizar.
+  - Resultado (mediana medida na 5ª rodada): P 0,90 px (55% < 1 px, 98% < 3 px), L 0,99, S 1,09, O 1,26, N 1,44 px
+    (1 px = 4 mm). Partiu de 13–19 px. Estagna em ~1 px da 3ª rodada em diante. Candidatos: distorção da lente
+    (as intrínsecas vêm com distorção 0), paralaxe do tronco (perspectiva, não semelhança) e móveis fora do plano.
+  - Visual: os puxadores duplicados do armário sumiram e o caixilho da janela ficou único. Resta a exposição
+    (faixa clara na janela) e o reflexo do vidro.
+  - Registro completo para voltar ao quadro: faces_geometria.csv (plano de cada face), faces_quadros.csv (rotação,
+    pinhole e semelhança de cada quadro em cada face, com a receita no código), faces_pares.csv (todos os
+    ladrilhos de todas as rodadas), giro_<face>_owner.u16.
+- 2026-09-28 — Baliza zero das faces (usuário: "linha de teto horizontal na borda superior e ambas as laterais
+  verticais; enquanto isso não ocorrer, não temos uma imagem retificada").
+  - inspectCreaseWalls: cada parede é composta com margem de 0,25 m, e o vinco do teto sai por Sobel + RANSAC
+    (a linha quase horizontal mais alta no meio da parede). Os pontos do vinco viram raios contra o plano do teto
+    (teto − câmera) e dão a linha real da parede na planta. As quinas saem das interseções, e as faces são
+    refeitas sobre elas. inspectCreaseCheck mede o resultado (faces_baliza.csv); as telas de medida saem como
+    medida_*.bmp e baliza_*.bmp.
+  - Achados: a detecção acerta o friso da L (−6 graus no plano do app; a quina real fica ~40 cm para dentro). Na N
+    o armário tapa o friso, e a linha mais alta passa a ser o topo do armário. Quinas reconstruídas com 98/87/93/82
+    graus.
+  - A L reconstruída mostra o friso quase horizontal, mas CURVO. Uma reta curva numa composição por rotação pura
+    indica modelo de câmera errado (focal imprecisa ou distorção; as intrínsecas vêm com distorção 0). Pode ser
+    também a causa do resíduo de ~1 px. Teste em curso: --focal-scale 0,97 / 1,00 / 1,03.
+  - Usuário: o piso P está bom mas trunca nas paredes (as bordas seguem o plano errado). O buraco do nadir deve
+    ser preenchido pelas vistas de piso do fim de cada canto (3 a 5 horizontais + 1 de piso, feitas para isso),
+    entrando por homografia do plano do piso, não por rotação pura.
+- 2026-09-28 — Baliza zero, continuação.
+  - A reconstrução estava certa; a VERIFICAÇÃO pegava linhas espúrias (textura do teto e fantasmas). Correções:
+    pontos de borda com degrau ≥ 12 (20 apagava o friso branco da N); RANSAC em duas fases (a linha mais apoiada
+    primeiro; o "mais alto" só entre as que têm ≥ 35% desse apoio); a reconstrução roda 2 vezes.
+  - O cômodo como retângulo: um rumo para todas as paredes (média de 4θ ponderada por pontos × comprimento²), as
+    paredes a 90 graus entre si; cada uma dá só a própria distância. Paredes de friso curto (N atrás do armário,
+    O) herdam a direção das de friso longo (L, S).
+  - Resultado: L −0,35 graus a 1,5 mm da borda de cima; S −0,30 graus a 1,2 mm; N −1,2 graus a 4,8 mm; O a
+    detecção falha (friso curto). Cômodo 3,28 × 3,51 m com pé-direito assumido de 2,80 m (planta aprovada:
+    3,03 × 3,37). Visual: friso horizontal na borda de cima em L e O, quinas nas laterais.
+  - Pendências: detector das quinas verticais (quase sempre nan); portas do armário da N onduladas (o armário
+    fica à frente da parede, e o ajuste por ladrilhos segue o plano); escala (pé-direito real); piso com as
+    vistas de canto; lente (distorção/focal: o teste 0,97–1,03 não decidiu).
+- 2026-09-28 — Marca (usuário: as imagens estampavam a marca anterior, deveria ser SORENA; a marca anterior não participa desse
+  projeto").
+  - EXIF Software: "Sorena LiDAR 0.1.0" (app) e "Sorena LiDAR capInspect" (os frame_*.jpg extraídos).
+  - Pacote Android: io.sorena.lidar (manifesto e TAndroid: cPackage e a ação GNSS). Certificado de debug novo,
+    CN=LiDAR Debug, O=Sorena; a chave antiga ficou em keys/lidarDebug_antiga.jks. Pasta de sessões no celular:
+    /sdcard/Android/data/io.sorena.lidar/files/.
+  - Antes da troca, a sessão imovel_20260928_110026 (15 MB, do app antigo) foi baixada por Wi-Fi, conferida e
+    apagada do celular. O app do pacote anterior continua instalado, sem sessões; desinstalar é decisão do
+    usuário.
+  - norm.sh passou a cobrir mobile/android/*.cpp|*.h (o sed deixou LF no TAndroid.cpp e o ppCompile recusou).
+  - shared/include/testCache.h: a referência à marca anterior foi retirada fora desta sessão (13:40).
+  - A correção do EXIF das capturas antigas não guarda o nome anterior: inspectEXIFSoftware lê a tag Software
+    (0x0131) do primeiro IFD e a reescreve com "Sorena", mantendo a versão.
+  - Por quadro e por face: pastas N/L/S/O/P com a retificação pura de cada quadro (homografia inteira, sem
+    recorte, até 1 m além da face; 4 mm/px), quadros.csv com a posição na tela da face. capInspect --face-frames.
+- 2026-09-28 — Vestígios da marca anterior limpos (pedido do usuário): o app do pacote antigo foi desinstalado do
+  celular (pasta de dados conferida vazia antes), a chave de debug antiga foi apagada (keys/ só com a nova) e os
+  índices do .vs/ foram removidos; 5 .vsidx ficaram presos pelo Visual Studio aberto.
+- 2026-09-28 — Prumo pelos pontos de fuga (usuário: "numa retificação frontal as caixas viram retângulos, não os
+  trapézios de hoje"; "o prumo pode ser balizado pelos pontos de fuga"; "não deve desviar da média do anterior e
+  posterior... de 5... verticais do ponto de fuga com peso 4x ou 8x").
+  - Diagnóstico: a vertical própria de cada quadro (ponto de fuga) contra a vertical da rotação: 1,94 graus em
+    média (pior 5), e o registro fotométrico não mexe nisso (1,91). Há um desalinhamento fixo câmera→sensor
+    (mínimos quadrados sobre v − g = W × g): (−1,5; −1,0; 0,2) graus. faces_vertical.csv.
+  - inspectPanoPlumb, ANTES do registro: o giro de prumo de cada quadro é o que leva sua vertical (a própria, ou a
+    do sensor corrigida por W) à vertical do mundo. Depois vem a média ponderada da janela (2 antes, 2 depois, a
+    própria com peso 8). --no-plumb desliga.
+  - Resultado: as verticais próprias ficam em média a 0,41 grau da média da janela (2 acima de 1,5). A inclinação
+    residual depois do registro caiu para média 0,82 e pior 2,56 graus. Na primeira passada, os vincos concordam
+    com o retângulo dentro de 1 grau. Cômodo 3,22 × 3,33 m (pé-direito assumido de 2,80). Visual: caixas, portas,
+    interruptores e tomadas saem retangulares (L/072, L/046).
+  - Tentativa intermediária DESCARTADA: aplicar o prumo depois do registro, quadro a quadro, com mediana. O ruído de
+    cada ponto de fuga desfez a coerência entre vizinhos e desviou os vincos (N 3,8, O 2,2 graus).
+- 2026-09-28 — Prumo pelo móvel (usuário: "o ponto de fuga do móvel é incontestável, e o restante pode ser balizado
+  a partir disso; confira as retificações em cima disso").
+  - Verificação (inspectRectLean): retas quase verticais e quase horizontais de cada quadro retificado (RANSAC em
+    série, ≥ 80 px), com a inclinação média, as retas e o trapézio (graus por metro). Colunas novas em
+    <face>/quadros.csv.
+  - Achado: no horizonte as verticais estavam a ~0 grau; na camada do piso pendiam de forma sistemática (L 72–76:
+    −1,7 a −3,2; O 58–60: −5). O ponto de fuga vertical olhando para baixo é fraco.
+  - inspectLeanPlumb (antes da reconstrução pelo teto): a inclinação t das verticais numa parede é o giro que falta
+    em torno da normal n → o quadro gira por t·n (duas paredes à vista dão os dois componentes). Janela de 5 com a
+    própria medida × 8, limite de 6 graus, 3 rodadas. inspectFaceFrames com outDir NULL só mede.
+  - Resultado: a inclinação média caiu de 1,50 para 0,96 grau. Por face: N 0,58, L 0,90, S 1,13, O 1,66 (os quadros
+    do piso da O, dominados por cama e persiana, oscilam). L 72–75 foram para −1,25…0. Vinco na verificação: N 0,25,
+    L −0,76, S 2,22, O −0,65 grau. As caixas IANA/OVOS nos quadros 72–74 agora repetem a inclinação real vista em
+    L/IANA.JPG (foto frontal do usuário): a IANA tombada, a OVOS com os lados paralelos.
+  - Nota: a IANA.JPG é do usuário; não apagar (as limpezas de L/ usam 0*.png).
+- 2026-09-28 — Rumo pelo móvel (usuário: "as verticais estão ótimas, mas a perspectiva ainda não é frontal: vejo
+  o móvel em ângulo horizontal").
+  - Uma horizontal h acima do olho, num plano a distância D girado φ em torno da vertical, tem inclinação −h·φ/D.
+    inspectRectLean passou a dar esse φ por quadro (out[5]). inspectLeanPlumb gira o quadro por φ em torno da
+    vertical do mundo (cLeanHeadingSign = +1, conferido: o rumo caiu), nas mesmas rodadas da prumada. Colunas
+    headingDeg/headingLines em quadros.csv.
+  - Rodadas: rumo 3,70 → 0,94 grau; verticais 1,50 → 1,02 grau.
+  - Conflito: a reconstrução pelo vinco girava as paredes de volta (rumo final 2–2,7 graus). Agora, com o prumo
+    ligado, as paredes ficam no rumo do móvel e o vinco só as posiciona (o vinco sozinho giraria 0,7–1,9 grau).
+  - Resultado final: rumo com sinal por face N −0,68, L 0,71, S −0,08, O 0,20 (medianas −0,36…0,46). O vinco na
+    verificação: L 0,11, S 0,10, O 0,93 grau (a N ainda pega o armário). Cômodo 3,17 × 3,21 m. L/072: o tampo da
+    mesa e as caixas saem horizontais e frontais.
+- 2026-09-28 — Eixos ortogonais (usuário: "o teto é baliza para a linha superior e o móvel para as verticais";
+  "em vez de móveis, vários vetores verticais com ponto de fuga em comum: adaptativo a qualquer caso").
+  - Rumo de cada quadro só pela linha do teto (as retas a até 12 cm do vinco, h = teto − olho); a direção das
+    paredes volta a sair do vinco (a regra que as prendia ao rumo do móvel foi retirada).
+  - Prumo pelo consenso das verticais: inspectRectLean acha a inclinação que a maioria das verticais compartilha
+    (tolerância 0,012 ≈ 0,7 grau) e ignora as que não concordam (a caixa tombada). A convergência delas é só
+    verificação.
+  - Combinação por quadro: mínimos quadrados em w (u·w = m para cada medida: a inclinação em torno da normal de
+    cada parede, o rumo em torno da vertical). Janela de 5 com peso 8, 3 rodadas.
+  - DESCARTADO: usar a convergência como giro em torno do eixo horizontal da parede, medida no pé da câmera. Ela
+    divergiu (2,7 → 5,2 graus): extrapolar até o pé amplifica o ruído.
+  - Resultado: inclinação das verticais 1,71 → 0,95; rumo 9,26 → 0,92 grau. Vinco na verificação: L −0,83,
+    S −0,64, O −1,38 grau (N 4,5: armário). Quinas verticais medidas: N −1,2/−0,2, L −0,1, O −1,0 grau, a 16–35 mm
+    das bordas. Cômodo 3,23 × 3,23 m (pé-direito assumido de 2,80).
+- 2026-09-28 — Quadro 21 fora de esquadro (camada do teto, olhando a quina L/S; sem verticais longas e sem ponto de
+  fuga vertical próprio; os frisos inclinavam +2,4 na L e −1,2 na S). Causa: o modelo lia a inclinação do vinco
+  só como rumo. Correto: s = −(n + (h/D)·vertical)·w (o giro em torno da normal da parede também inclina o vinco;
+  h/D ≈ 0,7). Agora cada vinco entra no ajuste com o eixo n + (h/D)·vertical (inspectLean[..][5] = h/D), e numa
+  quina os dois vincos dão prumo e rumo mesmo sem verticais.
+  - Resultado: a inclinação média dos vincos caiu de 6,7 para 0,21 grau (verticais 0,99). Vinco na verificação:
+    N 1,50 (era 4,5), L −1,00, S −1,39, O −0,26. No 21 o friso da L foi de ~−2 para ~−1 grau.
+- 2026-09-28 — Fusão das faces com os 4 graus de liberdade (usuário: "vamos fundi-las"). A fusão já roda em --faces
+  (inspectFaceAlign); o que mudou: com prumo e rumo calibrados, as semelhanças ficam pequenas. Um par com
+  deslocamento > 12 px (5 cm) é descartado: conteúdo fora do plano ou padrão repetido. A semelhança final fica
+  presa a 12 px, 1% de escala e 0,5 grau de rotação.
+  - Antes dos limites, a N se prendia ao armário (60 cm à frente da parede, portas repetidas): 24 de 29 quadros
+    deslocados > 8 cm, com sinais opostos por camada, e escala 0,96–1,05. A fileira de portas de cima saía dobrada.
+  - Depois: mediana medida N 1,67, L 0,58, S 0,55, O 1,28, P 0,53 px (1 px = 4 mm). A fileira dobrada da N sumiu.
+    Restam fantasmas de paralaxe em objetos fora do plano (objetos da mesa na L, batente e puxadores na N): a
+    mistura (pena^4) soma vistas de centros ligeiramente diferentes. Próximo possível: costura (cada região de um
+    só quadro, corte pelo caminho de menor diferença).
+- 2026-09-28 — Encaixes do topo (usuário: "os encaixes no topo ainda não são coincidentes"). O friso aparecia em
+  degraus de 8–22 cm entre quadros vizinhos da camada do teto. Teste com --no-plumb: o friso contínuo → a causa
+  era o prumo/rumo QUADRO A QUADRO pelas retas. As medidas por quadro têm ruído, e o registro fotométrico
+  (teto/parede lisos) não refaz a concordância.
+  - DESCARTADO: rodar o GN fotométrico de novo entre as rodadas (inspectPanoGN, que ficou como função): não refez.
+  - DESCARTADO: um giro 3D por camada. O rumo saía diferente por camada (teto 8, horizonte 5, piso 0 grau: o piso
+    não vê a linha do teto) e as camadas se descolavam.
+  - Solução: um rumo só para o giro inteiro (mínimos quadrados sobre todas as medidas) e, por camada, só os dois
+    componentes de prumo com o rumo fixo. Resultado: o friso sai contínuo em S e L; verticais 0,89, rumo 0,87 grau;
+    vinco na verificação L −0,25, S −0,15, O 1,60 (N 5,0: o armário); ladrilhos com residual mediano de 2,3–4,0 mm.
+- 2026-09-28 — Faixas do giro central (usuário: "+10..75, −20..+20, −75..10"; "estou capturando muito teto em si,
+  que é plenamente descartado"). ForFov com 3 camadas: teto +10..+75, horizonte −20..+20, piso −75..−10 (−75..10
+  lido como −75..−10, em espelho com o teto). Campos novos bandLoDeg/bandHiDeg (faixas que se sobrepõem: a camada
+  guiada leva a pose, em allowedBand) e TSpinTracker::inBand. Alvo da guia a ±25 graus (cCenterAimDeg), no friso,
+  e não no teto liso. capTest verde; APK instalado.
+  - testCache.h estava quebrado: a limpeza da marca anterior (fora desta sessão) tirou abtcHashFleet mas deixou a
+    chamada. Chamada e comentário do "fleet" retirados.
+- 2026-09-28 — Giro central com 36 posições por camada, a cada 10 graus (cCenterBinDeg = 10); antes eram 60. Na tela do
+  giro, uma linha vertical amarela no centro do cursor, mais alta que o retângulo da vista e que a faixa: a posição
+  que ela corta é a que a próxima foto preenche ou refaz (usuário: "acertar qual frame está sendo recapturado").
+  capTest verde; APK instalado por Wi-Fi.
+- 2026-09-28 — "De um ponto para frente nenhuma captura ficou verde" (sessão 155143, 108 fotos no giro central).
+  - Causa: TAxisCheck guardava no máximo 128 medidas por cômodo (axisCheckMax) e depois deixava de aceitar novas.
+    A referência (consenso das 10 mais recentes, para acompanhar a deriva) congelava, e o rumo seguia derivando.
+    Laranja por eixo: teto 0, horizonte 0, piso 12 de 36; no piso o desvio crescia de 6–7 para 13–16 graus. O piso
+    de ladrilhos na diagonal ainda dá eixos a ~40 graus (a tolerância da diagonal os descarta).
+  - Correção: com o vetor cheio, a medida mais antiga sai (memmove) e a nova entra. Teste novo no capTest: 250
+    medidas derivando 25 graus, nenhuma fora de eixo. APK instalado.
+  - Sessões 153215 (32 MB), 154123 (148 MB) e 155143 (292 MB) baixadas por Wi-Fi, conferidas e apagadas do
+    celular.
+  - Ritmo: o intervalo mínimo entre fotos aproveitadas é 1,66 s (piso do processamento serial: pontos de fuga,
+    borrão, portas, JPEG de 12 MP e gravação, numa única thread com um único job; PjobBusy bloqueia a próxima).
+    Mediana 3,45 s; giro central de 9,4 min.
+- 2026-09-28 — Encanamento de captura em três estágios (usuário: fila circular de imagens com giroscópio →
+  thread que agrupa 2 a 4 e escolhe a de melhor foco → thread final com medidas, armazenamento e sprites; a
+  cadência vem da taxa líquida do último × o grupo, com descarte adaptativo e suave, "um Bresenham dá conta").
+  - 8 slots (TKeySlot: planos, registro, meta, borrão, grupo, estado ssFree/Candidate/Measuring/Chosen/Final),
+    ~18 MB cada. O antigo Pjob/PjobBusy saiu: freeSlots() bloqueia a captura, pipelineIdle() libera a planta.
+  - Estágio 1 (câmera): um svKeep abre o grupo da posição; os quadros seguintes entram por Bresenham com a
+    fração N / (T_final × Rcam) (Rcam e T_final em média móvel), até N = 4, ou até a pose sair da posição
+    (TSpinTracker::At), ou até 2 × T_final. A vista do piso e a estação de portas usam grupos de 1.
+  - Estágio 2 (TFocusWorker, novo): pega o grupo fechado mais antigo, mede o borrão de cada um (blurMeasure) e
+    manda o mais nítido à fila circular Pchosen, liberando os outros.
+  - Estágio 3 (TKeyframeWorker): encodeOne em laço, com pontos de fuga, portas, veredito, JPEG e gravação; reusa o
+    borrão do estágio 2 e mede o próprio tempo (PfinalSec).
+  - A posição pulada enquanto a anterior junta candidatos é esperada (usuário) e já dispara o alerta de vazada.
+  - Mensagens de inclinação fora de contexto (usuário): a guia mandava inclinar a mais de 8 graus do alvo, regra
+    das faixas antigas. Agora só fora da faixa aceita (TSpinTracker::PitchSide), rumo à borda mais próxima, também
+    na tela vermelha.
+  - capTest verde; APK instalado. NÃO testado em campo ainda.
+- 2026-09-28 — Nenhuma posição vazia por causa do melhor de 4 (usuário: "o melhor de 4 deve garantir o melhor possível
+  para cada slot, descartando a chance de vazado, mesmo que não seja o melhor foco"). Os candidatos extras de um
+  grupo só entram se sobrarem appSlotReserve = 2 buffers livres; a primeira foto de cada posição sempre tem onde
+  entrar. APK instalado.
+- 2026-09-28 — Encanamento por posição, no lugar dos grupos (usuário: "janela de 36 slots possíveis, a thread do
+  meio pega um frame, mede o foco e compara com aquele atualmente no slot correspondente... slot vazio = 0"; "a
+  terceira sinaliza que já começou um dado slot, e com isso a segunda deixa de atualizá-lo", com mutex nesse flag).
+  - O slot guarda banda, posição e direct (porta ou vista do piso: segue sem comparação). Estado novo ssHeld: o
+    mais nítido da posição até agora. Saíram openGroup/closeGroup, Pgroup*, appGroup e PfinalSec.
+  - Estágio 1: o svKeep entra sempre (a primeira foto da posição). Enquanto a pose segue numa posição ainda viva
+    no encanamento (binLive: há quadro dela antes do estágio 3), entram candidatos por Bresenham com a fração
+    1 / (T_foco × Rcam). O ritmo depende só do estágio 2 (PfocusSec em média móvel), não do 3. A reserva
+    appSlotReserve = 2 continua.
+  - Estágio 2: cada candidato em ordem FIFO; mede o foco e compara com o ssHeld ou ssChosen da mesma posição. O
+    mais nítido fica; se era ssChosen, troca também na fila Pchosen. Se a posição já está em ssFinal (o estágio 3
+    começou; o estado é trocado sob Pmutex), o candidato é descartado. O ssHeld segue para o estágio 3 quando a
+    pose sai da posição (PcurBand/PcurBin via o novo TSpinTracker::Locate), ou depois de appHoldMs = 1 s sem
+    um mais nítido.
+  - Foco medido só na região do autofoco (usuário): focusRects(aim) é comum ao Autofocus e à medida. Teto usa o
+    triângulo de cima, piso o de baixo, horizonte uma faixa horizontal (antes era o quadrado central: 30% da
+    altura, largura toda menos 5% de cada lado). O aim de cada quadro vem do pitch da sua banda. Cada região
+    cresce em torno do centro até 1024 px (os ladrilhos do blur são 256 px de uma redução de 4x). O resultado é
+    a mediana sobre os ladrilhos texturizados de todas as regiões.
+  - ppCheck limpo, APK compilado e instalado por Wi-Fi. NÃO testado em campo.
+- 2026-09-28 — Sessão 162740, a primeira com o encanamento por posição: 135 fotos, com o giro central completo
+  (3 camadas × 36 = 108). Baixada por Wi-Fi, conferida e apagada do celular.
+  - Faces com `--faces --face-frames --face-names N,L,S,O,P`, na mesma ordem da 112140 (0 = armário e porta,
+    1 = caixas IANA, 2 = roupas e cama, 3 = janela). Pastas N 43, L 48, S 40, O 43, P 57 quadros.
+  - Baliza (friso do teto): N 3,57 graus (o armário esconde o friso), L −0,43, S −1,34, O 1,64. As verticais
+    laterais continuam nan. Resíduo final dos ladrilhos: N 2,0 mm, L 1,1, S 1,1, O 3,8, P 3,1.
+  - Prumo: as verticais inclinam 2,29 graus depois de 4 rodadas (na 112140 eram 0,89). O desalinhamento
+    câmera/sensor pelo ponto de fuga vertical é −1,32/−0,70 grau.
+  - Layout de pastas (usuário): o download vai para build/sessions/<sessão>/, com as saídas na raiz dela. Nunca
+    pull/, nunca subpasta nova.

@@ -65,7 +65,7 @@ rm -f "$OUT/unsigned.apk" "$OUT/aligned.apk" "$OUT/lidar.apk"
 
 if [ ! -f "$KEYSTORE" ]; then
    "$JDK/bin/keytool.exe" -genkeypair -keystore "$KEYSTORE" -alias lidar -keyalg RSA -keysize 2048 \
-      -validity 10000 -storepass lidardebug -keypass lidardebug -dname "CN=LiDAR Debug, O=Aeroblox" > /dev/null
+      -validity 10000 -storepass lidardebug -keypass lidardebug -dname "CN=LiDAR Debug, O=Sorena" > /dev/null
 fi
 JAVA_HOME="$(cygpath -w "$JDK")" "$BT/apksigner.bat" sign --ks "$(cygpath -w "$KEYSTORE")" --ks-pass pass:lidardebug \
    --out "$(cygpath -w "$OUT/lidar.apk")" "$(cygpath -w "$OUT/aligned.apk")"

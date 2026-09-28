@@ -19,6 +19,11 @@
 
 enum {
    appRingSize      = 256,      // attitude history, ~2.5 s at 100 Hz
+   appSlots         = 8,        // keyframe pipeline slots (~18 MB each at 12 MP)
+   appSlotReserve   = 2,        // slots a bin's extra candidates leave free: every bin gets its first frame (user: no gap for a sharper one)
+   appHoldMs        = 1000,     // a bin's sharpest goes on after this without a sharper one, even with the pose still on it
+   appFocusRects    = 3,        // focus regions of an aim (a triangle as three bands)
+   appFocusMeasurePx = 1024,    // a focus region is grown to this for its blur (the tiles are 256 px of a 4x reduction)
    appPreviewW      = 360,      // portrait preview width in pixels
    appMaxPixels     = 50000000, // camera request: the largest 4:3 YUV the sensor gives (every pixel counts later)
    appJPEGQuality   = 92,
@@ -37,7 +42,8 @@ enum {
    appMaxDoors      = 12,       // door candidates of a room
    appDoorShotMs    = 1500,     // between two door-station shots
    appMaxSuperseded = 4096,     // replaced photos of a property, dropped from the log at its end (production)
-   appKeepSuperseded = 1        // 1 = debug: the replaced photos stay in the log; 0 = production: overwritten
+   appKeepSuperseded = 0,       // 0: a retake overwrites, the replaced photo leaves the log (user, 2026-09-28); 1 = debug: both stay
+   appAlertMs       = 150       // vibration of an orange bin or a gap left in a band: look again (user, 2026-09-28)
 };
 
 static const float cFocusDiopters = 0.5f, // fixed focus at 2 m for the whole spin: sharp ~1.3-4 m, constant intrinsics
@@ -50,7 +56,8 @@ static const float cFocusDiopters = 0.5f, // fixed focus at 2 m for the whole sp
                    cBlurOrangeRel = 1.3f,  // ...and both floors follow the camera: orange beyond 1.3x the median of the latest keyframes,
                    cBlurRetakeRel = 1.1f,  // a sharper retake beyond 1.1x (the Moto's own softness reads ~5 px: 102600)
                    cFocusApexV = 0.5f,     // the focus triangle: top corners of the upright view and this far down the middle
-                   cFocusLevelHalf = 0.15f, // level poses: the middle 30% of the view each way
+                   cFocusLevelHalf = 0.15f, // level poses: a horizontal strip, the middle 30% of the view high (user, 2026-09-28)
+                   cFocusLevelSide = 0.05f, // and the whole width but this margin each side
                    cFocusMinDiopters = 0.1f, // a room lies between ~0.6 and 10 m; beyond, the AF locked on the wrong thing
                    cFocusMaxDiopters = 1.6f,
                    cGuideReachM = 0.35f,   // two walls this close to meeting make a corner (the support lines)
@@ -106,7 +113,7 @@ struct TPlanDoor {
 // Where the focus is measured: what the pose is after
 enum TFocusAim {
    faCeiling, // the triangle anchored on the top edge of the upright view
-   faLevel,   // the middle of the view
+   faLevel,   // a horizontal strip across the middle
    faFloor    // the triangle anchored on the bottom edge
 };
 
@@ -121,11 +128,54 @@ enum TRoomPhase {
 
 class TCapApp;
 
-// Encodes the pending keyframe off the camera thread
+/* The keyframe pipeline (user, 2026-09-28): the camera thread fills slots with candidate frames (planes, pose,
+   gyroscope), each tagged with the bin its pose lies in, at the focus worker's own rate - the frames between skipped
+   by a Bresenham on the camera's rate; the first frame of an empty bin always enters. The focus worker measures each
+   candidate's focus and keeps it only if sharper than what its bin holds (an empty bin holds nothing: any frame wins);
+   the bin's sharpest is held while the pose stays on it, then goes to the keyframe worker, which does the final
+   measures, the storage and the bins' state (what the screen draws) - at the pace of the bins, not of the camera */
+enum TSlotState {
+   ssFree,      // ready for the camera thread
+   ssCandidate, // a frame waiting for the focus worker
+   ssMeasuring, // its focus being measured
+   ssHeld,      // its bin's sharpest so far, while the pose stays on the bin
+   ssChosen,    // queued for the keyframe worker
+   ssFinal      // being measured, encoded and stored
+};
+
+// One frame in the pipeline
+struct TKeySlot {
+   TBlock<BYTE> planes; // planar Y, U, V
+   TImageRecord rec;
+   TFrameMeta   meta;
+   TBlurResult  blur;   // measured by the focus worker, reused by the keyframe worker
+   QWORD        stamp;
+   int          band,   // the bin it stands for (a door or floor-view shot: direct, no comparison)
+                bin;
+   bool         direct;
+   float        focus[4*appFocusRects]; // the focus regions of its aim, where its sharpness is measured
+   int          focusCount;
+   BYTE         state;  // TSlotState
+};
+
+// Encodes the chosen keyframes off the camera thread
 class TKeyframeWorker : public TCormWorker
 {
  public:
    explicit TKeyframeWorker(TCapApp &app) : TCormWorker("keyframe"), Papp(app) {}
+
+ protected:
+   void DoJob(void) override;
+
+ private:
+   TCapApp &Papp;
+};
+
+// Picks the sharpest frame of each group of candidates
+class TFocusWorker : public TCormWorker
+{
+ public:
+   explicit TFocusWorker(TCapApp &app) : TCormWorker("focus"), Papp(app) {}
 
  protected:
    void DoJob(void) override;
@@ -148,7 +198,8 @@ class TCapApp : public TCapSink
    ~TCapApp(void);
 
    void Launch(void);
-   void EncodePending(void); // worker thread
+   void EncodePending(void); // keyframe worker thread: every chosen frame in turn
+   void FocusPending(void);  // focus worker thread: every closed group in turn
 
    void OnResize(int w, int h, int densityQ8) override;
    void OnPaint(TSurface &s) override;
@@ -172,7 +223,11 @@ class TCapApp : public TCapSink
    TMat4 poseOf(const TAttitude &a) const;
    bool  attitudeAt(QWORD stampNs, TAttitude &out) const;
    void  updatePreview(const TCamFrame &f);
-   void  queueKeyframe(const TCamFrame &f, const TMat4 &pose, const TAttitude &a, bool floorFrame);
+   bool  queueKeyframe(const TCamFrame &f, const TMat4 &pose, const TAttitude &a, bool floorFrame, int band, int bin, bool direct);
+   bool  encodeOne(void);
+   int   freeSlots(void) const;
+   bool  pipelineIdle(void) const;
+   bool  binLive(int band, int bin) const;
    void  startRoom(void);
    void  finishRoom(void);
    void  beginStation(TStationKind kind);
@@ -184,6 +239,7 @@ class TCapApp : public TCapSink
    void  checkComplete(void);
    void  beginFloorView(void);
    void  requestFocus(TFocusAim aim);
+   int   focusRects(TFocusAim aim, float *rects) const;
    void  wantFocus(TFocusAim aim);
    TPlanPoint floorViewTarget(void) const;
    float floorViewHeadingDeg(void) const;
@@ -221,21 +277,20 @@ class TCapApp : public TCapSink
    TSessionWriter       Psession;
    TJPEGEncoder         Pencoder;
    TKeyframeWorker      Pworker;
+   TFocusWorker         PfocusWorker;
+   TKeySlot             Pslot[appSlots];
    TBlock<TSpinTracker> Pspin,
                         Pahead;       // at a corner, the floor view taken early (tilted down during the fan)
    TBlock<DWORD>        Ppreview;
-   TBlock<BYTE>         PjobPlanes,
-                        PdoorBuf;     // the frontal view the door finder works on (4 planes, worker thread)
+   TBlock<BYTE>         PdoorBuf;     // the frontal view the door finder works on (4 planes, worker thread)
    TByteBuf             Pjpeg,
                         Pexif,
                         Pfinal,
                         PmetaBuf;
-   TFrameMeta           PjobMeta;
    TAttitude            Pring[appRingSize];
    TCamInfo             Pcam;
    TIntrinsics          Pintr;
    TLocationRecord      Ploc;
-   TImageRecord         Pjob;
    TSpinVerdict         Pverdict;
    TSpinConfig          PcenterCfg,
                         PcornerCfg,
@@ -260,7 +315,8 @@ class TCapApp : public TCapSink
    DWORD                PcornerMask;  // stations captured, one bit per plan station
    float                PbinAxis[spinMaxBands][spinMaxBins]; // room axis measured on the keyframe of each bin (NaN: no lines)
    bool                 PbinDone[spinMaxBands][spinMaxBins], // the keyframe of the bin went through the vanishing check
-                        PbinOrange[spinMaxBands][spinMaxBins]; // its verdict: far off the axes or blurred (accepted, open to a retake)
+                        PbinOrange[spinMaxBands][spinMaxBins], // its verdict: far off the axes or blurred (accepted, open to a retake)
+                        PbinGap[spinMaxBands][spinMaxBins];    // empty between two done bins, already signaled
    float                PbinBlur[spinMaxBands][spinMaxBins];   // FFT blur of the bin's keyframe (NaN: plain image)
    BYTE                 PbinTries[spinMaxBands][spinMaxBins];  // retakes offered to a green bin for a sharper photo
    QWORD                PbinStamp[spinMaxBands][spinMaxBins],  // stamp of the bin's current photo (its rtImage)
@@ -284,7 +340,7 @@ class TCapApp : public TCapSink
    TStationRecord       Pstation;
    TButton              PbtnMain,
                         PbtnFinish;
-   QWORD                PjobStampNs,
+   QWORD                PlastFrameNs, // the camera's previous frame (its native rate)
                         PfocusNs,     // the focus run began
                         PbackArmedNs, // first Back pressed at (0: not armed)
                         PdoorShotNs,  // the door station's last shot
@@ -295,7 +351,12 @@ class TCapApp : public TCapSink
    char                 ProomName[roomNameMax],
                         PdevModel[64],
                         Pstatus[96];
-   int                  PviewW,
+   int                  Pchosen[appSlots], // the chosen slots, in order, for the keyframe worker (a ring)
+                        PchosenHead,
+                        PchosenCount,
+                        PcurBand,     // the bin the pose is on (-1: none), whose sharpest the focus worker holds
+                        PcurBin,
+                        PviewW,
                         PviewH,
                         Pdensity,
                         PringHead,
@@ -303,7 +364,10 @@ class TCapApp : public TCapSink
                         PpreviewH,
                         PpropRatios,  // how many
                         Prooms;
-   float                PdoorPrevHeading, // heading of the door station's previous frame
+   float                PcamFps,          // the camera's native frame rate (smoothed)
+                        PfocusSec,        // the focus worker's net time per frame (smoothed): the capture cadence
+                        PkeepErr,         // the Bresenham error of the frames taken as candidates
+                        PdoorPrevHeading, // heading of the door station's previous frame
                         PpropCeilingM,    // the property's ceiling line from its doors (NaN until a door station measures it)
                         PpropRatioSum,    // the confirmed doors' crease-over-head ratios so far
                         PhfovDeg,
@@ -313,7 +377,7 @@ class TCapApp : public TCapSink
                         PhasLoc,
                         PhasPreview,
                         ProomOpen,
-                        PjobBusy,
+                        Palert,       // an orange bin or a gap: the camera thread vibrates on its next frame
                         PcompleteSignaled,
                         PfloorView,   // the corner station is on its floor view (after its fan)
                         Pmagnetic,
@@ -333,13 +397,20 @@ void TKeyframeWorker::DoJob(void)
 }
 
 //--------------------------------------------------------------------------------
-TCapApp::TCapApp(TCapPort *port) : Pport(port), Pencoder(appJPEGQuality), Pworker(*this), PjobMeta(), Pring(),
-   Pcam(), Pintr(), Ploc(), Pjob(), Pverdict(svCovered), PcenterCfg(), PcornerCfg(), PfloorCfg(),
+void TFocusWorker::DoJob(void)
+{
+   Papp.FocusPending();
+}
+
+//--------------------------------------------------------------------------------
+TCapApp::TCapApp(TCapPort *port) : Pport(port), Pencoder(appJPEGQuality), Pworker(*this), PfocusWorker(*this), Pslot(), Pring(),
+   Pcam(), Pintr(), Ploc(), Pverdict(svCovered), PcenterCfg(), PcornerCfg(), PfloorCfg(),
    PvanishCfg(TVanishConfig::Default()), PaxisCheck(cAxisTolDeg), PaxisVerdict(avNoLines), Pplan(), PguidePlan(), Pedges(),
-   PfocusAim(faLevel), PfocusWant(faLevel), PfocusTries(0), PfocusBand(0), PcornerStep(0), PcornerCount(4), PcornerSlot(0), PcornerMask(0u), PbinAxis(), PbinDone(), PbinOrange(), PbinBlur(), PbinTries(), PbinStamp(), Psuperseded(), ProomBlur(), ProomBlurCount(0), PsupersededCount(0), PguideCount(0), PdoorCount(0), PplanDoorCount(0), PdoorIdx(0), PdoorCand(), PplanDoors(), PdoorEye(), PguideDeg(), PguideAt(), PguideConvex(), PplanWanted(false), PplanSketch(false), Pphase(rpNone), Pstation(), PbtnMain(), PbtnFinish(), PjobStampNs(0u), PfocusNs(0u), PbackArmedNs(0u), PdoorShotNs(0u), PdoorPrevNs(0u), PkeySeq(0u),
-   PstationCount(0u), ProomIndex(0u), PviewW(0), PviewH(0), Pdensity(256), PringHead(0), PringCount(0), PpreviewH(0), PpropRatios(0), Prooms(0), PdoorPrevHeading(0.f), PpropCeilingM(NAN), PpropRatioSum(0.f), PhfovDeg(60.f),
+   PfocusAim(faLevel), PfocusWant(faLevel), PfocusTries(0), PfocusBand(0), PcornerStep(0), PcornerCount(4), PcornerSlot(0), PcornerMask(0u), PbinAxis(), PbinDone(), PbinOrange(), PbinGap(), PbinBlur(), PbinTries(), PbinStamp(), Psuperseded(), ProomBlur(), ProomBlurCount(0), PsupersededCount(0), PguideCount(0), PdoorCount(0), PplanDoorCount(0), PdoorIdx(0), PdoorCand(), PplanDoors(), PdoorEye(), PguideDeg(), PguideAt(), PguideConvex(), PplanWanted(false), PplanSketch(false), Pphase(rpNone), Pstation(), PbtnMain(), PbtnFinish(), PlastFrameNs(0u), PfocusNs(0u), PbackArmedNs(0u), PdoorShotNs(0u), PdoorPrevNs(0u), PkeySeq(0u),
+   PstationCount(0u), ProomIndex(0u), Pchosen(), PchosenHead(0), PchosenCount(0), PcurBand(-1), PcurBin(-1),
+   PviewW(0), PviewH(0), Pdensity(256), PringHead(0), PringCount(0), PpreviewH(0), PpropRatios(0), Prooms(0), PcamFps(30.f), PfocusSec(0.3f), PkeepErr(0.f), PdoorPrevHeading(0.f), PpropCeilingM(NAN), PpropRatioSum(0.f), PhfovDeg(60.f),
    PvfovDeg(60.f), PcamReady(false), PlocAllowed(false), PhasLoc(false), PhasPreview(false),
-   ProomOpen(false), PjobBusy(false), PcompleteSignaled(false), PfloorView(false), Pmagnetic(false), PsensorFresh(true),
+   ProomOpen(false), Palert(false), PcompleteSignaled(false), PfloorView(false), Pmagnetic(false), PsensorFresh(true),
    Pfocusing(false), PfocusPending(false), PaheadDone(false), PposeOk(true)
 {
    ProomName[0] = '\0';
@@ -350,6 +421,8 @@ TCapApp::TCapApp(TCapPort *port) : Pport(port), Pencoder(appJPEGQuality), Pworke
 //--------------------------------------------------------------------------------
 TCapApp::~TCapApp(void)
 {
+   PfocusWorker.Terminate();
+   PfocusWorker.Join();
    Pworker.Terminate();
    Pworker.Join();
    Psession.Close(Pport->WallClockNs());
@@ -359,6 +432,7 @@ TCapApp::~TCapApp(void)
 void TCapApp::Launch(void)
 {
    Pworker.Start(thisInfo);
+   PfocusWorker.Start(thisInfo);
    Pport->SetSink(this);
    Pport->KeepScreenOn(true); // permissions are (re)checked on every OnResume
 }
@@ -464,10 +538,18 @@ void TCapApp::OnCameraReady(const TCamInfo &info)
    PpreviewH = appPreviewW*portraitH/portraitW;
    {
       TAlloc<DWORD> preview((size_t)appPreviewW*PpreviewH);
-      TAlloc<BYTE>  planes((size_t)info.width*info.height*3u/2u + 16u);
 
       preview.Drop(Ppreview);
-      planes.Drop(PjobPlanes);
+      for (int s = 0; s < appSlots; s++) // the pipeline's slots, each a whole frame (kept when the camera comes back)
+      {
+         if (Pslot[s].planes())
+            continue;
+
+         TAlloc<BYTE> planes((size_t)info.width*info.height*3u/2u + 16u);
+
+         planes.Drop(Pslot[s].planes);
+         Pslot[s].state = (BYTE)ssFree;
+      }
    }
    if (!PedgeRays())
    {
@@ -611,13 +693,23 @@ void TCapApp::updatePreview(const TCamFrame &f)
 }
 
 //--------------------------------------------------------------------------------
-// Copies the frame planes for the worker (planar Y, U, V) and posts the encode
-void TCapApp::queueKeyframe(const TCamFrame &f, const TMat4 &pose, const TAttitude &a, bool floorFrame)
+/* Copies the frame into a free slot as a candidate of its bin (planar Y, U, V); direct: a floor-view or door shot,
+   passed on as it is; false when no slot is free */
+bool TCapApp::queueKeyframe(const TCamFrame &f, const TMat4 &pose, const TAttitude &a, bool floorFrame, int band, int bin,
+                            bool direct)
 {
+   int slot = -1;
+
+   for (int s = 0; s < appSlots && slot < 0; s++)
+      slot = Pslot[s].state == (BYTE)ssFree && Pslot[s].planes() ? s : slot;
+   if (slot < 0)
+      return false;
+
+   TKeySlot        &k = Pslot[slot];
    const TYUVImage &src = f.yuv;
    int              cw = (src.width + 1)/2,
                     ch = (src.height + 1)/2;
-   LPBYTE           yDst = PjobPlanes(),
+   LPBYTE           yDst = k.planes(),
                     uDst = yDst + (size_t)src.width*src.height,
                     vDst = uDst + (size_t)cw*ch;
 
@@ -632,60 +724,272 @@ void TCapApp::queueKeyframe(const TCamFrame &f, const TMat4 &pose, const TAttitu
          vDst[(size_t)row*cw + col] = src.v[si];
       }
 
-   Pjob = TImageRecord();
-   Pjob.width = (DWORD)src.width;
-   Pjob.height = (DWORD)src.height;
-   Pjob.format = pfJPEG;
-   Pjob.intr = Pintr;
+   k.rec = TImageRecord();
+   k.rec.width = (DWORD)src.width;
+   k.rec.height = (DWORD)src.height;
+   k.rec.format = pfJPEG;
+   k.rec.intr = Pintr;
    for (int i = 0; i < 5; i++)
-      Pjob.distortion[i] = Pcam.distortion[i];
-   Pjob.cameraToWorld = pose;
-   Pjob.compass.magneticDeg = a.magnetic ? geomHeadingDeg(pose.Forward()) : NAN;
-   Pjob.compass.trueDeg = NAN;
-   Pjob.compass.accuracyDeg = a.accuracyDeg;
-   PjobMeta = TFrameMeta();
-   Psession.SessionId(PjobMeta.sessionId);
-   PjobMeta.roomIndex = ProomIndex;
-   PjobMeta.seq = PkeySeq++;
-   PjobMeta.sensorNs = f.stampNs;
-   PjobMeta.wallNs = Pport->WallClockNs();
-   PjobMeta.cameraToWorld = pose;
-   PjobMeta.compass = Pjob.compass;
-   PjobMeta.headingRef = a.magnetic ? hrMagnetic : hrArbitrary;
-   PjobMeta.intr = Pintr;
+      k.rec.distortion[i] = Pcam.distortion[i];
+   k.rec.cameraToWorld = pose;
+   k.rec.compass.magneticDeg = a.magnetic ? geomHeadingDeg(pose.Forward()) : NAN;
+   k.rec.compass.trueDeg = NAN;
+   k.rec.compass.accuracyDeg = a.accuracyDeg;
+   k.meta = TFrameMeta();
+   Psession.SessionId(k.meta.sessionId);
+   k.meta.roomIndex = ProomIndex;
+   k.meta.seq = PkeySeq++;
+   k.meta.sensorNs = f.stampNs;
+   k.meta.wallNs = Pport->WallClockNs();
+   k.meta.cameraToWorld = pose;
+   k.meta.compass = k.rec.compass;
+   k.meta.headingRef = a.magnetic ? hrMagnetic : hrArbitrary;
+   k.meta.intr = Pintr;
    for (int i = 0; i < 5; i++)
-      PjobMeta.distortion[i] = Pcam.distortion[i];
-   PjobMeta.headingDeg = geomHeadingDeg(pose.Forward()); // as the tracker saw it (the door station has none)
-   PjobMeta.pitchDeg = geomPitchDeg(pose.Forward());
+      k.meta.distortion[i] = Pcam.distortion[i];
+   k.meta.headingDeg = geomHeadingDeg(pose.Forward()); // as the tracker saw it (the door station has none)
+   k.meta.pitchDeg = geomPitchDeg(pose.Forward());
 
    TVec3 fwd = pose.Forward();
 
-   PjobMeta.forward[0] = fwd.x; // the gyroscope attitude, explicit per frame: where it looks and how it is rolled
-   PjobMeta.forward[1] = fwd.y;
-   PjobMeta.forward[2] = fwd.z;
-   PjobMeta.rollDeg = geomRollDeg(pose);
-   PjobMeta.spinBand = (BYTE)(floorFrame ? appFloorBand : (Pphase == rpDoor ? 0 : Pspin->LastKeptBand())); // floor view: own band
-   PjobMeta.spinBin = (BYTE)(floorFrame ? 0 : (Pphase == rpDoor ? PdoorIdx : Pspin->LastKeptBin())); // door station: the door
-   PjobMeta.stationIndex = (BYTE)Pstation.index;
-   PjobMeta.stationKind = (BYTE)Pstation.kind;
-   PjobMeta.cornerIndex = Pstation.kind == skCorner ? Pstation.corner : 0u;
-   PjobMeta.targetCorner = Pstation.kind == skCorner ? Pstation.target : 0u;
-   PjobMeta.focalMm = Pcam.focalMm;
+   k.meta.forward[0] = fwd.x; // the gyroscope attitude, explicit per frame: where it looks and how it is rolled
+   k.meta.forward[1] = fwd.y;
+   k.meta.forward[2] = fwd.z;
+   k.meta.rollDeg = geomRollDeg(pose);
+   k.meta.spinBand = (BYTE)(floorFrame ? appFloorBand : (Pphase == rpDoor ? 0 : band)); // floor view: own band
+   k.meta.spinBin = (BYTE)(floorFrame ? 0 : (Pphase == rpDoor ? PdoorIdx : bin)); // door station: the door
+   k.meta.stationIndex = (BYTE)Pstation.index;
+   k.meta.stationKind = (BYTE)Pstation.kind;
+   k.meta.cornerIndex = Pstation.kind == skCorner ? Pstation.corner : 0u;
+   k.meta.targetCorner = Pstation.kind == skCorner ? Pstation.target : 0u;
+   k.meta.focalMm = Pcam.focalMm;
    if (PhasLoc)
    {
-      PjobMeta.latE7 = Ploc.latE7;
-      PjobMeta.lonE7 = Ploc.lonE7;
-      PjobMeta.altMm = Ploc.altMm;
-      PjobMeta.horizAccMm = Ploc.horizAccMm;
-      PjobMeta.fixAgeNs = f.stampNs > Ploc.fixNs ? f.stampNs - Ploc.fixNs : 0u;
+      k.meta.latE7 = Ploc.latE7;
+      k.meta.lonE7 = Ploc.lonE7;
+      k.meta.altMm = Ploc.altMm;
+      k.meta.horizAccMm = Ploc.horizAccMm;
+      k.meta.fixAgeNs = f.stampNs > Ploc.fixNs ? f.stampNs - Ploc.fixNs : 0u;
    }
-   PjobStampNs = f.stampNs;
-   PjobBusy = true;
-   Pworker.Post();
+   k.stamp = f.stampNs;
+   k.band = band;
+   k.bin = bin;
+   k.direct = direct;
+
+   // measured where its band focuses: the ceiling's triangle, the floor's, the level strip (a direct shot: the lens's aim)
+   float     pitch = !direct && Pspin && band >= 0 ? Pspin->BandPitchDeg(band) : 0.f;
+   TFocusAim aim = direct ? PfocusAim : (pitch > 5.f ? faCeiling : (pitch < -5.f ? faFloor : faLevel));
+
+   k.focusCount = focusRects(aim, k.focus);
+   k.state = (BYTE)ssCandidate;
+   return true;
+}
+
+//--------------------------------------------------------------------------------
+int TCapApp::freeSlots(void) const
+{
+   int n = 0;
+
+   for (int s = 0; s < appSlots; s++)
+      n += Pslot[s].state == (BYTE)ssFree && Pslot[s].planes() ? 1 : 0;
+   return n;
+}
+
+//--------------------------------------------------------------------------------
+// No frame anywhere in the pipeline (the plan waits for the last verdicts)
+bool TCapApp::pipelineIdle(void) const
+{
+   for (int s = 0; s < appSlots; s++)
+      if (Pslot[s].state != (BYTE)ssFree)
+         return false;
+   return true;
+}
+
+//--------------------------------------------------------------------------------
+// The bin still takes candidates: a frame of it waits in the pipeline, the keyframe worker not yet on it
+bool TCapApp::binLive(int band, int bin) const
+{
+   for (int s = 0; s < appSlots; s++)
+   {
+      const TKeySlot &k = Pslot[s];
+
+      if (k.state != (BYTE)ssFree && k.state != (BYTE)ssFinal && !k.direct && k.band == band && k.bin == bin)
+         return true;
+   }
+   return false;
+}
+
+/*--------------------------------------------------------------------------------
+   The sharpness of a slot on its focus regions only (user, 2026-09-28): each region measured on its
+   own, grown around its center to what the blur tiles need, the median over all their textured
+   tiles; no regions: the whole frame.
+  --------------------------------------------------------------------------------*/
+static void focusBlur(const TKeySlot &k, TBlurResult &out)
+{
+   int   w = (int)k.rec.width,
+         h = (int)k.rec.height,
+         n = 0,
+         tiles = 0;
+   float v[(int)appFocusRects*(int)blurGridSide*(int)blurGridSide],
+         sharp = NAN;
+
+   out = TBlurResult();
+   if (k.focusCount <= 0)
+   {
+      blurMeasure(k.planes(), w, h, w, out);
+      return;
+   }
+   for (int r = 0; r < k.focusCount && r < appFocusRects; r++)
+   {
+      const float *q = k.focus + 4*r;
+      int          cx = (int)(0.5f*(q[0] + q[2])*(float)w),
+                   cy = (int)(0.5f*(q[1] + q[3])*(float)h),
+                   rw = (int)((q[2] - q[0])*(float)w),
+                   rh = (int)((q[3] - q[1])*(float)h);
+
+      rw = rw < appFocusMeasurePx ? appFocusMeasurePx : rw;
+      rh = rh < appFocusMeasurePx ? appFocusMeasurePx : rh;
+      rw = rw > w ? w : rw;
+      rh = rh > h ? h : rh;
+
+      int         x0 = cx - rw/2,
+                  y0 = cy - rh/2;
+      TBlurResult part;
+
+      x0 = x0 < 0 ? 0 : (x0 + rw > w ? w - rw : x0);
+      y0 = y0 < 0 ? 0 : (y0 + rh > h ? h - rh : y0);
+      blurMeasure(k.planes() + (size_t)y0*w + x0, rw, rh, w, part);
+      tiles += part.tiles;
+      for (int t = 0; t < blurGridSide*blurGridSide; t++)
+         if (!isnan(part.tilePx[t]))
+         {
+            v[n++] = part.tilePx[t];
+            sharp = isnan(sharp) || part.tilePx[t] < sharp ? part.tilePx[t] : sharp;
+         }
+   }
+   for (int i = 1; i < n; i++) // the median
+   {
+      float x = v[i];
+      int   j = i - 1;
+
+      while (j >= 0 && v[j] > x)
+      {
+         v[j + 1] = v[j];
+         j--;
+      }
+      v[j + 1] = x;
+   }
+   for (int t = 0; t < blurGridSide*blurGridSide; t++)
+      out.tilePx[t] = t < n ? v[t] : NAN;
+   out.tiles = tiles;
+   out.textured = n;
+   out.sharpPx = sharp;
+   out.medianPx = !n ? NAN : (n%2 ? v[n/2] : 0.5f*(v[n/2 - 1] + v[n/2]));
 }
 
 //--------------------------------------------------------------------------------
 void TCapApp::EncodePending(void)
+{
+   while (encodeOne())
+      ;
+}
+
+/*--------------------------------------------------------------------------------
+   The focus worker (user, 2026-09-28): each candidate, oldest first, its focus measured (the blur
+   of the raw luma) and compared with the frame its bin holds - none held is focus 0: the first
+   frame always enters; the sharper one stays, the other's slot is freed. A bin the keyframe worker
+   has begun (its slot final, set under the mutex) is no longer updated. What a bin holds goes on
+   to the keyframe worker once the pose leaves it; a door or floor-view shot goes on as it is.
+  --------------------------------------------------------------------------------*/
+void TCapApp::FocusPending(void)
+{
+   for (;;)
+   {
+      int   id = -1;
+      QWORD started = Pport->SensorClockNs();
+
+      {
+         TMutexLock lock(Pmutex, thisInfo);
+
+         for (int s = 0; s < appSlots; s++)
+            if (Pslot[s].state == (BYTE)ssCandidate && (id < 0 || Pslot[s].stamp < Pslot[id].stamp))
+               id = s;
+         if (id >= 0)
+            Pslot[id].state = (BYTE)ssMeasuring;
+      }
+      if (id >= 0) // the slot stays put while measuring: no lock
+      {
+         TKeySlot &k = Pslot[id];
+
+         focusBlur(k, k.blur);
+      }
+      {
+         TMutexLock lock(Pmutex, thisInfo);
+
+         if (id >= 0)
+         {
+            TKeySlot &k = Pslot[id];
+            int       rival = -1;
+            bool      locked = false; // the keyframe worker began the bin: it stays as it is
+
+            for (int s = 0; s < appSlots && !k.direct; s++)
+            {
+               const TKeySlot &o = Pslot[s];
+
+               if (s == id || o.direct || o.band != k.band || o.bin != k.bin)
+                  continue;
+               if (o.state == (BYTE)ssFinal)
+                  locked = true;
+               else if (o.state == (BYTE)ssHeld || o.state == (BYTE)ssChosen)
+                  rival = s;
+            }
+
+            float px = isnan(k.blur.medianPx) ? 1e8f : k.blur.medianPx,
+                  heldPx = rival >= 0 && !isnan(Pslot[rival].blur.medianPx) ? Pslot[rival].blur.medianPx : 1e8f;
+
+            if (k.direct)
+               k.state = (BYTE)ssHeld; // passed on below
+            else if (locked || (rival >= 0 && px >= heldPx))
+               k.state = (BYTE)ssFree;
+            else if (rival < 0)
+               k.state = (BYTE)ssHeld;
+            else
+            {
+               k.state = Pslot[rival].state; // takes the rival's place, in the keyframe worker's queue too
+               for (int i = 0; i < PchosenCount; i++)
+                  if (Pchosen[(PchosenHead + i)%appSlots] == rival)
+                     Pchosen[(PchosenHead + i)%appSlots] = id;
+               Pslot[rival].state = (BYTE)ssFree;
+            }
+            PfocusSec = 0.8f*PfocusSec + 0.2f*(float)(Pport->SensorClockNs() - started)*1e-9f; // the capture cadence
+         }
+
+         bool passed = false;
+
+         for (int s = 0; s < appSlots; s++) // the bins the pose left go on
+         {
+            TKeySlot &k = Pslot[s];
+
+            if (k.state == (BYTE)ssHeld && PchosenCount < appSlots && (k.direct || k.band != PcurBand || k.bin != PcurBin
+                                                                   || PlastFrameNs > k.stamp + (QWORD)appHoldMs*1000000u))
+            {
+               k.state = (BYTE)ssChosen;
+               Pchosen[(PchosenHead + PchosenCount)%appSlots] = s;
+               PchosenCount++;
+               passed = true;
+            }
+         }
+         if (passed)
+            Pworker.Post();
+         if (id < 0)
+            return;
+      }
+   }
+}
+
+//--------------------------------------------------------------------------------
+// One chosen frame through the final measures, the storage and the bins' state; false when none waits
+bool TCapApp::encodeOne(void)
 {
    TYUVImage     img;
    TImageRecord  rec;
@@ -693,57 +997,62 @@ void TCapApp::EncodePending(void)
    TVanishResult vr;
    TVanishRecord vrec = {};
    TVanishConfig tuned = PvanishCfg;
+   TBlurResult   blur;
    QWORD         stamp;
-   bool          measured;
+   int           slot;
+   bool          measured,
+                 alert = false; // this frame turned its bin orange or left a gap in its band
 
    {
       TMutexLock lock(Pmutex, thisInfo);
 
-      if (!PjobBusy)
-         return;
+      if (!PchosenCount)
+         return false;
+      slot = Pchosen[PchosenHead];
+      PchosenHead = (PchosenHead + 1)%appSlots;
+      PchosenCount--;
 
-      int cw = ((int)Pjob.width + 1)/2,
-          ch = ((int)Pjob.height + 1)/2;
+      TKeySlot &k = Pslot[slot];
+      int       cw = ((int)k.rec.width + 1)/2,
+                ch = ((int)k.rec.height + 1)/2;
 
-      img.width = (int)Pjob.width;
-      img.height = (int)Pjob.height;
-      img.y = PjobPlanes();
+      k.state = (BYTE)ssFinal;
+      img.width = (int)k.rec.width;
+      img.height = (int)k.rec.height;
+      img.y = k.planes();
       img.yStride = img.width;
       img.u = img.y + (size_t)img.width*img.height;
       img.v = img.u + (size_t)cw*ch;
       img.uvRowStride = cw;
       img.uvPixelStride = 1;
-      rec = Pjob;
-      meta = PjobMeta;
-      stamp = PjobStampNs;
+      rec = k.rec;
+      meta = k.meta;
+      stamp = k.stamp;
+      blur = k.blur; // the focus worker's measure
 
       TEXIFInfo exif = {};
 
       snprintf(exif.model, sizeof(exif.model), "%s", PdevModel);
-      snprintf(exif.software, sizeof(exif.software), "Aeroblox LiDAR 0.1.0");
-      exif.wallNs = PjobMeta.wallNs;
-      exif.orientation = exifOrientation(PjobMeta.cameraToWorld);
-      exif.focalMm = PjobMeta.focalMm;
-      exif.width = Pjob.width;
-      exif.height = Pjob.height;
-      exif.hasGPS = PjobMeta.horizAccMm != 0u;
-      exif.latE7 = PjobMeta.latE7;
-      exif.lonE7 = PjobMeta.lonE7;
-      exif.altMm = PjobMeta.altMm;
+      snprintf(exif.software, sizeof(exif.software), "Sorena LiDAR 0.1.0");
+      exif.wallNs = meta.wallNs;
+      exif.orientation = exifOrientation(meta.cameraToWorld);
+      exif.focalMm = meta.focalMm;
+      exif.width = rec.width;
+      exif.height = rec.height;
+      exif.hasGPS = meta.horizAccMm != 0u;
+      exif.latE7 = meta.latE7;
+      exif.lonE7 = meta.lonE7;
+      exif.altMm = meta.altMm;
       Pexif.Clear();
       exifBuild(exif, Pexif);
    }
 
-   // the planes stay put while the job is busy: detect without holding the camera thread
+   // the slot stays put while it is final: detect without holding the camera thread
    PtiltBias.Apply(tuned);
    measured = vanishDetect(img.y, img.width, img.height, img.yStride, rec.intr, rec.cameraToWorld, tuned, vr,
                            &Pedges);
    if (measured)
       PtiltBias.Add(vr);
-
-   TBlurResult blur = {};
-
-   blurMeasure(img.y, img.width, img.height, img.yStride, blur); // on the raw luma, before JPEG
 
    /* doors on the walls the frame shows (both when aimed at a corner: a door on the wall seen sideways is only upright
       in that wall's frontal view): candidates for the door station, which the operator confirms */
@@ -847,11 +1156,31 @@ void TCapApp::EncodePending(void)
                it) or blurred beyond the floor: autofocus still converging, a shaken hand */
             PbinOrange[band][bin] = (!floorFrame && binOffAxis(band, bin))
                                     || (!isnan(blur.medianPx) && blur.medianPx > blurFloorPx(cBlurOrangeRel, cBlurMaxPx));
+            alert = PbinOrange[band][bin];
          }
          else
          {
             elect.electedNs = PbinStamp[band][bin]; // a retake that was no sharper: it loses to the bin's photo
             elect.supersededNs = stamp;
+         }
+
+         /* a gap: an empty bin between two done ones of the band (around the whole circle on the center spin, along
+            the fan on a corner) - the turn skipped it; signaled once (user, 2026-09-28: vibrate on orange or a gap) */
+         int  bins = Pspin ? Pspin->HeadingBins() : 0;
+         bool ring = meta.stationKind == (BYTE)skCenter;
+
+         for (int b = 0; b < bins && !floorFrame; b++)
+         {
+            int prev = ring ? (b + bins - 1)%bins : b - 1,
+                next = ring ? (b + 1)%bins : b + 1;
+
+            if (PbinDone[band][b] || PbinGap[band][b] || prev < 0 || next >= bins)
+               continue;
+            if (PbinDone[band][prev] && PbinDone[band][next])
+            {
+               PbinGap[band][b] = true;
+               alert = true;
+            }
          }
          Psession.WriteElect(stamp, elect);
          if (elect.supersededNs && PsupersededCount < appMaxSuperseded)
@@ -884,12 +1213,15 @@ void TCapApp::EncodePending(void)
    {
       TMutexLock lock(Pmutex, thisInfo);
 
-      PjobBusy = false;
+      Pslot[slot].state = (BYTE)ssFree;
+      if (alert)
+         Palert = true;
       checkComplete(); // the verdict of this frame may be the last one the station waited for
-      if (PplanWanted)
+      if (PplanWanted && pipelineIdle())
          solvePlan(); // the keyframe that closed the center spin is in: the plan can be made
    }
    Pport->RequestPaint();
+   return true;
 }
 
 /*--------------------------------------------------------------------------------
@@ -897,18 +1229,30 @@ void TCapApp::EncodePending(void)
    left whole rooms 4.5-6 px blurred (093519). No keyframe is kept while the lens moves.
    The region follows what the pose is after (user, 2026-09-27): toward the ceiling, the triangle of
    the upright view touching both top corners and the center (the creases sit at the walls' distance,
-   almost never hidden); toward the floor, the same triangle upside down; level, the middle only
-   (desks and screens crowd the edges). A triangle goes as three bands, narrower toward its apex,
-   the middle one first (a camera that takes one region keeps that).
+   almost never hidden); toward the floor, the same triangle upside down; level, a horizontal strip
+   across the middle (user, 2026-09-28). A triangle goes as three bands, narrower toward its apex,
+   the middle one first (a camera that takes one region keeps that). The focus worker measures the
+   sharpness on the same regions, the rest of the image ignored (user, 2026-09-28).
   --------------------------------------------------------------------------------*/
 void TCapApp::requestFocus(TFocusAim aim)
 {
+   float rects[4*appFocusRects];
+   int   count = focusRects(aim, rects);
+
+   PfocusAim = aim;
+   PfocusTries++;
+   Pfocusing = PcamReady && Pport->Autofocus(rects, count);
+   PfocusNs = Pport->SensorClockNs();
+}
+
+//--------------------------------------------------------------------------------
+// The focus regions of an aim, normalized native image rectangles (x0, y0, x1, y1 each); how many
+int TCapApp::focusRects(TFocusAim aim, float *rects) const
+{
    const float band[3][2] = { { 0.17f, 0.32f }, { 0.02f, 0.17f }, { 0.32f, 0.47f } }; // from the anchoring edge
-   float       rects[12];
    int         rot = ((Pcam.sensorRotDeg%360) + 360)%360,
                count = aim == faLevel ? 1 : 3;
 
-   PfocusAim = aim;
    for (int i = 0; i < count; i++)
    {
       float v0 = aim == faFloor ? 1.f - band[i][1] : band[i][0],
@@ -919,8 +1263,8 @@ void TCapApp::requestFocus(TFocusAim aim)
 
       if (aim == faLevel)
       {
-         u0 = 0.5f - cFocusLevelHalf;
-         u1 = 0.5f + cFocusLevelHalf;
+         u0 = cFocusLevelSide;
+         u1 = 1.f - cFocusLevelSide;
          v0 = 0.5f - cFocusLevelHalf;
          v1 = 0.5f + cFocusLevelHalf;
       }
@@ -956,9 +1300,7 @@ void TCapApp::requestFocus(TFocusAim aim)
          rects[base + 3] = v1;
       }
    }
-   PfocusTries++;
-   Pfocusing = PcamReady && Pport->Autofocus(rects, count);
-   PfocusNs = Pport->SensorClockNs();
+   return count;
 }
 
 /*--------------------------------------------------------------------------------
@@ -995,9 +1337,26 @@ void TCapApp::OnFrame(const TCamFrame &frame)
    TMutexLock lock(Pmutex, thisInfo);
    TAttitude  a;
 
+   if (Palert) // the encoder's verdict asks for a look back (JNI calls stay on this thread)
+   {
+      Palert = false;
+      Pport->Vibrate(appAlertMs);
+   }
    if (!PcamReady || frame.yuv.width != Pcam.width || frame.yuv.height != Pcam.height)
       return;
    updatePreview(frame);
+   if (PlastFrameNs && frame.stampNs > PlastFrameNs) // the camera's native rate, smoothed: the capture cadence's base
+   {
+      float dt = (float)(frame.stampNs - PlastFrameNs)*1e-9f;
+
+      if (dt > 1e-3f && dt < 1.f)
+         PcamFps = 0.95f*PcamFps + 0.05f/dt;
+   }
+   PlastFrameNs = frame.stampNs;
+
+   int curBand = -1, // the bin the pose is on (none off a spin: what the bins hold goes on)
+       curBin = -1;
+
    if ((Pphase == rpCenter || Pphase == rpCorner) && Pspin && attitudeAt(frame.stampNs, a))
    {
       TMat4 pose = poseOf(a);
@@ -1029,8 +1388,8 @@ void TCapApp::OnFrame(const TCamFrame &frame)
                                                      : (Pspin->BandPitchDeg(guided) < -5.f ? faFloor : faLevel));
       }
 
-      // busy or focusing: observe only, never mark a bin we cannot save sharp
-      Pverdict = Pspin->Offer(frame.stampNs, pose, a.accuracyDeg, !PjobBusy && !Pfocusing && !PfocusPending);
+      // no free slot or focusing: observe only, never mark a bin we cannot save sharp
+      Pverdict = Pspin->Offer(frame.stampNs, pose, a.accuracyDeg, freeSlots() > 0 && !Pfocusing && !PfocusPending);
       PposeOk = Pspin->PoseAllowed();
 
       // a pending focus runs once the pose sits in its band and holds still: the aim is then what will be captured
@@ -1039,10 +1398,29 @@ void TCapApp::OnFrame(const TCamFrame &frame)
          PfocusPending = false;
          requestFocus(PfocusWant);
       }
+
+      /* a kept bin's first frame always enters (silent: only an orange bin or a gap vibrates); while the pose holds on
+         a bin still open in the pipeline, more candidates follow at the focus worker's own pace - the keyframe worker
+         never slows the camera - the frames between skipped by a Bresenham on the camera's rate (user, 2026-09-28: the
+         skip adapts, evenly, nothing wasted), only while appSlotReserve slots stay free (the next bin's first frame
+         never waits: no gap for a sharper candidate) */
+      if (!PfloorView)
+         Pspin->Locate(curBand, curBin);
       if (Pverdict == svKeep)
       {
-         queueKeyframe(frame, pose, a, PfloorView);
-         Pport->Vibrate(15);
+         PkeepErr = 0.f;
+         if (queueKeyframe(frame, pose, a, PfloorView, Pspin->LastKeptBand(), Pspin->LastKeptBin(), PfloorView))
+            PfocusWorker.Post();
+      }
+      else if (curBand >= 0 && binLive(curBand, curBin))
+      {
+         PkeepErr = fminf(1.f, PkeepErr + 1.f/fmaxf(1.f, PfocusSec*PcamFps)); // frames taken per camera frame
+         if (PkeepErr >= 1.f && Pverdict != svTooFast && !Pfocusing && freeSlots() > appSlotReserve
+             && queueKeyframe(frame, pose, a, false, curBand, curBin, false))
+         {
+            PkeepErr -= 1.f;
+            PfocusWorker.Post();
+         }
       }
 
       /* tilted down during a corner's fan: aimed at the room's middle it is the floor view, taken now instead of in
@@ -1052,14 +1430,14 @@ void TCapApp::OnFrame(const TCamFrame &frame)
       {
          Pahead->AimFan(floorViewHeadingDeg());
 
-         TSpinVerdict fv = Pahead->Offer(frame.stampNs, pose, a.accuracyDeg, !PjobBusy && !Pfocusing && !PfocusPending);
+         TSpinVerdict fv = Pahead->Offer(frame.stampNs, pose, a.accuracyDeg, freeSlots() > 0 && !Pfocusing && !PfocusPending);
 
          PposeOk = fv != svOffBand && fv != svOutside;
          if (fv == svKeep)
          {
             PaheadDone = true;
-            queueKeyframe(frame, pose, a, true);
-            Pport->Vibrate(15);
+            if (queueKeyframe(frame, pose, a, true, -1, -1, true)) // one frame, as it is
+               PfocusWorker.Post();
          }
       }
       if (Pverdict == svKeep)
@@ -1086,13 +1464,20 @@ void TCapApp::OnFrame(const TCamFrame &frame)
          PfocusPending = false;
          requestFocus(PfocusWant);
       }
-      if (PposeOk && rate <= cDoorSteadyDps && !PjobBusy && !Pfocusing && !PfocusPending && PdoorIdx >= 0
+      if (PposeOk && rate <= cDoorSteadyDps && pipelineIdle() && !Pfocusing && !PfocusPending && PdoorIdx >= 0
           && frame.stampNs - PdoorShotNs > (QWORD)appDoorShotMs*1000000u)
       {
          PdoorShotNs = frame.stampNs;
-         queueKeyframe(frame, pose, a, false);
+         if (queueKeyframe(frame, pose, a, false, -1, -1, true)) // one frame: the detector judges each shot before the next
+            PfocusWorker.Post();
          Pport->Vibrate(15);
       }
+   }
+   if (curBand != PcurBand || curBin != PcurBin) // the pose left a bin: its sharpest goes on to the keyframe worker
+   {
+      PcurBand = curBand;
+      PcurBin = curBin;
+      PfocusWorker.Post();
    }
    Pport->RequestPaint();
 }
@@ -1135,6 +1520,7 @@ void TCapApp::beginFloorView(void)
    PfloorView = true;
    memset(PbinDone, 0, sizeof(PbinDone));
    memset(PbinOrange, 0, sizeof(PbinOrange));
+   memset(PbinGap, 0, sizeof(PbinGap));
    memset(PbinTries, 0, sizeof(PbinTries));
    Pverdict = svCovered;
    PfocusTries = 0;
@@ -1739,6 +2125,7 @@ void TCapApp::beginStation(TStationKind kind)
    Pphase = kind == skCenter ? rpCenter : rpCorner;
    memset(PbinDone, 0, sizeof(PbinDone));
    memset(PbinOrange, 0, sizeof(PbinOrange));
+   memset(PbinGap, 0, sizeof(PbinGap));
    memset(PbinTries, 0, sizeof(PbinTries));
    PcompleteSignaled = false;
    PfloorView = false;
@@ -1773,7 +2160,7 @@ void TCapApp::stationDone(void)
    if (wasCenter)
    {
       PplanWanted = true;
-      if (!PjobBusy)
+      if (pipelineIdle())
          solvePlan(); // otherwise the worker solves once the closing keyframe is in
    }
    if (!wasCenter && PcornerStep + 1 >= PcornerCount)
@@ -2071,7 +2458,7 @@ void TCapApp::hintText(LPSTR out, size_t cap) const
          left += PplanDoors[i].state == 0u ? 1 : 0;
       if (!PposeOk)
          snprintf(out, cap, "Deixe a câmera na horizontal");
-      else if (PjobBusy)
+      else if (!pipelineIdle())
          snprintf(out, cap, "Segure: conferindo a porta");
       else
       {
@@ -2137,11 +2524,17 @@ void TCapApp::hintText(LPSTR out, size_t cap) const
    }
    if (Pverdict == svOffBand && spin->GuidedBand() >= 0 && spin->BandCount() > 1) // the red view of the center spin
    {
-      float  target = spin->BandPitchDeg(spin->GuidedBand());
+      int    guided = spin->GuidedBand(),
+             side = spin->PitchSide(guided, spin->LastPitchDeg());
+      float  target = spin->BandPitchDeg(guided);
       LPCSTR what = target > 0.f ? "linha do teto" : (target < 0.f ? "linha do piso" : "paredes");
 
-      snprintf(out, cap, spin->LastPitchDeg() < target ? "Incline para cima (%s)" : "Incline para baixo (%s)", what);
-      return;
+      // red only for a reason the pitch explains: outside the band's range, toward its nearest edge
+      if (side != 0)
+      {
+         snprintf(out, cap, side < 0 ? "Incline para cima (%s)" : "Incline para baixo (%s)", what);
+         return;
+      }
    }
    switch (Pverdict)
    {
@@ -2166,7 +2559,7 @@ void TCapApp::hintText(LPSTR out, size_t cap) const
    int aimBand,
        aimBin;
 
-   if (PjobBusy && spin->AimedEmpty(aimBand, aimBin))
+   if (freeSlots() == 0 && spin->AimedEmpty(aimBand, aimBin))
    {
       snprintf(out, cap, "Segure: processando a foto anterior");
       return;
@@ -2181,11 +2574,13 @@ void TCapApp::hintText(LPSTR out, size_t cap) const
       best--;
    if (spin->BandCount() > 1 && spin->BandFilled(best) < spin->HeadingBins())
    {
+      // a nudge only outside the band's accepted pitches (user, 2026-09-28: inside them it misled the operator)
       float target = spin->BandPitchDeg(best);
+      int   side = spin->PitchSide(best, pitch);
 
-      if (pitch < target - 8.f)
+      if (side < 0)
          snprintf(out, cap, "Incline para cima (%s)", target > 0.f ? "linha do teto" : "paredes");
-      else if (pitch > target + 8.f)
+      else if (side > 0)
          snprintf(out, cap, "Incline para baixo (%s)", target < 0.f ? "linha do piso" : "paredes");
       else
          snprintf(out, cap, "Gire devagar no lugar");
@@ -2855,7 +3250,7 @@ void TCapApp::drawCoverage(TSurface &s, int cx, int cy, int radius)
 
    int  aimBand = -1,
         aimBin = -1;
-   bool busy = PjobBusy && Pspin->AimedEmpty(aimBand, aimBin);
+   bool busy = freeSlots() == 0 && Pspin->AimedEmpty(aimBand, aimBin);
 
    for (int b = 0; b < bands; b++)
    {
@@ -2945,6 +3340,13 @@ void TCapApp::drawCoverage(TSurface &s, int cx, int cy, int radius)
    canvasLine(s, cx + fw, fy - fh, cx + fw, fy + fh, scaleDp(2), aim);
    canvasLine(s, cx + fw, fy + fh, cx - fw, fy + fh, scaleDp(2), aim);
    canvasLine(s, cx - fw, fy + fh, cx - fw, fy - fh, scaleDp(2), aim);
+
+   /* the camera's own heading as a vertical taller than the box (user, 2026-09-28): the bin it crosses is the one
+      the next photo fills or retakes */
+   int lineTop = (fy - fh < yTop ? fy - fh : yTop) - scaleDp(14),
+       lineBottom = (fy + fh > yBottom ? fy + fh : yBottom) + scaleDp(14);
+
+   canvasLine(s, cx, lineTop, cx, lineBottom, scaleDp(2), aim);
    if (target >= 0 && bestGap > 95.f)
    {
       float d = fmodf(Pspin->BinCenterDeg(target, heading) - heading + 540.f, 360.f) - 180.f;

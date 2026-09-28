@@ -24,9 +24,12 @@ struct TMosaicFrame {
                 gyroZ;
    float        camX,    // camera center: its station plus the spin circle (meters, spin point at the origin)
                 camZ,
+                camY,    // camera height off the plan's (the corner fit sets it; 0 until then)
                 stationX, // where the operator stood (the center spin at the origin; corner stations adjusted)
                 stationZ;
    TIntrinsics  k;       // of the reduced picture
+   bool         xyz,     // its own picture measured the vertical and both room axes: only these enter the merge
+                picked;  // named by the user as a corner frame (--corner-frames): XYZ whatever the measures say
    int          w,
                 h,
                 index,   // keyframe number in the session
@@ -36,8 +39,15 @@ struct TMosaicFrame {
 
 /* Refines the frames (rounds against the others, bundle rounds with the geometry, optional joint rounds), writes
  * parede_K_<length>m.bmp; the refined plan is printed. frames[0, centers) are the center spin, the rest corner
- * stations (used by the bundle adjustment and the final composition only) */
+ * stations (used by the bundle adjustment and the final composition only). fixPlan: the bundle holds walls and camera
+ * height on the plan (only rotations, stations and spin radius move) */
 void mosaicWalls(TMosaicFrame *frames, int count, int centers, const TLayoutPlan &plan, int rounds,
-                 int bundleRounds, int jointRounds, float spinRadiusM, LPCSTR outDir);
+                 int bundleRounds, int jointRounds, float spinRadiusM, bool fixPlan, LPCSTR outDir);
+
+// Names the five target images for the components (--face-names "O,N,L,S,P": walls in plan order, then the floor)
+void mosaicSetFaceNames(LPCSTR list);
+
+// A face's name for files and prints: the user's (--face-names), else parede<K> / piso
+void mosaicFaceLabel(int face, LPSTR out, size_t cap);
 
 #endif // CAPMOSAIC_H

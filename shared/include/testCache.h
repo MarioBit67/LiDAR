@@ -121,33 +121,6 @@ static inline int abtcHashFileMeta(TAbtcSHA *sha, LPCSTR path)
 #endif
 }
 
-/* Fleet config as a GENERAL cache criterion (user directive 2026-07-31): the authoritative fleet file
-   (%ProgramData%\Aeroblox\abWorker\fleet_abworker.json) steers encode/decode yet is NOT a declared input of
-   any test - a fleet edit would otherwise leave every test on a STALE cache HIT (the enc4Aka fiddelta trap).
-   Fold its size+mtime into the SHA for EVERY test. Resolved WITHOUT configPath() (the cache check runs before
-   configInit) - mirrors fleetConfig.cpp's fleetPath() %ProgramData% default. ABSENT fleet => skip (do NOT
-   disable caching) so a station with no fleet replica still caches normally. Read-only stat: NEVER writes the
-   authoritative file. */
-
-//--------------------------------------------------------------------------------
-static inline void abtcHashFleet(TAbtcSHA *sha)
-{
-#if defined(_WIN32)
-   char   pd[512],
-          fleet[640];
-   DWORD  n    = GetEnvironmentVariableA("ProgramData", pd, (DWORD)sizeof pd);
-   LPCSTR base = (n > 0 && n < sizeof pd) ? pd : "C:\\ProgramData";
-
-   snprintf(fleet, sizeof fleet, "%s\\Aeroblox\\abWorker\\fleet_abworker.json", base);
-   abtcHashFileMeta(sha, fleet); // present => size+mtime enter the SHA; absent (-1) => skipped, still caches
-#else
-   (void)sha;
-#endif
-}
-
-/* Hash ONLY the .text section of a PE image at `path` (codegen signature, timestamp-independent).
-   Returns 0 ok, -1 on any parse/read failure (caller should treat failure as "cannot cache"). */
-
 //--------------------------------------------------------------------------------
 static inline int abtcHashPeText(TAbtcSHA *sha, LPCSTR path)
 {
@@ -281,8 +254,8 @@ typedef struct TAbTestCache
    int code() const { return cachedCode; }        // the cached exit code (valid on a hit)
 
    /* Nonce - THE seed for any per-run value a test would otherwise take from the clock or an RNG.
-      It is this run's cache key: 64 hex chars fingerprinting the exe, argv, declared inputs and the
-      fleet, or "" when caching is off (then the caller may fall back to a clock).
+      It is this run's cache key: 64 hex chars fingerprinting the exe, argv and the declared inputs,
+      or "" when caching is off (then the caller may fall back to a clock).
 
       🔴 WHY THIS EXISTS. A cache MEMOIZES A FUNCTION. If a test's result depends on something the key
       does not cover - a random LID, a time(NULL) payload, thread scheduling - it is not a function, and
@@ -358,7 +331,6 @@ static inline int abTestBegin(TAbTestCache *tc, int argc, LPSTR *argv,
          if (abtcHashFileMeta(&sha, inputs[i]) != 0) // size+mtime (near-instant), not content
             return 0; // a declared input is unreadable -> don't risk a stale cache
       }
-   abtcHashFleet(&sha); // GENERAL: any fleet-config edit invalidates every test cache (steers encode/decode)
    if (extra)           // caller feature fingerprint (e.g. TFrameCodec::FeatureDescriptor): a field/model/cs* change flips the SHA even when the exe .text does not relink
       abtcSHAUpdate(&sha, extra, strlen(extra));
    // declared external apps: exe .text + cmdline
