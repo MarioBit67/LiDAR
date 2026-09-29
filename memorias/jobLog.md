@@ -1498,3 +1498,50 @@ Entradas mais novas no fim.
     câmera/sensor pelo ponto de fuga vertical é −1,32/−0,70 grau.
   - Layout de pastas (usuário): o download vai para build/sessions/<sessão>/, com as saídas na raiz dela. Nunca
     pull/, nunca subpasta nova.
+- 2026-09-29 — Braço de alavanca na registração, passo A (usuário: "a paralaxe é um grau adicional de liberdade
+  que deveria ser explorado").
+  - Modelo: o centro de cada câmera é c = R o a partir do pivô do giro (a origem). o é um só para o giro, em eixos
+    da câmera. A profundidade vem da caixa da sala (paredes das faces, piso −cam, teto ceil − cam; inspectBoxHit).
+  - inspectPanoRound com a caixa: o raio de a parte do próprio centro, bate no plano e é visto do centro de b. Os
+    jacobianos: girar a leva o ponto pelo plano (P y = y − d (n y)/(n d)), girar b gira a visão, e há 3 incógnitas
+    do braço na mesma GN. Os centros entram também em inspectAlignSample, inspectFaceSplat e inspectFaceFrames.
+    Flags --no-lever e --lever-scan.
+  - Resultado na 162740: a GN convergiu para o = (−0,001; 0,003; 0,001) m, isto é, 3 mm. A varredura
+    (--lever-scan, o braço fixo em −0,4..0,4 m em cada eixo, rotações registradas de novo a 1/16) dá o mínimo em
+    0 nos três eixos (RMS 2,041; nos vizinhos 2,05–2,15). Mas a contagem de resíduos varia de 6,9 M a 13,3 M
+    conforme o braço, e isso contamina a comparação.
+  - Faces com o braço ≈ 0: resíduos iguais aos de antes (N 2,0 mm, L 0,7, S 1,1, O 3,1, P 3,0).
+  - EM ABERTO: os fantasmas das alças do armário (≈10 cm) exigem translação de ≈17 cm entre os quadros que se
+    sobrepõem, se forem paralaxe. Ou o celular gira quase no próprio lugar e os fantasmas têm outra causa
+    (distorção da lente não modelada, registração presa nas paredes), ou a métrica fotométrica não enxerga o braço.
+- 2026-09-29 — Distorção de barril pelas linhas retas (usuário: "estime a distorção com as linhas sabidamente retas,
+  como as de teto; se houver desvio nelas, temos barril, senão é desprezível"). capInspect --distortion.
+  - Em cada foto, a meia resolução: Sobel, afinamento, cadeias de orientação contínua com mais de 600 px (resolução
+    cheia) e curvatura abaixo de 3%. Ajuste de k1 e k2 (x_u = x_d (1 + k1 r² + k2 r⁴)) para que todas fiquem retas
+    ao mesmo tempo. As cadeias curvas ficam de fora pelo resíduo. Saída em distorcao_linhas.csv.
+  - 162740: 430 cadeias, 374 usadas, de 135 fotos. Retidão rms 1,13 px sem distorção e 1,03 px com o ajuste. As
+    cadeias perto das bordas já são tão retas quanto as do centro (0,93 contra 0,95 px). Não há assinatura de
+    barril; o k1 −0,048 e o k2 0,050 se compensam (ajuste mal condicionado, ganho de 0,1 px). CONCLUSÃO: a distorção
+    é desprezível, e o ISP do Moto provavelmente já a corrige.
+  - Com braço ≈ 0 e sem distorção, o modelo de um centro só não explica os fantasmas. Hipótese seguinte: a
+    translação é aleatória por quadro (o corpo e os braços oscilam alguns cm), não sistemática, por isso o braço
+    global e a razão de giro não a veem.
+- 2026-09-29 — Translação própria por quadro (3 incógnitas a mais por quadro na GN, com a caixa da sala como
+  profundidade, freio cPanoShiftPrior = 1e-2; colunas shiftX/Y/Z em faces_quadros.csv).
+  - 162740: deslocamentos com mediana de 7 mm, p90 de 2 cm e máximo de 5,4 cm. Médias por camada abaixo de 3 mm.
+    RMS fotométrico 1,934 → 1,921. Os fantasmas da face N continuam idênticos.
+  - Diagnóstico: os pares rejeitados pelo teto de 12 px agora vão para faces_pares.csv (tileX = −1).
+    - ~230 pares por rodada ficam de fora. Muitos têm NCC 0,7–0,9 com 15–30 px (6–12 cm) entre vizinhos da mesma
+      camada, por exemplo N 19-20 −25 px e L 34-35 −26 px.
+    - O quadro 19, dono das alças duplicadas, não tem nenhum par aceito em N. O alinhamento fino nunca o viu, mas
+      a composição o mistura.
+    - Sobrepondo 19 (vermelho) e 20 (ciano) retificados em N, o 20 fica ~27 px (11 cm) à direita no armário, e as
+      verticais do 20 inclinam 5,2 graus.
+  - Descartados como causa:
+    - rolling shutter: as fotos são tiradas quase paradas (giro médio de 2,9 graus/s) e a correlação entre
+      inclinação e giro é de 0,15;
+    - paralaxe: 11 cm entre 19 e 20 exigiria ~30 cm de base;
+    - distorção da lente (dia 29).
+  - O registrado bate com o giroscópio a menos de 0,3 grau entre 16 e 26 (fora o giro global de ~7 graus). Então a
+    rotação relativa 19/20 é a do giroscópio, e a imagem discorda dela em ~2,6 graus. Verticais inclinadas acima de
+    2 graus em 7 quadros de N e 6 de O (até 8 graus).

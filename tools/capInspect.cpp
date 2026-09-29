@@ -954,7 +954,10 @@ static LPCSTR inspectOutDir = NULL;
 static float  inspectFocalScale = 1.f; // --focal-scale: the lens's focal length against the app's (panorama and faces)
 static bool   inspectFaceFramesOn = false; // --face-frames: each frame rectified alone onto each face, a folder per face
 static const TVanishResult *inspectFrameVr = NULL; // each keyframe's vanishing measure (the main loop's), for the registration's check
-static bool                 inspectPlumbOn = true;  // --no-plumb: keep the registered tilt (no plumb from the vanishing points)
+static bool                 inspectPlumbOn = true,  // --no-plumb: keep the registered tilt (no plumb from the vanishing points)
+                            inspectLeverOn = true,  // --no-lever: every camera center at the pivot (pure rotation)
+                            inspectLeverScan = false; // --lever-scan: the registration's residual at trial levers (diagnosis)
+static TVec3                inspectLever = {};      // the camera center from the spin's pivot, camera axes (m): c = R o
 static float  inspectHiddenCeilingM = 2.7f,  // --hidden-heights H h: the room's ceiling and the camera height
               inspectHiddenCameraM = 1.49f;  // (defaults: the bedroom 064701 plan)
 static const float cHiddenGateShare = 0.1f,   // a floor line crosses the vertical this near the expected foot (share of the corner's height)
@@ -3222,6 +3225,7 @@ enum {
 static const float cPanoNeighborCos = 0.5f,   // frames whose forwards lie within 60 degrees overlap
                    cPanoHuber = 1.5f,         // Huber knee, in RMS residuals of the previous round
                    cPanoPrior = 1e-4f,        // damping, share of the mean diagonal
+                   cPanoShiftPrior = 1e-2f,   // each frame's own shift held harder (alone on one wall it trades with the turn)
                    cPanoEdgeShare = 1.f;      // sample pixels: gradient above this share of the frame's mean
 
 // One center-spin frame being registered: its pinhole, rotation (camera to world, TMat4 layout) and pyramid
@@ -3232,6 +3236,7 @@ struct TPanoFrame {
                  cx,
                  cy,
                  rot[9],      // columns: camera x, y, z in world (m0 m1 m2 / m4 m5 m6 / m8 m9 m10)
+                 shift[3],    // its camera center's own offset beyond the lever (world, m): the body sways
                  gyro[9],     // the gyroscope's, kept for the report
                  edge[inspectPanoLevels]; // mean gradient of each level (the sampling threshold)
    int           w[inspectPanoLevels],
@@ -3243,6 +3248,64 @@ static TPanoFrame inspectPano[inspectPanoMax];
 static int        inspectPanoCount = 0;
 static float      inspectPanoRot[inspectMaxFrames][9]; // refined rotation of each frame (TMat4 layout, 3x3)
 static bool       inspectPanoHas[inspectMaxFrames];
+
+/*--------------------------------------------------------------------------------
+   The spin turns about the body, not the lens (user, 2026-09-29: the parallax is one more freedom,
+   to be used): every camera center sits at c = R o from the turn's pivot (the world origin), o the
+   lever arm in camera axes, one for the whole spin. Once the plan gives the room's box (walls,
+   floor, ceiling), a pixel's ray from its own center meets a known plane, and that point seen from
+   a neighbor's center moves by the parallax: the registration then solves o with the rotations.
+  --------------------------------------------------------------------------------*/
+enum {
+   inspectBoxMax = layoutMaxVerts + 2
+};
+
+static float inspectBoxN[inspectBoxMax][3], // outward normals: n X = D on the plane, D > 0 (the pivot inside)
+             inspectBoxD[inspectBoxMax];
+static int   inspectBoxCount = 0;
+static bool  inspectLeverFit = false,      // the registration solves the lever arm too
+             inspectShiftFit = false;      // and each frame's own shift
+
+//--------------------------------------------------------------------------------
+// A frame's camera center in the world: the lever turned by its rotation (TMat4 layout, 3x3), plus its own shift (NULL: none)
+static TVec3 inspectCenter(const float *rot, const float *shift)
+{
+   TVec3 c = { rot[0]*inspectLever.x + rot[3]*inspectLever.y + rot[6]*inspectLever.z,
+               rot[1]*inspectLever.x + rot[4]*inspectLever.y + rot[7]*inspectLever.z,
+               rot[2]*inspectLever.x + rot[5]*inspectLever.y + rot[8]*inspectLever.z };
+
+   if (shift)
+   {
+      c.x += shift[0];
+      c.y += shift[1];
+      c.z += shift[2];
+   }
+   return c;
+}
+
+//--------------------------------------------------------------------------------
+// The ray c + t d (d unit) to the room's box: the nearest plane ahead; false when none
+static bool inspectBoxHit(const TVec3 &c, const TVec3 &d, float &t, int &plane)
+{
+   t = 1e9f;
+   plane = -1;
+   for (int k = 0; k < inspectBoxCount; k++)
+   {
+      const float *n = inspectBoxN[k];
+      float        nd = n[0]*d.x + n[1]*d.y + n[2]*d.z,
+                   tk;
+
+      if (nd < 1e-4f)
+         continue;
+      tk = (inspectBoxD[k] - (n[0]*c.x + n[1]*c.y + n[2]*c.z))/nd;
+      if (tk > 0.f && tk < t)
+      {
+         t = tk;
+         plane = k;
+      }
+   }
+   return plane >= 0;
+}
 
 //--------------------------------------------------------------------------------
 // Bilinear sample of a level image; false outside (a pixel of margin for the gradient)
@@ -3434,7 +3497,10 @@ static void inspectPanoPyramid(LPCBYTE bgr, DWORD width, DWORD height, TPanoFram
 // One Gauss-Newton round at a level: accumulates, solves, applies; returns the RMS residual before it
 static float inspectPanoRound(int level, float knee, int &residuals)
 {
-   const int     n = inspectPanoCount*3;
+   const bool    shifts = inspectShiftFit && inspectBoxCount;
+   const int     rots = inspectPanoCount*3,
+                 lever0 = rots + (shifts ? rots : 0),
+                 n = lever0 + (inspectLeverFit && inspectBoxCount ? 3 : 0);
    TAlloc<float> H((size_t)n*n),
                   g((size_t)n);
    float        sq = 0.f,
@@ -3454,6 +3520,7 @@ static float inspectPanoRound(int level, float knee, int &residuals)
                         cy = (a.cy + 0.5f)*s - 0.5f;
       int               w = a.w[level],
                         h = a.h[level];
+      TVec3             ca = inspectCenter(a.rot, a.shift);
 
       for (int y = 2; y + 2 < h; y++)
          for (int x = 2; x + 2 < w; x++)
@@ -3468,12 +3535,27 @@ static float inspectPanoRound(int level, float knee, int &residuals)
             float rx = ((float)x - cx)/fx,
                   ry = -((float)y - cy)/fy;
             TVec3 d = { a.rot[0]*rx + a.rot[3]*ry - a.rot[6], a.rot[1]*rx + a.rot[4]*ry - a.rot[7],
-                        a.rot[2]*rx + a.rot[5]*ry - a.rot[8] };
-            float dl = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
+                        a.rot[2]*rx + a.rot[5]*ry - a.rot[8] },
+                  X = {};
+            float dl = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z),
+                  t = 0.f,
+                  nd = 1.f;
+            int   plane = -1;
 
             d.x /= dl;
             d.y /= dl;
             d.z /= dl;
+
+            // with the room's box: the point the ray meets from this camera's own center (else at infinity)
+            if (inspectBoxCount && !inspectBoxHit(ca, d, t, plane))
+               continue;
+            if (plane >= 0)
+            {
+               X.x = ca.x + t*d.x;
+               X.y = ca.y + t*d.y;
+               X.z = ca.z + t*d.z;
+               nd = inspectBoxN[plane][0]*d.x + inspectBoxN[plane][1]*d.y + inspectBoxN[plane][2]*d.z;
+            }
             for (int j = 0; j < inspectPanoCount; j++)
             {
                if (j == i)
@@ -3484,8 +3566,18 @@ static float inspectPanoRound(int level, float knee, int &residuals)
                if (b.rot[6]*a.rot[6] + b.rot[7]*a.rot[7] + b.rot[8]*a.rot[8] < cPanoNeighborCos) // forwards' cosine
                   continue;
 
-               TVec3 rc = { b.rot[0]*d.x + b.rot[1]*d.y + b.rot[2]*d.z, b.rot[3]*d.x + b.rot[4]*d.y + b.rot[5]*d.z,
-                            b.rot[6]*d.x + b.rot[7]*d.y + b.rot[8]*d.z };
+               TVec3 cb = inspectCenter(b.rot, b.shift),
+                     q = d;
+
+               if (plane >= 0)
+               {
+                  q.x = X.x - cb.x;
+                  q.y = X.y - cb.y;
+                  q.z = X.z - cb.z;
+               }
+
+               TVec3 rc = { b.rot[0]*q.x + b.rot[1]*q.y + b.rot[2]*q.z, b.rot[3]*q.x + b.rot[4]*q.y + b.rot[5]*q.z,
+                            b.rot[6]*q.x + b.rot[7]*q.y + b.rot[8]*q.z };
 
                if (rc.z > -1e-3f)
                   continue;
@@ -3501,45 +3593,101 @@ static float inspectPanoRound(int level, float knee, int &residuals)
                   continue;
 
                float r = v0 - val,
-                     wt = fabsf(r) <= knee ? 1.f : knee/fabsf(r);
-               // d(u, v)/d(rc), then back to world: gw = R_b (dr/drc) up to the sign
+                     wt = fabsf(r) <= knee ? 1.f : knee/fabsf(r),
+                     J[15];
+               int   at[15],
+                     m = 6;
+               // d(u, v)/d(rc), then back to world: gw = R_b (dval/drc)
                TVec3 grc = { gu*fx*iz, -gv*fy*iz, gu*fx*rc.x*iz*iz - gv*fy*rc.y*iz*iz },
                      gw = { b.rot[0]*grc.x + b.rot[3]*grc.y + b.rot[6]*grc.z, b.rot[1]*grc.x + b.rot[4]*grc.y + b.rot[7]*grc.z,
                             b.rot[2]*grc.x + b.rot[5]*grc.y + b.rot[8]*grc.z };
-               float J[3] = { gw.y*d.z - gw.z*d.y, gw.z*d.x - gw.x*d.z, gw.x*d.y - gw.y*d.x }; // dr/dw_i; dr/dw_j = -J
-               int    oi = 3*i,
-                      oj = 3*j;
 
-               for (int p = 0; p < 3; p++)
+               for (int k = 0; k < 3; k++)
                {
-                  for (int q = 0; q < 3; q++)
-                  {
-                     float jj = (float)wt*J[p]*J[q];
-
-                     H[(size_t)(oi + p)*n + oi + q] += jj;
-                     H[(size_t)(oj + p)*n + oj + q] += jj;
-                     H[(size_t)(oi + p)*n + oj + q] -= jj;
-                     H[(size_t)(oj + p)*n + oi + q] -= jj;
-                  }
-                  g[oi + p] += (float)wt*J[p]*r;
-                  g[oj + p] -= (float)wt*J[p]*r;
+                  at[k] = 3*i + k;
+                  at[3 + k] = 3*j + k;
                }
-               sq += (float)r*r;
+               if (plane < 0) // at infinity: turning a moves the direction, turning b the other way
+               {
+                  J[0] = gw.y*d.z - gw.z*d.y;
+                  J[1] = gw.z*d.x - gw.x*d.z;
+                  J[2] = gw.x*d.y - gw.y*d.x;
+                  for (int k = 0; k < 3; k++)
+                     J[3 + k] = -J[k];
+               }
+               else
+               {
+                  /* turning a swings the point about the pivot and slides it along the ray back onto its plane
+                     (P y = y - d (n y)/(n d)); turning b turns its view of the point; a shift of a's center slides the
+                     point on its plane, one of b's moves its view the other way; the lever moves both centers */
+                  const float *pn = inspectBoxN[plane];
+                  float        gd = (gw.x*d.x + gw.y*d.y + gw.z*d.z)/nd;
+                  TVec3        pg = { gw.x - pn[0]*gd, gw.y - pn[1]*gd, gw.z - pn[2]*gd };
+
+                  J[0] = pg.y*X.z - pg.z*X.y;
+                  J[1] = pg.z*X.x - pg.x*X.z;
+                  J[2] = pg.x*X.y - pg.y*X.x;
+                  J[3] = -(gw.y*X.z - gw.z*X.y);
+                  J[4] = -(gw.z*X.x - gw.x*X.z);
+                  J[5] = -(gw.x*X.y - gw.y*X.x);
+                  if (shifts)
+                  {
+                     const float pa[3] = { pg.x, pg.y, pg.z },
+                                 pb[3] = { gw.x, gw.y, gw.z };
+
+                     for (int k = 0; k < 3; k++)
+                     {
+                        J[m + k] = -pa[k];
+                        at[m + k] = rots + 3*i + k;
+                        J[m + 3 + k] = pb[k];
+                        at[m + 3 + k] = rots + 3*j + k;
+                     }
+                     m += 6;
+                  }
+                  if (n > lever0)
+                  {
+                     for (int k = 0; k < 3; k++)
+                     {
+                        J[m + k] = -(pg.x*a.rot[3*k] + pg.y*a.rot[3*k + 1] + pg.z*a.rot[3*k + 2])
+                                   + gw.x*b.rot[3*k] + gw.y*b.rot[3*k + 1] + gw.z*b.rot[3*k + 2];
+                        at[m + k] = lever0 + k;
+                     }
+                     m += 3;
+                  }
+               }
+               for (int p = 0; p < m; p++)
+               {
+                  for (int k = 0; k < m; k++)
+                     H[(size_t)at[p]*n + at[k]] += wt*J[p]*J[k];
+                  g[at[p]] += wt*J[p]*r;
+               }
+               sq += r*r;
                count++;
             }
          }
    }
-   for (int k = 0; k < n; k++)
-      diag += H[(size_t)k*n + k];
-   diag = n ? diag/(float)n : 1.f;
-   for (int k = 0; k < n; k++) // damping: holds the whole set's free rotation near the gyroscope's
-      H[(size_t)k*n + k] += cPanoPrior*diag;
+
+   // damping per block (turns, shifts, lever): the turns' holds the whole set's free rotation near the gyroscope's
+   const int   lo[3] = { 0, rots, lever0 },
+               hi[3] = { rots, lever0, n };
+   const float pull[3] = { cPanoPrior, cPanoShiftPrior, cPanoPrior };
+
+   for (int blk = 0; blk < 3; blk++)
+   {
+      diag = 0.f;
+      for (int k = lo[blk]; k < hi[blk]; k++)
+         diag += H[(size_t)k*n + k];
+      diag = hi[blk] > lo[blk] ? diag/(float)(hi[blk] - lo[blk]) : 1.f;
+      for (int k = lo[blk]; k < hi[blk]; k++)
+         H[(size_t)k*n + k] += pull[blk]*diag + 1e-12f;
+   }
    for (int k = 0; k < n; k++)
       g[k] = -g[k];
    if (count && inspectPanoSolve(H(), g(), n))
+   {
       for (int i = 0; i < inspectPanoCount; i++)
       {
-         float w[3] = { (float)g[3*i], (float)g[3*i + 1], (float)g[3*i + 2] },
+         float w[3] = { g[3*i], g[3*i + 1], g[3*i + 2] },
                e[9],
                old[9];
          TPanoFrame &a = inspectPano[i];
@@ -3553,6 +3701,17 @@ static float inspectPanoRound(int level, float knee, int &residuals)
             a.rot[3*c + 2] = e[6]*old[3*c] + e[7]*old[3*c + 1] + e[8]*old[3*c + 2];
          }
       }
+      if (shifts)
+         for (int i = 0; i < inspectPanoCount; i++)
+            for (int k = 0; k < 3; k++)
+               inspectPano[i].shift[k] += g[rots + 3*i + k];
+      if (n > lever0)
+      {
+         inspectLever.x += g[lever0];
+         inspectLever.y += g[lever0 + 1];
+         inspectLever.z += g[lever0 + 2];
+      }
+   }
    residuals = count;
    return count ? sqrtf(sq/(float)count) : 0.f;
 }
@@ -3725,10 +3884,14 @@ static void inspectPanoPlumb(DWORD room)
           inspectPanoCount ? sum/(float)inspectPanoCount : 0.f, worst);
 }
 
-//--------------------------------------------------------------------------------
-// The photometric Gauss-Newton rounds from pyramid level top down to the finest; the rotations in inspectPanoRot follow
-static void inspectPanoGN(DWORD room, int top)
+/*--------------------------------------------------------------------------------
+   The photometric Gauss-Newton rounds from pyramid level top down to the finest; the rotations in
+   inspectPanoRot follow; returns the finest level's last RMS
+  --------------------------------------------------------------------------------*/
+static float inspectPanoGN(DWORD room, int top)
 {
+   float fine = 0.f;
+
    for (int l = top; l >= 0; l--)
    {
       float knee = 1e9f,
@@ -3747,10 +3910,12 @@ static void inspectPanoGN(DWORD room, int top)
       }
       printf("  panorama room %lu: level 1/%d, %d residuals, RMS %.3f -> %.3f\n", (unsigned long)room,
              inspectPanoShrink << l, count, first, last);
+      fine = last;
    }
    for (int i = 0; i < inspectPanoCount; i++)
       if (inspectPanoHas[inspectPano[i].index])
          memcpy(inspectPanoRot[inspectPano[i].index], inspectPano[i].rot, sizeof(inspectPano[i].rot));
+   return fine;
 }
 
 //--------------------------------------------------------------------------------
@@ -3798,6 +3963,7 @@ static bool inspectPanoRegister(LPCSTR sessionDir, DWORD room, const DWORD *fram
       p.cy = img.intr.cy;
       memcpy(p.rot, r, sizeof(r));
       memcpy(p.gyro, r, sizeof(r));
+      p.shift[0] = p.shift[1] = p.shift[2] = 0.f;
       inspectPanoPyramid(bgr(), img.width, img.height, p);
    }
    if (inspectPanoCount < 2)
@@ -4181,9 +4347,11 @@ static void inspectSimBack(const float *sim, const float *ref, float &c, float &
 
 //--------------------------------------------------------------------------------
 // Gray of a frame at a world direction (bilinear), NAN outside its picture less its own border
-static float inspectAlignSample(const TImageRecord &img, LPCBYTE bgr, const float *m, const TVec3 &d)
+static float inspectAlignSample(const TImageRecord &img, LPCBYTE bgr, const float *m, const float *shift, const TVec3 &P)
 {
-   TVec3 rc = { m[0]*d.x + m[1]*d.y + m[2]*d.z, m[3]*d.x + m[4]*d.y + m[5]*d.z, m[6]*d.x + m[7]*d.y + m[8]*d.z };
+   TVec3 c = inspectCenter(m, shift),
+         d = { P.x - c.x, P.y - c.y, P.z - c.z }, // from this camera's own center
+         rc = { m[0]*d.x + m[1]*d.y + m[2]*d.z, m[3]*d.x + m[4]*d.y + m[5]*d.z, m[6]*d.x + m[7]*d.y + m[8]*d.z };
 
    if (rc.z > -1e-3f)
       return NAN;
@@ -4213,7 +4381,8 @@ static float inspectAlignSample(const TImageRecord &img, LPCBYTE bgr, const floa
 
 //--------------------------------------------------------------------------------
 // One frame onto one face as an edge patch, moved by its similarity; false when it does not see the face
-static bool inspectAlignPatch(const TImageRecord &img, LPCBYTE bgr, const float *m, const TFaceCanvas &fc, int cols, int rows,
+static bool inspectAlignPatch(const TImageRecord &img, LPCBYTE bgr, const float *m, const float *shift, const TFaceCanvas &fc,
+                              int cols, int rows,
                               const float *sim, const float *ref, TFacePatch &p)
 {
    int lo[2] = { cols, rows },
@@ -4226,7 +4395,7 @@ static bool inspectAlignPatch(const TImageRecord &img, LPCBYTE bgr, const float 
                v = (float)r;
 
          inspectSimBack(sim, ref, u, v);
-         if (!isnan(inspectAlignSample(img, bgr, m, inspectAlignPoint(fc, u, v))))
+         if (!isnan(inspectAlignSample(img, bgr, m, shift, inspectAlignPoint(fc, u, v))))
          {
             lo[0] = c < lo[0] ? c : lo[0];
             lo[1] = r < lo[1] ? r : lo[1];
@@ -4251,7 +4420,7 @@ static bool inspectAlignPatch(const TImageRecord &img, LPCBYTE bgr, const float 
                v = (float)(p.y0 + r);
 
          inspectSimBack(sim, ref, u, v);
-         gray[(size_t)r*p.w + c] = inspectAlignSample(img, bgr, m, inspectAlignPoint(fc, u, v));
+         gray[(size_t)r*p.w + c] = inspectAlignSample(img, bgr, m, shift, inspectAlignPoint(fc, u, v));
       }
    for (int r = 0; r < p.h; r++)
       for (int c = 0; c < p.w; c++)
@@ -4454,7 +4623,8 @@ static void inspectAlignRender(LPCSTR sessionDir, const TFaceCanvas *fc, int fac
 
          p.frame = k;
          p.face = i;
-         if (inspectAlignPatch(img, bgr(), inspectPano[k].rot, fc[i], cols[i], rows[i], inspectSim[k][i], inspectSimRef[i], p))
+         if (inspectAlignPatch(img, bgr(), inspectPano[k].rot, inspectPano[k].shift, fc[i], cols[i], rows[i], inspectSim[k][i],
+                               inspectSimRef[i], p))
             inspectPatchCount++;
       }
    }
@@ -4474,6 +4644,8 @@ struct TAlignTile {
 };
 
 static TAlignTile inspectTile[inspectTileMax];
+static float      inspectRejected[inspectPatchMax*8][5]; // pairs left out for a shift beyond cAlignMaxShiftPx: a, b, px, py, ncc
+static int        inspectRejectedCount = 0;
 
 //--------------------------------------------------------------------------------
 // The tiles of every overlapping pair of patches on the faces; returns their count
@@ -4483,6 +4655,7 @@ static int inspectAlignTiles(void)
        span = (int)cAlignTileSpan,
        side = (int)cAlignTilePx;
 
+   inspectRejectedCount = 0;
    for (int i = 0; i < inspectPatchCount; i++)
       for (int j = i + 1; j < inspectPatchCount; j++)
       {
@@ -4515,6 +4688,16 @@ static int inspectAlignTiles(void)
          /* the frames already stand on the scene's own axes (plumb and heading): what is left between two of them is
             small. A pair farther apart is locked on something off the plane (furniture shifted by parallax) or on a
             repeating pattern (a row of doors) - it measures nothing (user, 2026-09-28: small but known freedoms) */
+         if (sqrtf(px*px + py*py) > cAlignMaxShiftPx && inspectRejectedCount < inspectPatchMax*8)
+         {
+            float *q = inspectRejected[inspectRejectedCount++];
+
+            q[0] = (float)i;
+            q[1] = (float)j;
+            q[2] = px;
+            q[3] = py;
+            q[4] = pn;
+         }
          if (sqrtf(px*px + py*py) > cAlignMaxShiftPx)
             continue;
          for (int ty = oy; ty + side/2 <= ey && tiles < inspectTileMax; ty += side)
@@ -4738,6 +4921,13 @@ static void inspectFaceAlign(LPCSTR sessionDir, LPCSTR outDir, DWORD room, const
                 " (%.1f -> %.1f mm)\n", (unsigned long)room, run + 1, fc[f].name, used, before, after, p90,
                 before*1000.f/cAlignPxPerM, after*1000.f/cAlignPxPerM);
       }
+      for (int k = 0; log && k < inspectRejectedCount; k++) // the pairs left out, as tile -1: their own shift only
+      {
+         const float *q = inspectRejected[k];
+
+         fprintf(log, "%d,%s,%d,%d,-1,-1,%.3f,%.3f,%.4f,0,0\r\n", run + 1, fc[inspectPatch[(int)q[0]].face].name,
+                 inspectPano[inspectPatch[(int)q[0]].frame].index, inspectPano[inspectPatch[(int)q[1]].frame].index, q[2], q[3], q[4]);
+      }
       for (int k = 0; log && k < tiles; k++)
       {
          const TAlignTile &t = inspectTile[k];
@@ -4753,14 +4943,16 @@ static void inspectFaceAlign(LPCSTR sessionDir, LPCSTR outDir, DWORD room, const
 
 //--------------------------------------------------------------------------------
 // One frame onto one face canvas, moved by its similarity there (sim, ref: cAlignPxPerM pixels)
-static void inspectFaceSplat(const TImageRecord &img, LPCBYTE bgr, const float *m, int f, const float *sim, const float *ref,
+static void inspectFaceSplat(const TImageRecord &img, LPCBYTE bgr, const float *m, const float *shift, int f, const float *sim,
+                             const float *ref,
                              TFaceCanvas &fc)
 {
    float w = (float)img.width,
          h = (float)img.height,
          half = atanf(0.5f*sqrtf(w*w/(img.intr.fx*img.intr.fx) + h*h/(img.intr.fy*img.intr.fy))),
          reach = cosf(half + 0.02f);
-   TVec3 fwd = { -m[6], -m[7], -m[8] };
+   TVec3 fwd = { -m[6], -m[7], -m[8] },
+         cen = inspectCenter(m, shift);
 
    for (int r = 0; r < fc.rows; r++)
       for (int c = 0; c < fc.cols; c++)
@@ -4771,6 +4963,11 @@ static void inspectFaceSplat(const TImageRecord &img, LPCBYTE bgr, const float *
          inspectSimBack(sim, ref, ua, va);
 
          TVec3 d = inspectAlignPoint(fc, ua, va);
+
+         d.x -= cen.x; // from this camera's own center
+         d.y -= cen.y;
+         d.z -= cen.z;
+
          float dl = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
 
          if (dl < 1e-3f || (d.x*fwd.x + d.y*fwd.y + d.z*fwd.z) < reach*dl)
@@ -4885,7 +5082,7 @@ static void inspectComposeRaw(LPCSTR sessionDir, TFaceCanvas *fc, int count)
       if (!inspectDecode(img.pixels, img.pixelBytes, img.width, img.height, true, bgr))
          continue;
       for (int i = 0; i < count; i++)
-         inspectFaceSplat(img, bgr(), inspectPano[k].rot, f, none, ref, fc[i]);
+         inspectFaceSplat(img, bgr(), inspectPano[k].rot, inspectPano[k].shift, f, none, ref, fc[i]);
    }
 }
 
@@ -5601,6 +5798,7 @@ static void inspectFaceFrames(LPCSTR sessionDir, LPCSTR outDir, DWORD room, cons
 
          TAlloc<BYTE> bgr((size_t)img.width*img.height*3u);
          const float *m = inspectPano[k].rot;
+         TVec3        cen = inspectCenter(m, inspectPano[k].shift); // the camera's own center
          float        fx = img.intr.fx*inspectFocalScale,
                       fy = img.intr.fy*inspectFocalScale;
 
@@ -5685,8 +5883,8 @@ static void inspectFaceFrames(LPCSTR sessionDir, LPCSTR outDir, DWORD room, cons
                {
                   float ac = ((float)(x0 + q) + 0.5f)/cFrameRectPxPerM,
                         dn = ((float)(y0 + r) + 0.5f)/cFrameRectPxPerM;
-                  TVec3 d = { c.origin.x + ac*c.across.x + dn*c.down.x, c.origin.y + ac*c.across.y + dn*c.down.y,
-                              c.origin.z + ac*c.across.z + dn*c.down.z },
+                  TVec3 d = { c.origin.x + ac*c.across.x + dn*c.down.x - cen.x, c.origin.y + ac*c.across.y + dn*c.down.y - cen.y,
+                              c.origin.z + ac*c.across.z + dn*c.down.z - cen.z }, // from this camera's own center
                         rc = { m[0]*d.x + m[1]*d.y + m[2]*d.z, m[3]*d.x + m[4]*d.y + m[5]*d.z, m[6]*d.x + m[7]*d.y + m[8]*d.z };
 
                   if (rc.z > -1e-3f)
@@ -5963,6 +6161,8 @@ static void inspectFaces(LPCSTR sessionDir, LPCSTR outDir, DWORD room, const TLa
       printf("  faces room %lu: no plan\n", (unsigned long)room);
       return;
    }
+   inspectLever.x = inspectLever.y = inspectLever.z = 0.f; // each room's spin its own lever, pure rotation until the box
+   inspectBoxCount = 0;
 
    float       a = plan.axisDeg*0.01745329f,
                cam = plan.cameraHeightM > 0.3f ? plan.cameraHeightM : 1.5f,
@@ -6050,6 +6250,98 @@ static void inspectFaces(LPCSTR sessionDir, LPCSTR outDir, DWORD room, const TLa
          printf("  faces room %lu: walls kept as they are (pass %d)\n", (unsigned long)room, pass + 1);
          break;
       }
+
+   // the room's box from the faces (outward normals), then the lever arm with the rotations (see inspectBoxHit)
+   inspectBoxCount = 0;
+   for (int i = 0; i < walls && inspectBoxCount < inspectBoxMax - 2; i++)
+   {
+      float *bn = inspectBoxN[inspectBoxCount],
+            bl;
+
+      bn[0] = fc[i].across.z;
+      bn[1] = 0.f;
+      bn[2] = -fc[i].across.x;
+      bl = bn[0]*fc[i].origin.x + bn[2]*fc[i].origin.z;
+      if (bl < 0.f)
+      {
+         bn[0] = -bn[0];
+         bn[2] = -bn[2];
+         bl = -bl;
+      }
+      inspectBoxD[inspectBoxCount++] = bl;
+   }
+   inspectBoxN[inspectBoxCount][0] = 0.f; // the floor
+   inspectBoxN[inspectBoxCount][1] = -1.f;
+   inspectBoxN[inspectBoxCount][2] = 0.f;
+   inspectBoxD[inspectBoxCount++] = cam;
+   inspectBoxN[inspectBoxCount][0] = 0.f; // the ceiling
+   inspectBoxN[inspectBoxCount][1] = 1.f;
+   inspectBoxN[inspectBoxCount][2] = 0.f;
+   inspectBoxD[inspectBoxCount++] = ceil - cam;
+   if (inspectLeverOn && inspectPanoCount > 1 && inspectLeverScan)
+   {
+      // the registration's residual with the lever held at each trial, the rotations registered anew (level 1/16)
+      TAlloc<float> keep((size_t)inspectPanoCount*9u);
+
+      for (int i = 0; i < inspectPanoCount; i++)
+         memcpy(&keep[(size_t)i*9u], inspectPano[i].rot, sizeof(inspectPano[i].rot));
+      for (int axis = 0; axis < 3; axis++)
+         for (int s = -2; s <= 2; s++)
+         {
+            float knee = 1e9f,
+                  rms = 0.f;
+            int   count = 0;
+
+            for (int i = 0; i < inspectPanoCount; i++)
+               memcpy(inspectPano[i].rot, &keep[(size_t)i*9u], sizeof(inspectPano[i].rot));
+            inspectLever.x = axis == 0 ? 0.2f*(float)s : 0.f;
+            inspectLever.y = axis == 1 ? 0.2f*(float)s : 0.f;
+            inspectLever.z = axis == 2 ? 0.2f*(float)s : 0.f;
+            for (int it = 0; it < inspectPanoIters; it++)
+            {
+               rms = inspectPanoRound(1, knee, count);
+               knee = cPanoHuber*rms;
+            }
+            printf("  faces room %lu: lever scan %.2f %.2f %.2f m: RMS %.4f (%d residuals)\n", (unsigned long)room,
+                   inspectLever.x, inspectLever.y, inspectLever.z, rms, count);
+         }
+      for (int i = 0; i < inspectPanoCount; i++)
+         memcpy(inspectPano[i].rot, &keep[(size_t)i*9u], sizeof(inspectPano[i].rot));
+      inspectLever.x = inspectLever.y = inspectLever.z = 0.f;
+   }
+   if (inspectLeverOn && inspectPanoCount > 1)
+   {
+      /* each frame's own center (user, 2026-09-29): the lever came out ~0 (no steady arm) yet the furniture doubles -
+         the body sways from shot to shot; three more unknowns per frame, held toward the pivot */
+      TAlloc<float> len((size_t)inspectPanoCount);
+      float         band[inspectLeanBands][4] = {}; // mean x y z, frames
+
+      inspectShiftFit = true;
+      inspectPanoGN(room, 1);
+      inspectShiftFit = false;
+      for (int i = 0; i < inspectPanoCount; i++)
+      {
+         const float *s = inspectPano[i].shift;
+         int          b = (int)inspectBand[inspectPano[i].index];
+
+         len[i] = sqrtf(s[0]*s[0] + s[1]*s[1] + s[2]*s[2]);
+         if (b >= 0 && b < inspectLeanBands)
+         {
+            for (int k = 0; k < 3; k++)
+               band[b][k] += s[k];
+            band[b][3] += 1.f;
+         }
+      }
+      printf("  faces room %lu: own shifts of the camera centers: median %.3f, p90 %.3f, largest %.3f m\n", (unsigned long)room,
+             inspectQuantile(len(), inspectPanoCount, 0.5f), inspectQuantile(len(), inspectPanoCount, 0.9f),
+             inspectQuantile(len(), inspectPanoCount, 1.f));
+      for (int b = 0; b < inspectLeanBands; b++)
+         if (band[b][3] > 0.f)
+            printf("  faces room %lu: band %d: mean shift %.3f %.3f %.3f m (%d frames)\n", (unsigned long)room, b,
+                   band[b][0]/band[b][3], band[b][1]/band[b][3], band[b][2]/band[b][3], (int)band[b][3]);
+   }
+   else
+      inspectBoxCount = 0; // pure rotation, as before
    inspectFaceAlign(sessionDir, outDir, room, fc, faces);
    for (int i = 0; i < faces; i++)
       inspectFaceAlloc(fc[i]);
@@ -6091,7 +6383,8 @@ static void inspectFaces(LPCSTR sessionDir, LPCSTR outDir, DWORD room, const TLa
       if (inspectPanoHas[f])
          memcpy(m, inspectPanoRot[f], sizeof(m));
       for (int i = 0; i < faces; i++)
-         inspectFaceSplat(img, bgr(), m, f, k >= 0 ? inspectSim[k][i] : none, inspectSimRef[i], fc[i]);
+         inspectFaceSplat(img, bgr(), m, k >= 0 ? inspectPano[k].shift : NULL, f, k >= 0 ? inspectSim[k][i] : none,
+                          inspectSimRef[i], fc[i]);
       used++;
    }
 
@@ -6121,7 +6414,8 @@ static void inspectFaces(LPCSTR sessionDir, LPCSTR outDir, DWORD room, const TLa
    }
    if (frm)
    {
-      fprintf(frm, "frame,face,tx,ty,a,b,scale,rotDeg,fx,fy,cx,cy,r00,r01,r02,r10,r11,r12,r20,r21,r22,gyroDeg\r\n");
+      fprintf(frm, "frame,face,tx,ty,a,b,scale,rotDeg,fx,fy,cx,cy,r00,r01,r02,r10,r11,r12,r20,r21,r22,gyroDeg,shiftX,shiftY,"
+                   "shiftZ\r\n");
       for (int k = 0; k < inspectPanoCount; k++)
          for (int i = 0; i < faces; i++)
          {
@@ -6130,8 +6424,9 @@ static void inspectFaces(LPCSTR sessionDir, LPCSTR outDir, DWORD room, const TLa
                              *r = p.rot;
 
             fprintf(frm, "%d,%s,%.4f,%.4f,%.7f,%.7f,%.6f,%.4f,%.2f,%.2f,%.2f,%.2f,%.7f,%.7f,%.7f,%.7f,%.7f,%.7f,%.7f,%.7f,%.7f,"
-                         "%.3f\r\n", p.index, fc[i].name, s[0], s[1], s[2], s[3], 1.f + s[2], s[3]*57.2957795f, p.fx, p.fy, p.cx,
-                    p.cy, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], inspectPanoAngleDeg(p.rot, p.gyro));
+                         "%.3f,%.4f,%.4f,%.4f\r\n", p.index, fc[i].name, s[0], s[1], s[2], s[3], 1.f + s[2], s[3]*57.2957795f, p.fx, p.fy, p.cx,
+                    p.cy, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], inspectPanoAngleDeg(p.rot, p.gyro),
+                    p.shift[0], p.shift[1], p.shift[2]);
          }
       fclose(frm);
    }
@@ -6661,6 +6956,432 @@ static void inspectParsePick(LPCSTR text)
    inspectParseList(text, inspectPick);
 }
 
+/*--------------------------------------------------------------------------------
+   Barrel distortion from the lines known to be straight (--distortion; user, 2026-09-29: a straight
+   line of the scene - the ceiling's crease, a door frame, the wardrobe's edges - bends in the
+   picture only by the lens: if they bend there is a barrel, else it is negligible). Every frame's
+   edges at half resolution (Sobel, thinned across the gradient) are linked into chains whose
+   direction turns slowly; the long, nearly straight ones are kept. The radial model undistorts a
+   picture point, x_u = x_d (1 + k1 r^2 + k2 r^4) in focal units about the principal point (k1 > 0:
+   a barrel), and k1 k2 are the ones that make every chain straightest at once - the sum of each
+   chain's squared distances to its own best line (total least squares). Chains still bent after a
+   first fit (a curved object) leave, and the fit runs again. Printed with the displacement at the
+   picture's corner and edge; distorcao_linhas.csv holds every chain.
+  --------------------------------------------------------------------------------*/
+static const float cDistEdgeMin = 20.f,  // Sobel magnitude of an edge pixel (half resolution, gray 0..255)
+                   cDistTurnCos = 0.94f, // neighbors of a chain turn at most ~20 degrees
+                   cDistMinLen = 300.f,  // chain extent, half-resolution pixels
+                   cDistMaxBend = 0.03f; // a chain bent beyond this share of its length at k = 0 is no straight line
+
+enum {
+   inspectDistChainMax = 6000,
+   inspectDistPointMax = 1500000,
+   inspectDistChainPx  = 40000 // pixels one chain holds at most
+};
+
+struct TDistChain {
+   int   first,
+         count,
+         frame;
+   float length, // half-resolution pixels
+         radius, // mean distance from the principal point, focal units
+         before, // rms distance to its own line, full-resolution pixels (k = 0)
+         after;
+   bool  used;
+};
+
+static TDistChain inspectDistChain[inspectDistChainMax];
+static float      inspectDistPt[inspectDistPointMax*2]; // normalized distorted x y
+static int        inspectDistChains = 0,
+                  inspectDistPoints = 0;
+
+//--------------------------------------------------------------------------------
+// A chain's squared distances to its own best line, summed, its points undistorted by k1 k2
+static float inspectDistCost(const TDistChain &c, float k1, float k2)
+{
+   const float *p = inspectDistPt + (size_t)c.first*2u;
+   float        mx = 0.f,
+                my = 0.f,
+                cxx = 0.f,
+                cyy = 0.f,
+                cxy = 0.f,
+                sum = 0.f;
+
+   for (int pass = 0; pass < 3; pass++)
+   {
+      float nx = 0.f,
+            ny = 0.f;
+
+      if (pass == 2) // the major axis: its normal is the line's
+      {
+         float t = 0.5f*atan2f(2.f*cxy, cxx - cyy);
+
+         nx = -sinf(t);
+         ny = cosf(t);
+      }
+      for (int i = 0; i < c.count; i++)
+      {
+         float x = p[2*i],
+               y = p[2*i + 1],
+               r2 = x*x + y*y,
+               s = 1.f + k1*r2 + k2*r2*r2;
+
+         x *= s;
+         y *= s;
+         if (pass == 0)
+         {
+            mx += x;
+            my += y;
+         }
+         else if (pass == 1)
+         {
+            cxx += (x - mx)*(x - mx);
+            cyy += (y - my)*(y - my);
+            cxy += (x - mx)*(y - my);
+         }
+         else
+         {
+            float e = (x - mx)*nx + (y - my)*ny;
+
+            sum += e*e;
+         }
+      }
+      if (pass == 0)
+      {
+         mx /= (float)c.count;
+         my /= (float)c.count;
+      }
+   }
+   return sum;
+}
+
+//--------------------------------------------------------------------------------
+// All used chains' cost at k1 k2: rms distance in full-resolution pixels
+static float inspectDistRms(float k1, float k2, float fx)
+{
+   float sum = 0.f;
+   int   n = 0;
+
+   for (int i = 0; i < inspectDistChains; i++)
+      if (inspectDistChain[i].used)
+      {
+         sum += inspectDistCost(inspectDistChain[i], k1, k2);
+         n += inspectDistChain[i].count;
+      }
+   return n ? sqrtf(sum/(float)n)*fx : 0.f;
+}
+
+//--------------------------------------------------------------------------------
+// One frame's long, nearly straight edge chains into inspectDistChain (gray at half resolution)
+static void inspectDistFrame(const float *g, int w, int h, const TImageRecord &img, int frame)
+{
+   TAlloc<float> ux((size_t)w*h),
+                 uy((size_t)w*h),
+                 mag((size_t)w*h);
+   TAlloc<BYTE>  edge((size_t)w*h);
+   TAlloc<int>   chain((size_t)inspectDistChainPx),
+                 stack((size_t)inspectDistChainPx);
+
+   memset(mag(), 0, sizeof(float)*(size_t)w*h);
+   memset(ux(), 0, sizeof(float)*(size_t)w*h);
+   memset(uy(), 0, sizeof(float)*(size_t)w*h);
+   memset(edge(), 0, (size_t)w*h);
+   for (int y = 1; y + 1 < h; y++)
+      for (int x = 1; x + 1 < w; x++)
+      {
+         const float *q = g + (size_t)y*w + x;
+         float        gx = (q[-w + 1] + 2.f*q[1] + q[w + 1]) - (q[-w - 1] + 2.f*q[-1] + q[w - 1]),
+                      gy = (q[w - 1] + 2.f*q[w] + q[w + 1]) - (q[-w - 1] + 2.f*q[-w] + q[-w + 1]),
+                      m = sqrtf(gx*gx + gy*gy);
+         size_t       at = (size_t)y*w + x;
+
+         mag[at] = m;
+         ux[at] = m > 0.f ? gx/m : 0.f;
+         uy[at] = m > 0.f ? gy/m : 0.f;
+      }
+   for (int y = 2; y + 2 < h; y++) // thinned across the gradient
+      for (int x = 2; x + 2 < w; x++)
+      {
+         size_t at = (size_t)y*w + x;
+         float  m = mag[at],
+                ax = fabsf(ux[at]),
+                ay = fabsf(uy[at]);
+         int    dx = ax > 2.414f*ay ? 1 : (ay > 2.414f*ax ? 0 : (ux[at]*uy[at] > 0.f ? 1 : -1)),
+                dy = ax > 2.414f*ay ? 0 : 1,
+                off = dy*w + dx;
+
+         if (m >= cDistEdgeMin && m >= mag[(size_t)((int)at + off)] && m > mag[(size_t)((int)at - off)])
+            edge[at] = 1;
+      }
+   for (size_t seed = 0; seed < (size_t)w*h && inspectDistChains < inspectDistChainMax; seed++)
+   {
+      if (edge[seed] != 1)
+         continue;
+
+      int n = 0,
+          top = 0;
+
+      edge[seed] = 2;
+      stack[top++] = (int)seed;
+      while (top > 0)
+      {
+         int at = stack[--top],
+             x = at%w,
+             y = at/w;
+
+         if (n < inspectDistChainPx)
+            chain[n++] = at;
+         for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++)
+            {
+               int nb = (y + dy)*w + x + dx;
+
+               if ((dx || dy) && edge[nb] == 1 && ux[at]*ux[nb] + uy[at]*uy[nb] >= cDistTurnCos && top < inspectDistChainPx)
+               {
+                  edge[nb] = 2;
+                  stack[top++] = nb;
+               }
+            }
+      }
+      if ((float)n < cDistMinLen || inspectDistPoints + n > inspectDistPointMax)
+         continue;
+
+      // straight enough at k = 0: its extent along the major axis, and its bend across
+      float mx = 0.f,
+            my = 0.f,
+            cxx = 0.f,
+            cyy = 0.f,
+            cxy = 0.f,
+            lo = 1e9f,
+            hi = -1e9f,
+            bend = 0.f;
+
+      for (int i = 0; i < n; i++)
+      {
+         mx += (float)(chain[i]%w);
+         my += (float)(chain[i]/w);
+      }
+      mx /= (float)n;
+      my /= (float)n;
+      for (int i = 0; i < n; i++)
+      {
+         float x = (float)(chain[i]%w) - mx,
+               y = (float)(chain[i]/w) - my;
+
+         cxx += x*x;
+         cyy += y*y;
+         cxy += x*y;
+      }
+
+      float t = 0.5f*atan2f(2.f*cxy, cxx - cyy),
+            ax = cosf(t),
+            ay = sinf(t);
+
+      for (int i = 0; i < n; i++)
+      {
+         float x = (float)(chain[i]%w) - mx,
+               y = (float)(chain[i]/w) - my,
+               a = x*ax + y*ay;
+
+         lo = fminf(lo, a);
+         hi = fmaxf(hi, a);
+         bend = fmaxf(bend, fabsf(-x*ay + y*ax));
+      }
+      if (hi - lo < cDistMinLen || bend > cDistMaxBend*(hi - lo))
+         continue;
+
+      TDistChain &c = inspectDistChain[inspectDistChains++];
+      float       rs = 0.f;
+
+      c.first = inspectDistPoints;
+      c.count = n;
+      c.frame = frame;
+      c.length = hi - lo;
+      c.used = true;
+      for (int i = 0; i < n; i++)
+      {
+         float X = (2.f*(float)(chain[i]%w) + 0.5f - img.intr.cx)/img.intr.fx,
+               Y = (2.f*(float)(chain[i]/w) + 0.5f - img.intr.cy)/img.intr.fy;
+
+         inspectDistPt[(size_t)inspectDistPoints*2u] = X;
+         inspectDistPt[(size_t)inspectDistPoints*2u + 1u] = Y;
+         inspectDistPoints++;
+         rs += sqrtf(X*X + Y*Y);
+      }
+      c.radius = rs/(float)n;
+   }
+}
+
+//--------------------------------------------------------------------------------
+// The best k1 k2 on a grid about (k1, k2): steps of s1 and s2, span steps each way
+static float inspectDistSearch(float &k1, float &k2, float s1, float s2, int span1, int span2, float fx)
+{
+   float b1 = k1,
+         b2 = k2,
+         best = inspectDistRms(k1, k2, fx);
+
+   for (int i = -span1; i <= span1; i++)
+      for (int j = -span2; j <= span2; j++)
+      {
+         float a = k1 + s1*(float)i,
+               b = k2 + s2*(float)j,
+               e = inspectDistRms(a, b, fx);
+
+         if (e < best)
+         {
+            best = e;
+            b1 = a;
+            b2 = b;
+         }
+      }
+   k1 = b1;
+   k2 = b2;
+   return best;
+}
+
+//--------------------------------------------------------------------------------
+static void inspectDistortion(LPCSTR sessionDir, LPCSTR outDir)
+{
+   TSessionReader reader;
+   TRecordView    v;
+   int            index = 0;
+   float          fx = 0.f,
+                  cornerR = 0.f,
+                  edgeR = 0.f;
+
+   inspectDistChains = 0;
+   inspectDistPoints = 0;
+   if (!reader.Open(sessionDir))
+      return;
+   while (reader.Next(v))
+   {
+      TImageRecord img;
+
+      if (v.type != rtImage || !img.Decode(v.payload, v.length))
+         continue;
+
+      int          f = index++,
+                   w = (int)img.width/2,
+                   h = (int)img.height/2;
+      TAlloc<BYTE> bgr((size_t)img.width*img.height*3u);
+
+      if (!inspectDecode(img.pixels, img.pixelBytes, img.width, img.height, true, bgr))
+         continue;
+
+      TAlloc<float> g((size_t)w*h);
+
+      for (int y = 0; y < h; y++)
+         for (int x = 0; x < w; x++)
+         {
+            float s = 0.f;
+
+            for (int k = 0; k < 4; k++)
+            {
+               LPCBYTE q = bgr() + ((size_t)(2*y + k/2)*img.width + 2*x + k%2)*3u;
+
+               s += 0.114f*(float)q[0] + 0.587f*(float)q[1] + 0.299f*(float)q[2];
+            }
+            g[(size_t)y*w + x] = 0.25f*s;
+         }
+      inspectDistFrame(g(), w, h, img, f);
+      fx = img.intr.fx;
+      cornerR = sqrtf((img.intr.cx/img.intr.fx)*(img.intr.cx/img.intr.fx) + (img.intr.cy/img.intr.fy)*(img.intr.cy/img.intr.fy));
+      edgeR = img.intr.cy/img.intr.fy;
+   }
+   if (!inspectDistChains || fx <= 0.f)
+   {
+      printf("  distortion: no straight chains\n");
+      return;
+   }
+
+   float k1 = 0.f,
+         k2 = 0.f,
+         zero = 0.f,
+         fit = 0.f;
+   int   used = inspectDistChains;
+
+   for (int round = 0; round < 2; round++)
+   {
+      TAlloc<float> e((size_t)inspectDistChains);
+      int           n = 0;
+
+      k1 = 0.f;
+      k2 = 0.f;
+      inspectDistSearch(k1, k2, 0.005f, 0.f, 60, 0, fx); // k1 alone over -0.3..0.3, then both, finer
+      inspectDistSearch(k1, k2, 0.0025f, 0.01f, 12, 30, fx);
+      fit = inspectDistSearch(k1, k2, 0.0005f, 0.002f, 6, 6, fx);
+      for (int i = 0; i < inspectDistChains; i++)
+      {
+         TDistChain &c = inspectDistChain[i];
+
+         c.before = sqrtf(inspectDistCost(c, 0.f, 0.f)/(float)c.count)*fx;
+         c.after = sqrtf(inspectDistCost(c, k1, k2)/(float)c.count)*fx;
+         if (c.used)
+            e[n++] = c.after;
+      }
+
+      float knee = 3.f*inspectQuantile(e(), n, 0.5f);
+
+      used = 0;
+      for (int i = 0; i < inspectDistChains && round == 0; i++) // a chain still bent is a curved object
+         inspectDistChain[i].used = inspectDistChain[i].after <= knee;
+      for (int i = 0; i < inspectDistChains; i++)
+         used += inspectDistChain[i].used ? 1 : 0;
+      zero = inspectDistRms(0.f, 0.f, fx);
+   }
+
+   // the straightness by distance from the center: a barrel bends the lines toward the edges
+   float band[3][3] = {}; // before, after, chains - center, middle, edge
+
+   for (int i = 0; i < inspectDistChains; i++)
+   {
+      const TDistChain &c = inspectDistChain[i];
+      int               b = c.radius < 0.25f ? 0 : (c.radius < 0.5f ? 1 : 2);
+
+      if (!c.used)
+         continue;
+      band[b][0] += c.before;
+      band[b][1] += c.after;
+      band[b][2] += 1.f;
+   }
+   printf("  distortion: %d straight chains (%d kept) from %d frames, %d points\n", inspectDistChains, used, index,
+          inspectDistPoints);
+   printf("  distortion: k1 %.4f k2 %.4f (undistort x_u = x_d (1 + k1 r^2 + k2 r^4), focal units; k1 > 0 a barrel)\n", k1, k2);
+   printf("  distortion: straightness rms %.3f px with no distortion -> %.3f px fitted\n", zero, fit);
+   for (int b = 0; b < 3; b++)
+      if (band[b][2] > 0.f)
+         printf("  distortion: chains %s: %d, rms %.3f -> %.3f px\n",
+                b == 0 ? "near the center" : (b == 1 ? "midway" : "near the edges"), (int)band[b][2], band[b][0]/band[b][2],
+                band[b][1]/band[b][2]);
+   for (int s = 0; s < 2; s++)
+   {
+      float r = s ? cornerR : edgeR,
+            r2 = r*r;
+
+      printf("  distortion: at the %s (r %.3f) a point moves %.1f px\n", s ? "corner" : "top edge's middle", r,
+             r*(k1*r2 + k2*r2*r2)*fx);
+   }
+
+   char path[sessionPathMax];
+
+   snprintf(path, sizeof(path), "%s/distorcao_linhas.csv", outDir);
+
+   FILE *csv = fopen(path, "wb");
+
+   if (csv)
+   {
+      fprintf(csv, "chain,frame,points,lengthPx,radius,beforePx,afterPx,used\r\n");
+      for (int i = 0; i < inspectDistChains; i++)
+      {
+         const TDistChain &c = inspectDistChain[i];
+
+         fprintf(csv, "%d,%d,%d,%.1f,%.4f,%.3f,%.3f,%d\r\n", i, c.frame, c.count, 2.f*c.length, c.radius, c.before, c.after,
+                 c.used ? 1 : 0);
+      }
+      fclose(csv);
+   }
+}
+
 //--------------------------------------------------------------------------------
 int main(int argc, LPSTR *argv)
 {
@@ -6695,7 +7416,8 @@ int main(int argc, LPSTR *argv)
                   measureBlur = false,
                   floorViews = false,
                   panorama = false,
-                  faces = false;
+                  faces = false,
+                  distortion = false;
    DWORD          statRoom = ~0ul;
    TRoomLayout    layout;
    TTiltBias      tilt;
@@ -6763,6 +7485,12 @@ int main(int argc, LPSTR *argv)
       }
       else if (!strcmp(argv[i], "--no-plumb"))
          inspectPlumbOn = false;
+      else if (!strcmp(argv[i], "--no-lever"))
+         inspectLeverOn = false;
+      else if (!strcmp(argv[i], "--lever-scan"))
+         inspectLeverScan = true;
+      else if (!strcmp(argv[i], "--distortion"))
+         distortion = true;
       else if (!strcmp(argv[i], "--faces"))
          faces = true;
       else if (!strcmp(argv[i], "--panorama"))
@@ -6793,6 +7521,14 @@ int main(int argc, LPSTR *argv)
    }
    inspectReadDevice(argv[1], model, sizeof(model), &modelFocalMm);
    inspectMakeDir(argv[2]);
+   if (distortion) // the lens alone: nothing else of the session
+   {
+      inspectDistortion(argv[1], argv[2]);
+#ifdef _WIN32
+      CoUninitialize();
+#endif
+      return 0;
+   }
    snprintf(path, sizeof(path), "%s/frames.csv", argv[2]);
 
    FILE *frames = fopen(path, "wb");
