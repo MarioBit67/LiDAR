@@ -86,6 +86,7 @@ TSpinConfig TSpinConfig::ForFov(float hfovDeg, float vfovDeg)
       }
       c.reachDownDeg = 0.f;
       c.reachUpDeg = 0.f;
+      c.zigzag = true; // user, 2026-09-30: columns, the ceiling line in every one of them
    }
    return c;
 }
@@ -160,11 +161,15 @@ void TSpinTracker::Reset(void)
    PhasLast = false;
    PhasOrigin = false;
    PfanSet = false;
+   PzigSet = false;
+   PzigStart = 0;
    PfanCenter = 0.f;
    PlastHeading = 0.f;
    PlastPitch = 0.f;
    PlastStampNs = 0u;
    Porigin = { 0.f, 0.f, 0.f };
+   PlastFwd = { 0.f, 0.f, -1.f };
+   PlastUp = { 0.f, 1.f, 0.f };
    Pfilled = 0;
    PkeptBand = 0;
    PkeptBin = 0;
@@ -225,15 +230,76 @@ int TSpinTracker::bandOf(float pitchDeg) const
   --------------------------------------------------------------------------------*/
 int TSpinTracker::GuidedBand(void) const
 {
+   if (Pcfg.zigzag)
+   {
+      int band,
+          bin;
+
+      return GuidedCell(band, bin) ? band : -1;
+   }
    for (int band = Pcfg.bandCount - 1; band >= 0; band--)
       if (BandFilled(band) < Pcfg.headingBins)
          return band;
    return -1;
 }
 
+/*--------------------------------------------------------------------------------
+   The zigzag (user, 2026-09-30): not one 360 per band but column after column, the ceiling line in
+   every one of them as the beacon, the floor's between, the horizon in the middle. Column k is the
+   k-th bin clockwise from the first one kept; even columns go ceiling -> horizon -> floor, odd ones
+   back up. Every neighbor is then seconds away (the gyroscope drifts over minutes), the body turns
+   only between columns, the wrist alone within one. Cells stay free: any steady pose fills or
+   refines its own; the serpentine only says which one comes next.
+  --------------------------------------------------------------------------------*/
+bool TSpinTracker::GuidedCell(int &band, int &bin) const
+{
+   const int top = Pcfg.bandCount - 1,
+             cells = Pcfg.bandCount*Pcfg.headingBins;
+
+   band = -1;
+   bin = -1;
+   if (!Pcfg.zigzag)
+      return false;
+   if (!PzigSet) // before the first column: the ceiling where the camera looks
+   {
+      band = top;
+      bin = PhasLast ? binOf(PlastHeading) : 0;
+      return true;
+   }
+   for (int s = 0; s < cells; s++)
+   {
+      int k = s/Pcfg.bandCount,
+          p = s%Pcfg.bandCount,
+          b = (k%2 == 0) ? top - p : p,
+          c = (PzigStart + k)%Pcfg.headingBins;
+
+      if (!Pbin[b][c])
+      {
+         band = b;
+         bin = c;
+         return true;
+      }
+   }
+   return false;
+}
+
 //--------------------------------------------------------------------------------
 int TSpinTracker::allowedBand(float pitchDeg, float headingDeg) const
 {
+   if (Pcfg.zigzag) // free cells: the guided band when the pose lies in it, else the band whose aim is nearest
+   {
+      int guided = GuidedBand(),
+          best = -1;
+
+      if (guided >= 0 && inBand(guided, pitchDeg))
+         return guided;
+      for (int band = 0; band < Pcfg.bandCount; band++)
+         if (inBand(band, pitchDeg)
+             && (best < 0 || fabsf(pitchDeg - Pcfg.bandPitchDeg[band]) < fabsf(pitchDeg - Pcfg.bandPitchDeg[best])))
+            best = band;
+      return best;
+   }
+
    int band = bandOf(pitchDeg),
        guided = GuidedBand();
 
@@ -323,34 +389,49 @@ bool TSpinTracker::nearKept(int band, int bin, float headingDeg) const
 }
 
 //--------------------------------------------------------------------------------
-TSpinVerdict TSpinTracker::Offer(QWORD stampNs, const TMat4 &cameraToWorld, float accuracyDeg, bool allowKeep)
+TSpinVerdict TSpinTracker::Offer(QWORD stampNs, const TMat4 &cameraToWorld, float accuracyDeg, bool allowKeep, float rateDps)
 {
    TVec3 fwd = cameraToWorld.Forward(),
-         pos = cameraToWorld.Translation();
+         pos = cameraToWorld.Translation(),
+         up = { cameraToWorld.m[4], cameraToWorld.m[5], cameraToWorld.m[6] };
    float heading = geomHeadingDeg(fwd),
          pitch = geomPitchDeg(fwd),
          rate = 0.f;
    bool  hadLast = PhasLast;
    QWORD lastStamp = PlastStampNs;
-   float lastHeading = PlastHeading;
+   TVec3 lastFwd = PlastFwd,
+         lastUp = PlastUp;
 
    PhasLast = true;
    PlastStampNs = stampNs;
    PlastHeading = heading;
    PlastPitch = pitch;
+   PlastFwd = fwd;
+   PlastUp = up;
 
    if (!PhasOrigin)
    {
       Porigin = pos;
       PhasOrigin = true;
    }
+
+   /* the whole turn, not the heading's alone (162740: 62 of 108 center frames kept above 2 degrees/s - the tilt was
+      never checked, and the zigzag tilts all the time): the larger of the forward's and the up's swing */
    if (hadLast && stampNs > lastStamp)
    {
       float dt = (float)(stampNs - lastStamp)*1e-9f;
 
       if (dt < 0.5f)
-         rate = geomHeadingDiffDeg(heading, lastHeading)/dt;
+      {
+         float cf = fwd.x*lastFwd.x + fwd.y*lastFwd.y + fwd.z*lastFwd.z,
+               cu = up.x*lastUp.x + up.y*lastUp.y + up.z*lastUp.z,
+               swing = acosf(fminf(1.f, fminf(cf, cu)))*57.2957795f;
+
+         rate = swing/dt;
+      }
    }
+   if (rateDps >= 0.f) // the caller's measure over the attitude's own stamps: successive frames may share a stale attitude
+      rate = rateDps;
 
    if (Pcfg.maxDriftM > 0.f)
    {
@@ -392,6 +473,11 @@ TSpinVerdict TSpinTracker::Offer(QWORD stampNs, const TMat4 &cameraToWorld, floa
    }
    if (Pbin[band][bin] || nearKept(band, bin, heading) || !allowKeep)
       return svCovered;
+   if (Pcfg.zigzag && !PzigSet) // the first cell kept starts the first column
+   {
+      PzigStart = bin;
+      PzigSet = true;
+   }
    Pbin[band][bin] = true;
    Pkept[band][bin] = heading;
    PkeptBand = band;

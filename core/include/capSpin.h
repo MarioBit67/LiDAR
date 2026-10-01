@@ -39,6 +39,7 @@ struct TSpinConfig {
          fanDeg,                     // 0 = full circle; > 0 = only a fan this wide around the first steady aim
          reachDownDeg,               // < 0: the lowest band also takes pitches down to this (a small room's floor)
          reachUpDeg;                 // > 0: the highest band also takes pitches up to this (its ceiling)
+   bool  zigzag;                     // center spin by columns, ceiling-horizon-floor then back up (see GuidedCell)
 
    static TSpinConfig UltraWide(void); // 0.5x lens: one horizon band covers creases
    static TSpinConfig Wide(void);      // 1x lens (ARKit + LiDAR): three bands
@@ -60,8 +61,9 @@ class TSpinTracker
  public:
    explicit TSpinTracker(const TSpinConfig &cfg);
 
-   // Every frame should be offered (it tracks the turn rate); allowKeep false = observe only (encoder busy)
-   TSpinVerdict Offer(QWORD stampNs, const TMat4 &cameraToWorld, float accuracyDeg, bool allowKeep = true);
+   /* Every frame should be offered (it tracks the turn rate); allowKeep false = observe only (encoder busy); rateDps
+      the turn rate measured by the caller over the attitude's own stamps (negative or NaN: from the successive offers) */
+   TSpinVerdict Offer(QWORD stampNs, const TMat4 &cameraToWorld, float accuracyDeg, bool allowKeep = true, float rateDps = -1.f);
    void Reset(void);
 
    int   Filled(void) const { return Pfilled; }
@@ -86,7 +88,8 @@ class TSpinTracker
       it may be retaken even outside the guided band */
    void  Reopen(int band, int bin, bool wrong = false);
    void  AimFan(float headingDeg);  // a fan centered on this heading instead of the first steady aim
-   int   GuidedBand(void) const;    // the band to hold now (ceiling first); -1 once every bin is in
+   int   GuidedBand(void) const;    // the band to hold now (ceiling first; zigzag: the guided cell's); -1 once every bin is in
+   bool  GuidedCell(int &band, int &bin) const; // zigzag: the next cell of the serpentine (false once all are in)
    bool  PoseAllowed(void) const;   // the last pose lies in the guided band (or on an orange bin): false = red, nothing kept
 
    TSpinTracker(const TSpinTracker &) = delete;
@@ -108,16 +111,20 @@ class TSpinTracker
                Pwrong[spinMaxBands][spinMaxBins],  // that frame is off (orange): retakable outside the guided band
                PhasLast,
                PhasOrigin,
-               PfanSet;
+               PfanSet,
+               PzigSet;    // zigzag: the first column is set
    float       Pkept[spinMaxBands][spinMaxBins], // heading of the frame kept in each bin
                PlastHeading,
                PlastPitch,
                PfanCenter;
    QWORD       PlastStampNs;
-   TVec3       Porigin;
+   TVec3       Porigin,
+               PlastFwd,   // the last pose's forward and up (the full turn rate, not the heading's alone)
+               PlastUp;
    int         Pfilled,
                PkeptBand,
-               PkeptBin;
+               PkeptBin,
+               PzigStart;  // zigzag: the bin of the first column
 };
 
 #endif // CAPSPIN_H

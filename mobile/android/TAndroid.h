@@ -46,6 +46,7 @@ class TAndroid : public TCapPort
    bool  StartCamera(int index, int maxPixels, float focusDiopters, int maxExposureHz) override;
    void  StopCamera(void) override;
    bool  Autofocus(const float *rects, int count) override;
+   bool  HoldFocus(float diopters) override;
    void  StartSensors(void) override;
    void  StopSensors(void) override;
    void  StartLocation(void) override;

@@ -29,6 +29,9 @@ struct TSessionCounts {
    QWORD poses, images, depth, meshes, locations, stations, vanish, layouts, elects, doors, bytes;
 };
 
+// Creates a directory (an existing one is fine); false on failure
+bool sessionMakeDir(LPCSTR dir);
+
 class TSessionWriter
 {
  public:

@@ -21,7 +21,9 @@ enum {
    appRingSize      = 256,      // attitude history, ~2.5 s at 100 Hz
    appSlots         = 8,        // keyframe pipeline slots (~18 MB each at 12 MP)
    appSlotReserve   = 2,        // slots a bin's extra candidates leave free: every bin gets its first frame (user: no gap for a sharper one)
-   appHoldMs        = 1000,     // a bin's sharpest goes on after this without a sharper one, even with the pose still on it
+   appOrangeWaitMs  = 4000,     // a blurred frame waiting behind the sharp ones goes on after this (it may be replaced meanwhile)
+   appFocusSettleMs = 300,      // a held focus reapplied: the lens's travel before a keyframe counts
+   appRateWindowMs  = 100,      // the turn rate of a frame: over this much of the attitude ring before it
    appFocusRects    = 3,        // focus regions of an aim (a triangle as three bands)
    appFocusMeasurePx = 1024,    // a focus region is grown to this for its blur (the tiles are 256 px of a 4x reduction)
    appPreviewW      = 360,      // portrait preview width in pixels
@@ -55,6 +57,7 @@ static const float cFocusDiopters = 0.5f, // fixed focus at 2 m for the whole sp
                    cBlurGoodPx = 2.f,      // a green keyframe above this stays open for a sharper one (32 almost good, 2.6)
                    cBlurOrangeRel = 1.3f,  // ...and both floors follow the camera: orange beyond 1.3x the median of the latest keyframes,
                    cBlurRetakeRel = 1.1f,  // a sharper retake beyond 1.1x (the Moto's own softness reads ~5 px: 102600)
+                   cReplaceGain = 0.1f,    // a candidate replaces a cell's photo only this much sharper (no rewrite for a hair)
                    cFocusApexV = 0.5f,     // the focus triangle: top corners of the upright view and this far down the middle
                    cFocusLevelHalf = 0.15f, // level poses: a horizontal strip, the middle 30% of the view high (user, 2026-09-28)
                    cFocusLevelSide = 0.05f, // and the whole width but this margin each side
@@ -138,9 +141,41 @@ enum TSlotState {
    ssFree,      // ready for the camera thread
    ssCandidate, // a frame waiting for the focus worker
    ssMeasuring, // its focus being measured
-   ssHeld,      // its bin's sharpest so far, while the pose stays on the bin
-   ssChosen,    // queued for the keyframe worker
-   ssFinal      // being measured, encoded and stored
+   ssChosen,    // a direct shot queued for the keyframe worker
+   ssFinal,     // a direct shot being measured, encoded and stored
+   ssWrite,     // its cell's new sharpest, waiting for the writer
+   ssWriting    // being written to its cell's file
+};
+
+/* The work area on disk (user, 2026-09-30: the phone's storage as the 3 x 36 table, the writing in a
+   fourth thread). Every cell of a station keeps its sharpest raw frame (planar YUV, ~18 MB at 12 MP) in
+   one of two files, the new one written beside the one in use and taking over only once complete; the
+   keyframe worker reads a cell's file when its turn comes (the green first) and does it again only when
+   a sharper one arrived. Two stations' tables (by the station's parity): the last one drains while the
+   next is captured. */
+enum TCellState {
+   csEmpty,      // no frame yet
+   csPending,    // its frame on disk, the keyframe worker not yet on it
+   csProcessing, // the keyframe worker on it
+   csDone        // measured, encoded and stored
+};
+
+enum {
+   appCellSides = 2 // stations' tables: the current and the one draining
+};
+
+struct TCellEntry {
+   TImageRecord rec;
+   TFrameMeta   meta;
+   TBlurResult  blur;
+   QWORD        stamp;
+   BYTE         state,     // TCellState
+                file,      // the file (0, 1) holding its frame
+                readFile;  // the file the keyframe worker is reading
+   bool         green,     // the focus worker's verdict
+                newer,     // a sharper one arrived while the keyframe worker was on it
+                reading,   // the keyframe worker is copying its file
+                hasFile[2];
 };
 
 // One frame in the pipeline
@@ -152,7 +187,8 @@ struct TKeySlot {
    QWORD        stamp;
    int          band,   // the bin it stands for (a door or floor-view shot: direct, no comparison)
                 bin;
-   bool         direct;
+   bool         direct,
+                green;  // the focus worker's verdict: sharp enough (the keyframe worker takes these first)
    float        focus[4*appFocusRects]; // the focus regions of its aim, where its sharpness is measured
    int          focusCount;
    BYTE         state;  // TSlotState
@@ -184,6 +220,19 @@ class TFocusWorker : public TCormWorker
    TCapApp &Papp;
 };
 
+// Writes each cell's new sharpest to the work area, off every other thread
+class TWriteWorker : public TCormWorker
+{
+ public:
+   explicit TWriteWorker(TCapApp &app) : TCormWorker("writer"), Papp(app) {}
+
+ protected:
+   void DoJob(void) override;
+
+ private:
+   TCapApp &Papp;
+};
+
 // A tap target laid out by the last paint
 struct TButton {
    int  x, y, w, h;
@@ -200,6 +249,7 @@ class TCapApp : public TCapSink
    void Launch(void);
    void EncodePending(void); // keyframe worker thread: every chosen frame in turn
    void FocusPending(void);  // focus worker thread: every closed group in turn
+   void WritePending(void);  // writer thread: every cell's new sharpest to the work area
 
    void OnResize(int w, int h, int densityQ8) override;
    void OnPaint(TSurface &s) override;
@@ -222,12 +272,17 @@ class TCapApp : public TCapSink
    bool  startBestCamera(void);
    TMat4 poseOf(const TAttitude &a) const;
    bool  attitudeAt(QWORD stampNs, TAttitude &out) const;
+   float ringRateDps(QWORD stampNs) const; // the turn rate over the attitude ring's own stamps (NaN: too few)
    void  updatePreview(const TCamFrame &f);
    bool  queueKeyframe(const TCamFrame &f, const TMat4 &pose, const TAttitude &a, bool floorFrame, int band, int bin, bool direct);
    bool  encodeOne(void);
    int   freeSlots(void) const;
    bool  pipelineIdle(void) const;
    bool  binLive(int band, int bin) const;
+   void  cellPath(int side, int band, int bin, int file, LPSTR out, size_t cap) const;
+   void  clearWork(int side, bool sweep = false); // the side's work files removed (sweep: every name, leftovers)
+   bool  cellsBusy(int side) const; // a cell of the side still waits for the keyframe worker
+   bool  pickCell(int &side, int &band, int &bin) const; // the next cell for the keyframe worker (green first)
    void  startRoom(void);
    void  finishRoom(void);
    void  beginStation(TStationKind kind);
@@ -266,6 +321,7 @@ class TCapApp : public TCapSink
    void  wireEdge(TSurface &s, const TMat4 &pose, const TVec3 &a, const TVec3 &b, DWORD rgba);
    void  drawWireframe(TSurface &s);
    void  finishProperty(void);
+   void  closeProperty(void);  // writer thread: the log compacted and closed (no app lock during the copy)
    bool  openSession(void);
    void  drawLabel(TSurface &s, int x, int y, LPCSTR text, DWORD rgba, int sizeDp, bool bold, bool centered);
    void  drawButton(TSurface &s, TButton &b, LPCSTR text, DWORD rgba);
@@ -278,7 +334,14 @@ class TCapApp : public TCapSink
    TJPEGEncoder         Pencoder;
    TKeyframeWorker      Pworker;
    TFocusWorker         PfocusWorker;
+   TWriteWorker         PwriteWorker;
    TKeySlot             Pslot[appSlots];
+   TCellEntry           Pcell[appCellSides][spinMaxBands][spinMaxBins];
+   TBlock<BYTE>         PworkPlanes;  // the keyframe worker's copy of a cell's frame
+   char                 PworkDir[sessionPathMax];
+   bool                 PworkUsed[appCellSides], // a side has files in the work area
+                        Pclosing,     // the property was finished: the writer compacts and closes it once all is in
+                        PcloseRunning;
    TBlock<TSpinTracker> Pspin,
                         Pahead;       // at a corner, the floor view taken early (tilted down during the fan)
    TBlock<DWORD>        Ppreview;
@@ -317,7 +380,8 @@ class TCapApp : public TCapSink
    bool                 PbinDone[spinMaxBands][spinMaxBins], // the keyframe of the bin went through the vanishing check
                         PbinOrange[spinMaxBands][spinMaxBins], // its verdict: far off the axes or blurred (accepted, open to a retake)
                         PbinGap[spinMaxBands][spinMaxBins];    // empty between two done bins, already signaled
-   float                PbinBlur[spinMaxBands][spinMaxBins];   // FFT blur of the bin's keyframe (NaN: plain image)
+   float                PbinBlur[spinMaxBands][spinMaxBins],   // FFT blur of the bin's keyframe (NaN: plain image)
+                        PaimDiopters[3];                       // the lens distance each aim focused at in this station (NaN: none yet)
    BYTE                 PbinTries[spinMaxBands][spinMaxBins];  // retakes offered to a green bin for a sharper photo
    QWORD                PbinStamp[spinMaxBands][spinMaxBins],  // stamp of the bin's current photo (its rtImage)
                         Psuperseded[appMaxSuperseded];         // photos replaced so far in the property
@@ -342,6 +406,7 @@ class TCapApp : public TCapSink
                         PbtnFinish;
    QWORD                PlastFrameNs, // the camera's previous frame (its native rate)
                         PfocusNs,     // the focus run began
+                        PsettleNs,    // a held focus moved the lens: no keyframe before this
                         PbackArmedNs, // first Back pressed at (0: not armed)
                         PdoorShotNs,  // the door station's last shot
                         PdoorPrevNs;  // and its previous frame (turn rate)
@@ -397,16 +462,22 @@ void TKeyframeWorker::DoJob(void)
 }
 
 //--------------------------------------------------------------------------------
+void TWriteWorker::DoJob(void)
+{
+   Papp.WritePending();
+}
+
+//--------------------------------------------------------------------------------
 void TFocusWorker::DoJob(void)
 {
    Papp.FocusPending();
 }
 
 //--------------------------------------------------------------------------------
-TCapApp::TCapApp(TCapPort *port) : Pport(port), Pencoder(appJPEGQuality), Pworker(*this), PfocusWorker(*this), Pslot(), Pring(),
+TCapApp::TCapApp(TCapPort *port) : Pport(port), Pencoder(appJPEGQuality), Pworker(*this), PfocusWorker(*this), PwriteWorker(*this), Pslot(), Pcell(), PworkUsed(), Pclosing(false), PcloseRunning(false), Pring(),
    Pcam(), Pintr(), Ploc(), Pverdict(svCovered), PcenterCfg(), PcornerCfg(), PfloorCfg(),
    PvanishCfg(TVanishConfig::Default()), PaxisCheck(cAxisTolDeg), PaxisVerdict(avNoLines), Pplan(), PguidePlan(), Pedges(),
-   PfocusAim(faLevel), PfocusWant(faLevel), PfocusTries(0), PfocusBand(0), PcornerStep(0), PcornerCount(4), PcornerSlot(0), PcornerMask(0u), PbinAxis(), PbinDone(), PbinOrange(), PbinGap(), PbinBlur(), PbinTries(), PbinStamp(), Psuperseded(), ProomBlur(), ProomBlurCount(0), PsupersededCount(0), PguideCount(0), PdoorCount(0), PplanDoorCount(0), PdoorIdx(0), PdoorCand(), PplanDoors(), PdoorEye(), PguideDeg(), PguideAt(), PguideConvex(), PplanWanted(false), PplanSketch(false), Pphase(rpNone), Pstation(), PbtnMain(), PbtnFinish(), PlastFrameNs(0u), PfocusNs(0u), PbackArmedNs(0u), PdoorShotNs(0u), PdoorPrevNs(0u), PkeySeq(0u),
+   PfocusAim(faLevel), PfocusWant(faLevel), PfocusTries(0), PfocusBand(0), PcornerStep(0), PcornerCount(4), PcornerSlot(0), PcornerMask(0u), PbinAxis(), PbinDone(), PbinOrange(), PbinGap(), PbinBlur(), PaimDiopters(), PbinTries(), PbinStamp(), Psuperseded(), ProomBlur(), ProomBlurCount(0), PsupersededCount(0), PguideCount(0), PdoorCount(0), PplanDoorCount(0), PdoorIdx(0), PdoorCand(), PplanDoors(), PdoorEye(), PguideDeg(), PguideAt(), PguideConvex(), PplanWanted(false), PplanSketch(false), Pphase(rpNone), Pstation(), PbtnMain(), PbtnFinish(), PlastFrameNs(0u), PfocusNs(0u), PsettleNs(0u), PbackArmedNs(0u), PdoorShotNs(0u), PdoorPrevNs(0u), PkeySeq(0u),
    PstationCount(0u), ProomIndex(0u), Pchosen(), PchosenHead(0), PchosenCount(0), PcurBand(-1), PcurBin(-1),
    PviewW(0), PviewH(0), Pdensity(256), PringHead(0), PringCount(0), PpreviewH(0), PpropRatios(0), Prooms(0), PcamFps(30.f), PfocusSec(0.3f), PkeepErr(0.f), PdoorPrevHeading(0.f), PpropCeilingM(NAN), PpropRatioSum(0.f), PhfovDeg(60.f),
    PvfovDeg(60.f), PcamReady(false), PlocAllowed(false), PhasLoc(false), PhasPreview(false),
@@ -421,10 +492,14 @@ TCapApp::TCapApp(TCapPort *port) : Pport(port), Pencoder(appJPEGQuality), Pworke
 //--------------------------------------------------------------------------------
 TCapApp::~TCapApp(void)
 {
+   PwriteWorker.Terminate();
+   PwriteWorker.Join();
    PfocusWorker.Terminate();
    PfocusWorker.Join();
    Pworker.Terminate();
    Pworker.Join();
+   if (Pclosing && !PcloseRunning) // exiting before the writer got to it: compact and close here
+      closeProperty();
    Psession.Close(Pport->WallClockNs());
 }
 
@@ -433,6 +508,12 @@ void TCapApp::Launch(void)
 {
    Pworker.Start(thisInfo);
    PfocusWorker.Start(thisInfo);
+   PwriteWorker.Start(thisInfo);
+   Pport->DataDir(PworkDir, sizeof(PworkDir));
+   snprintf(PworkDir + strlen(PworkDir), sizeof(PworkDir) - strlen(PworkDir), "/work");
+   sessionMakeDir(PworkDir);
+   for (int side = 0; side < appCellSides; side++) // leftovers of a run that ended early
+      clearWork(side, true);
    Pport->SetSink(this);
    Pport->KeepScreenOn(true); // permissions are (re)checked on every OnResume
 }
@@ -550,6 +631,12 @@ void TCapApp::OnCameraReady(const TCamInfo &info)
          planes.Drop(Pslot[s].planes);
          Pslot[s].state = (BYTE)ssFree;
       }
+      if (!PworkPlanes()) // the keyframe worker's copy of a cell read back from the work area
+      {
+         TAlloc<BYTE> planes((size_t)info.width*info.height*3u/2u + 16u);
+
+         planes.Drop(PworkPlanes);
+      }
    }
    if (!PedgeRays())
    {
@@ -600,6 +687,36 @@ bool TCapApp::attitudeAt(QWORD stampNs, TAttitude &out) const
       }
    }
    return found && bestGap <= (QWORD)appMaxAttitudeMs*1000000u;
+}
+
+/*--------------------------------------------------------------------------------
+   The turn rate at a frame (20260930_101732: frames kept turning ~3 degrees/s, the limit 2.33): the
+   frame-to-frame rate compared two frames' nearest attitudes, and the sensor's events come in bursts -
+   two frames sharing one attitude read 0. Here the two attitudes nearest the frame and appRateWindowMs
+   before it, by their own stamps: the larger swing of the forward and the up over their time apart.
+  --------------------------------------------------------------------------------*/
+float TCapApp::ringRateDps(QWORD stampNs) const
+{
+   TAttitude now,
+             before;
+   QWORD     back = (QWORD)appRateWindowMs*1000000u;
+
+   if (stampNs <= back || !attitudeAt(stampNs, now) || !attitudeAt(stampNs - back, before) || now.stampNs <= before.stampNs)
+      return NAN;
+
+   float dt = (float)(now.stampNs - before.stampNs)*1e-9f;
+
+   if (dt < 0.5f*(float)appRateWindowMs*1e-3f) // the ring does not reach that far back yet
+      return NAN;
+
+   TMat4 a = poseOf(now),
+         b = poseOf(before);
+   TVec3 fa = a.Forward(),
+         fb = b.Forward();
+   float cf = fa.x*fb.x + fa.y*fb.y + fa.z*fb.z,
+         cu = a.m[4]*b.m[4] + a.m[5]*b.m[5] + a.m[6]*b.m[6];
+
+   return acosf(fminf(1.f, fminf(cf, cu)))*57.2957795f/dt;
 }
 
 //--------------------------------------------------------------------------------
@@ -796,27 +913,113 @@ int TCapApp::freeSlots(void) const
 }
 
 //--------------------------------------------------------------------------------
-// No frame anywhere in the pipeline (the plan waits for the last verdicts)
+// No frame anywhere in the pipeline nor waiting in the work area (the plan waits for the last verdicts)
 bool TCapApp::pipelineIdle(void) const
 {
    for (int s = 0; s < appSlots; s++)
       if (Pslot[s].state != (BYTE)ssFree)
          return false;
-   return true;
+   return !cellsBusy(0) && !cellsBusy(1);
 }
 
 //--------------------------------------------------------------------------------
-// The bin still takes candidates: a frame of it waits in the pipeline, the keyframe worker not yet on it
+bool TCapApp::cellsBusy(int side) const
+{
+   for (int b = 0; b < spinMaxBands; b++)
+      for (int c = 0; c < spinMaxBins; c++)
+         if (Pcell[side][b][c].state == (BYTE)csPending || Pcell[side][b][c].state == (BYTE)csProcessing)
+            return true;
+   return false;
+}
+
+//--------------------------------------------------------------------------------
+void TCapApp::cellPath(int side, int band, int bin, int file, LPSTR out, size_t cap) const
+{
+   snprintf(out, cap, "%s/cell_%d_%d_%02d_%d.yuv", PworkDir, side, band, bin, file);
+}
+
+//--------------------------------------------------------------------------------
+void TCapApp::clearWork(int side, bool sweep)
+{
+   for (int b = 0; b < spinMaxBands; b++)
+      for (int c = 0; c < spinMaxBins; c++)
+      {
+         for (int file = 0; file < 2; file++)
+         {
+            if (!sweep && !Pcell[side][b][c].hasFile[file]) // only what was written: the lock is held
+               continue;
+
+            char path[sessionPathMax];
+
+            cellPath(side, b, c, file, path, sizeof(path));
+            remove(path);
+         }
+         Pcell[side][b][c] = TCellEntry();
+      }
+}
+
+/*--------------------------------------------------------------------------------
+   The bin still takes candidates: a frame of it waits in the pipeline or in the work area, the
+   keyframe worker not yet done with it - or (user, 2026-09-30: the cells stay open) its stored photo
+   can still get better: orange, or blurred beyond the retake floor.
+  --------------------------------------------------------------------------------*/
 bool TCapApp::binLive(int band, int bin) const
 {
    for (int s = 0; s < appSlots; s++)
    {
       const TKeySlot &k = Pslot[s];
 
-      if (k.state != (BYTE)ssFree && k.state != (BYTE)ssFinal && !k.direct && k.band == band && k.bin == bin)
+      if (k.state != (BYTE)ssFree && !k.direct && k.band == band && k.bin == bin)
          return true;
    }
-   return false;
+   if (band < 0 || band >= spinMaxBands || bin < 0 || bin >= spinMaxBins)
+      return false;
+
+   const TCellEntry &e = Pcell[Pstation.index%appCellSides][band][bin];
+
+   if (e.state == (BYTE)csPending || e.state == (BYTE)csProcessing)
+      return true;
+   if (!PbinDone[band][bin])
+      return false;
+   return PbinOrange[band][bin] || (!isnan(PbinBlur[band][bin]) && PbinBlur[band][bin] > blurFloorPx(cBlurRetakeRel, cBlurGoodPx));
+}
+
+/*--------------------------------------------------------------------------------
+   The keyframe worker's next cell: the draining station's before the current one's, the green before
+   the orange (user, 2026-09-30) - an orange one goes first only after appOrangeWaitMs, a sharper frame
+   of its cell may take its place meanwhile - and a cell the pose still lies on last (more candidates
+   may come); false when none waits
+  --------------------------------------------------------------------------------*/
+bool TCapApp::pickCell(int &side, int &band, int &bin) const
+{
+   int   cur = (int)(Pstation.index%appCellSides),
+         bestRank = -1;
+   QWORD bestStamp = 0u;
+
+   side = band = bin = -1;
+   for (int sd = 0; sd < appCellSides; sd++)
+      for (int b = 0; b < spinMaxBands; b++)
+         for (int c = 0; c < spinMaxBins; c++)
+         {
+            const TCellEntry &e = Pcell[sd][b][c];
+
+            if (e.state != (BYTE)csPending)
+               continue;
+
+            bool due = e.green || PlastFrameNs > e.stamp + (QWORD)appOrangeWaitMs*1000000u,
+                 underPose = sd == cur && b == PcurBand && c == PcurBin;
+            int  rank = (sd != cur ? 4 : 0) + (due ? 2 : 0) + (underPose ? 0 : 1);
+
+            if (rank > bestRank || (rank == bestRank && e.stamp < bestStamp))
+            {
+               bestRank = rank;
+               bestStamp = e.stamp;
+               side = sd;
+               band = b;
+               bin = c;
+            }
+         }
+   return bestRank >= 0;
 }
 
 /*--------------------------------------------------------------------------------
@@ -896,10 +1099,11 @@ void TCapApp::EncodePending(void)
 
 /*--------------------------------------------------------------------------------
    The focus worker (user, 2026-09-28): each candidate, oldest first, its focus measured (the blur
-   of the raw luma) and compared with the frame its bin holds - none held is focus 0: the first
-   frame always enters; the sharper one stays, the other's slot is freed. A bin the keyframe worker
-   has begun (its slot final, set under the mutex) is no longer updated. What a bin holds goes on
-   to the keyframe worker once the pose leaves it; a door or floor-view shot goes on as it is.
+   of the raw luma) and weighed against its cell (user, 2026-09-30): the frame the cell holds in the
+   work area, or one of it still waiting for the writer - none held is focus 0, the first frame always
+   enters. Only a clearly sharper one (cReplaceGain) wins, and it goes to the writer at once; an orange
+   cell takes any (it may be off the axes). A door or floor-view shot goes to the keyframe worker as it
+   is.
   --------------------------------------------------------------------------------*/
 void TCapApp::FocusPending(void)
 {
@@ -917,73 +1121,154 @@ void TCapApp::FocusPending(void)
          if (id >= 0)
             Pslot[id].state = (BYTE)ssMeasuring;
       }
-      if (id >= 0) // the slot stays put while measuring: no lock
-      {
-         TKeySlot &k = Pslot[id];
+      if (id < 0)
+         return;
 
-         focusBlur(k, k.blur);
+      TKeySlot &k = Pslot[id]; // the slot stays put while measuring: no lock
+
+      focusBlur(k, k.blur);
+
+      TMutexLock lock(Pmutex, thisInfo);
+      float      px = isnan(k.blur.medianPx) ? 1e8f : k.blur.medianPx,
+                 bar = 1.f - cReplaceGain;
+      bool       cell = !k.direct && k.band >= 0 && k.band < spinMaxBands && k.bin >= 0 && k.bin < spinMaxBins;
+
+      k.green = k.direct || (!isnan(k.blur.medianPx) && k.blur.medianPx <= blurFloorPx(cBlurOrangeRel, cBlurMaxPx));
+      PfocusSec = 0.8f*PfocusSec + 0.2f*(float)(Pport->SensorClockNs() - started)*1e-9f; // the capture cadence
+      if (!cell)
+      {
+         if (PchosenCount < appSlots)
+         {
+            k.state = (BYTE)ssChosen;
+            Pchosen[(PchosenHead + PchosenCount)%appSlots] = id;
+            PchosenCount++;
+            Pworker.Post();
+         }
+         else
+            k.state = (BYTE)ssFree;
+         continue;
       }
+
+      // against a frame of the cell still waiting for the writer (the sharper stays), then against the work area's
+      int  rival = -1;
+      bool beaten = false,
+           orange = PbinDone[k.band][k.bin] && PbinOrange[k.band][k.bin] && k.meta.stationIndex == (BYTE)Pstation.index;
+
+      for (int s = 0; s < appSlots; s++)
+      {
+         const TKeySlot &o = Pslot[s];
+
+         if (s == id || o.direct || o.band != k.band || o.bin != k.bin || o.meta.stationIndex != k.meta.stationIndex)
+            continue;
+         if (o.state == (BYTE)ssWrite)
+            rival = s;
+         else if (o.state == (BYTE)ssWriting && !isnan(o.blur.medianPx))
+            beaten = beaten || px >= bar*o.blur.medianPx;
+      }
+
+      const TCellEntry &e = Pcell[k.meta.stationIndex%appCellSides][k.band][k.bin];
+
+      if (e.state != (BYTE)csEmpty && !orange && !isnan(e.blur.medianPx))
+         beaten = beaten || px >= bar*e.blur.medianPx;
+      if (rival >= 0 && !isnan(Pslot[rival].blur.medianPx))
+         beaten = beaten || px >= Pslot[rival].blur.medianPx;
+      if (beaten)
+         k.state = (BYTE)ssFree;
+      else
+      {
+         if (rival >= 0)
+            Pslot[rival].state = (BYTE)ssFree;
+         k.state = (BYTE)ssWrite;
+         PwriteWorker.Post();
+      }
+   }
+}
+
+/*--------------------------------------------------------------------------------
+   The writer (user, 2026-09-30: a fourth thread, so the disk slows none of the others): each cell's
+   new sharpest, oldest first, written whole beside the cell's file in use; once complete it becomes
+   the cell's frame and waits for the keyframe worker (a cell the keyframe worker is on is marked newer:
+   it goes again once done). The file the keyframe worker is copying is never written: the frame waits.
+   A first frame that cannot be written reopens its bin (the tracker counted it).
+  --------------------------------------------------------------------------------*/
+void TCapApp::WritePending(void)
+{
+   for (;;)
+   {
+      int  id = -1,
+           side = 0,
+           target = 0;
+      char path[sessionPathMax];
+
       {
          TMutexLock lock(Pmutex, thisInfo);
 
-         if (id >= 0)
+         for (int s = 0; s < appSlots; s++)
          {
-            TKeySlot &k = Pslot[id];
-            int       rival = -1;
-            bool      locked = false; // the keyframe worker began the bin: it stays as it is
+            const TKeySlot &k = Pslot[s];
 
-            for (int s = 0; s < appSlots && !k.direct; s++)
-            {
-               const TKeySlot &o = Pslot[s];
+            if (k.state != (BYTE)ssWrite || (id >= 0 && k.stamp >= Pslot[id].stamp))
+               continue;
 
-               if (s == id || o.direct || o.band != k.band || o.bin != k.bin)
-                  continue;
-               if (o.state == (BYTE)ssFinal)
-                  locked = true;
-               else if (o.state == (BYTE)ssHeld || o.state == (BYTE)ssChosen)
-                  rival = s;
-            }
+            const TCellEntry &e = Pcell[k.meta.stationIndex%appCellSides][k.band][k.bin];
+            int               t = e.state == (BYTE)csEmpty ? 0 : 1 - (int)e.file;
 
-            float px = isnan(k.blur.medianPx) ? 1e8f : k.blur.medianPx,
-                  heldPx = rival >= 0 && !isnan(Pslot[rival].blur.medianPx) ? Pslot[rival].blur.medianPx : 1e8f;
-
-            if (k.direct)
-               k.state = (BYTE)ssHeld; // passed on below
-            else if (locked || (rival >= 0 && px >= heldPx))
-               k.state = (BYTE)ssFree;
-            else if (rival < 0)
-               k.state = (BYTE)ssHeld;
-            else
-            {
-               k.state = Pslot[rival].state; // takes the rival's place, in the keyframe worker's queue too
-               for (int i = 0; i < PchosenCount; i++)
-                  if (Pchosen[(PchosenHead + i)%appSlots] == rival)
-                     Pchosen[(PchosenHead + i)%appSlots] = id;
-               Pslot[rival].state = (BYTE)ssFree;
-            }
-            PfocusSec = 0.8f*PfocusSec + 0.2f*(float)(Pport->SensorClockNs() - started)*1e-9f; // the capture cadence
+            if (e.reading && (int)e.readFile == t) // the keyframe worker is copying that file: later
+               continue;
+            id = s;
+            target = t;
          }
-
-         bool passed = false;
-
-         for (int s = 0; s < appSlots; s++) // the bins the pose left go on
+         if (id >= 0) // taken under the same lock: the focus worker cannot free it meanwhile
          {
-            TKeySlot &k = Pslot[s];
-
-            if (k.state == (BYTE)ssHeld && PchosenCount < appSlots && (k.direct || k.band != PcurBand || k.bin != PcurBin
-                                                                   || PlastFrameNs > k.stamp + (QWORD)appHoldMs*1000000u))
-            {
-               k.state = (BYTE)ssChosen;
-               Pchosen[(PchosenHead + PchosenCount)%appSlots] = s;
-               PchosenCount++;
-               passed = true;
-            }
+            Pslot[id].state = (BYTE)ssWriting;
+            side = (int)(Pslot[id].meta.stationIndex%appCellSides);
+            cellPath(side, Pslot[id].band, Pslot[id].bin, target, path, sizeof(path));
          }
-         if (passed)
-            Pworker.Post();
-         if (id < 0)
+         else if (Pclosing && !PcloseRunning && pipelineIdle()) // nothing to write: a finished property is closed
+            PcloseRunning = true;
+         else
             return;
       }
+      if (id < 0)
+      {
+         closeProperty();
+         return;
+      }
+
+      TKeySlot &k = Pslot[id]; // the slot stays put while written: no lock
+      size_t    bytes = (size_t)k.rec.width*k.rec.height + 2u*(size_t)((k.rec.width + 1u)/2u)*((k.rec.height + 1u)/2u);
+      FILE     *out = fopen(path, "wb");
+      bool      ok = out && fwrite(k.planes(), 1u, bytes, out) == bytes;
+
+      if (out)
+         ok = fclose(out) == 0 && ok;
+
+      TMutexLock  lock(Pmutex, thisInfo);
+      TCellEntry &e = Pcell[side][k.band][k.bin];
+
+      if (ok)
+      {
+         e.rec = k.rec;
+         e.meta = k.meta;
+         e.blur = k.blur;
+         e.stamp = k.stamp;
+         e.green = k.green;
+         e.file = (BYTE)target;
+         e.hasFile[target] = true;
+         PworkUsed[side] = true;
+         if (e.state == (BYTE)csProcessing)
+            e.newer = true;
+         else
+            e.state = (BYTE)csPending;
+         Pworker.Post();
+      }
+      else
+      {
+         Pport->Log("work area: a cell could not be written");
+         if (e.state == (BYTE)csEmpty && Pspin && k.meta.stationIndex == (BYTE)Pstation.index)
+            Pspin->Reopen(k.band, k.bin, true);
+      }
+      k.state = (BYTE)ssFree;
    }
 }
 
@@ -999,36 +1284,58 @@ bool TCapApp::encodeOne(void)
    TVanishConfig tuned = PvanishCfg;
    TBlurResult   blur;
    QWORD         stamp;
-   int           slot;
+   int           slot,
+                 cellSide = -1,
+                 cellBand = -1,
+                 cellBin = -1;
+   char          path[sessionPathMax];
    bool          measured,
                  alert = false; // this frame turned its bin orange or left a gap in its band
 
    {
       TMutexLock lock(Pmutex, thisInfo);
 
-      if (!PchosenCount)
+      /* a door or floor-view shot first (the operator waits on it), straight from its slot; else the next cell of the
+         work area (pickCell: green before orange), read back from its file */
+      slot = -1;
+      if (PchosenCount)
+      {
+         slot = Pchosen[PchosenHead];
+         PchosenHead = (PchosenHead + 1)%appSlots;
+         PchosenCount--;
+      }
+      else if (!pickCell(cellSide, cellBand, cellBin) || !PworkPlanes())
          return false;
-      slot = Pchosen[PchosenHead];
-      PchosenHead = (PchosenHead + 1)%appSlots;
-      PchosenCount--;
 
-      TKeySlot &k = Pslot[slot];
-      int       cw = ((int)k.rec.width + 1)/2,
-                ch = ((int)k.rec.height + 1)/2;
+      TKeySlot   *k = slot >= 0 ? &Pslot[slot] : NULL;
+      TCellEntry *e = slot < 0 ? &Pcell[cellSide][cellBand][cellBin] : NULL;
 
-      k.state = (BYTE)ssFinal;
-      img.width = (int)k.rec.width;
-      img.height = (int)k.rec.height;
-      img.y = k.planes();
+      rec = k ? k->rec : e->rec;
+      meta = k ? k->meta : e->meta;
+      stamp = k ? k->stamp : e->stamp;
+      blur = k ? k->blur : e->blur; // the focus worker's measure
+
+      int cw = ((int)rec.width + 1)/2,
+          ch = ((int)rec.height + 1)/2;
+
+      if (k)
+         k->state = (BYTE)ssFinal;
+      else
+      {
+         e->state = (BYTE)csProcessing;
+         e->newer = false;
+         e->reading = true;
+         e->readFile = e->file;
+         cellPath(cellSide, cellBand, cellBin, (int)e->file, path, sizeof(path));
+      }
+      img.width = (int)rec.width;
+      img.height = (int)rec.height;
+      img.y = k ? k->planes() : PworkPlanes();
       img.yStride = img.width;
       img.u = img.y + (size_t)img.width*img.height;
       img.v = img.u + (size_t)cw*ch;
       img.uvRowStride = cw;
       img.uvPixelStride = 1;
-      rec = k.rec;
-      meta = k.meta;
-      stamp = k.stamp;
-      blur = k.blur; // the focus worker's measure
 
       TEXIFInfo exif = {};
 
@@ -1045,6 +1352,30 @@ bool TCapApp::encodeOne(void)
       exif.altMm = meta.altMm;
       Pexif.Clear();
       exifBuild(exif, Pexif);
+   }
+   if (slot < 0) // the cell's frame read back (the writer never touches this file meanwhile)
+   {
+      size_t bytes = (size_t)rec.width*rec.height + 2u*(size_t)((rec.width + 1u)/2u)*((rec.height + 1u)/2u);
+      FILE  *in = fopen(path, "rb");
+      bool   ok = in && fread(PworkPlanes(), 1u, bytes, in) == bytes;
+
+      if (in)
+         fclose(in);
+
+      TMutexLock  lock(Pmutex, thisInfo);
+      TCellEntry &e = Pcell[cellSide][cellBand][cellBin];
+
+      e.reading = false;
+      PwriteWorker.Post(); // a frame waiting for this file may go now
+      if (!ok)
+      {
+         Pport->Log("work area: a cell could not be read");
+         e.state = e.newer ? (BYTE)csPending : (BYTE)csEmpty;
+         if (!e.newer && Pspin && meta.stationIndex == (BYTE)Pstation.index)
+            Pspin->Reopen(cellBand, cellBin, true);
+         e.newer = false;
+         return true;
+      }
    }
 
    // the slot stays put while it is final: detect without holding the camera thread
@@ -1213,10 +1544,31 @@ bool TCapApp::encodeOne(void)
    {
       TMutexLock lock(Pmutex, thisInfo);
 
-      Pslot[slot].state = (BYTE)ssFree;
+      if (slot >= 0)
+         Pslot[slot].state = (BYTE)ssFree;
+      else
+      {
+         TCellEntry &e = Pcell[cellSide][cellBand][cellBin];
+
+         e.state = e.newer ? (BYTE)csPending : (BYTE)csDone; // a sharper one came meanwhile: its turn again
+         e.newer = false;
+      }
+
+      // a station's work area is removed once it is no longer captured and nothing of it waits
+      int  cur = (int)(Pstation.index%appCellSides);
+      bool capturing = Pphase == rpCenter || Pphase == rpCorner;
+
+      for (int side = 0; side < appCellSides; side++)
+         if (PworkUsed[side] && !(capturing && side == cur) && !cellsBusy(side))
+         {
+            clearWork(side);
+            PworkUsed[side] = false;
+         }
       if (alert)
          Palert = true;
       checkComplete(); // the verdict of this frame may be the last one the station waited for
+      if (Pclosing) // the last frame of a finished property: the writer may close it now
+         PwriteWorker.Post();
       if (PplanWanted && pipelineIdle())
          solvePlan(); // the keyframe that closed the center spin is in: the plan can be made
    }
@@ -1326,6 +1678,8 @@ void TCapApp::OnFocus(bool locked, float diopters)
    snprintf(msg, sizeof(msg), "focus %s at %.2f D (try %d)", locked ? "locked" : "held unlocked", diopters, PfocusTries);
    Pport->Log(msg);
    Pfocusing = false;
+   if (!odd) // this aim's distance for the station: the next visit to its band takes it back at once
+      PaimDiopters[PfocusAim] = diopters;
    if (odd && PfocusTries < appFocusTries)
       requestFocus(PfocusAim);
    Pport->RequestPaint();
@@ -1377,19 +1731,40 @@ void TCapApp::OnFrame(const TCamFrame &frame)
       if (Pfocusing && frame.stampNs - PfocusNs > (QWORD)appFocusMaxMs*1000000u)
          Pfocusing = false; // the camera never answered: go on with the lens as it is
 
-      // the center spin moves on to the floor band: focus again, for the floor
-      int guided = Pspin->GuidedBand();
+      /* the center spin moves on to another band: focus again, for it. Layered, the guided band; the zigzag changes
+         band shot by shot (user, 2026-09-30), so the focus follows the band the pose is on (the nearest aim), and a band
+         focused once in the station takes its lens distance back at once, no autofocus run (up to 2.5 s each) */
+      int fb = Pspin->GuidedBand();
 
-      if (Pphase == rpCenter && guided >= 0 && guided != PfocusBand && !Pfocusing)
+      if (PcenterCfg.zigzag && Pphase == rpCenter)
       {
-         PfocusBand = guided;
+         float pitch = geomPitchDeg(pose.Forward());
+
+         fb = 0;
+         for (int b = 1; b < Pspin->BandCount(); b++)
+            fb = fabsf(pitch - Pspin->BandPitchDeg(b)) < fabsf(pitch - Pspin->BandPitchDeg(fb)) ? b : fb;
+      }
+      if (Pphase == rpCenter && fb >= 0 && fb != PfocusBand && !Pfocusing)
+      {
+         TFocusAim aim = Pspin->BandPitchDeg(fb) > 5.f ? faCeiling : (Pspin->BandPitchDeg(fb) < -5.f ? faFloor : faLevel);
+
+         PfocusBand = fb;
          PfocusTries = 0;
-         wantFocus(Pspin->BandPitchDeg(guided) > 5.f ? faCeiling
-                                                     : (Pspin->BandPitchDeg(guided) < -5.f ? faFloor : faLevel));
+         if (!isnan(PaimDiopters[aim]) && Pport->HoldFocus(PaimDiopters[aim]))
+         {
+            PfocusAim = aim;
+            PfocusPending = false;
+            PsettleNs = frame.stampNs + (QWORD)appFocusSettleMs*1000000u;
+         }
+         else
+            wantFocus(aim);
       }
 
-      // no free slot or focusing: observe only, never mark a bin we cannot save sharp
-      Pverdict = Pspin->Offer(frame.stampNs, pose, a.accuracyDeg, freeSlots() > 0 && !Pfocusing && !PfocusPending);
+      // no free slot, focusing or the lens still moving: observe only, never mark a bin we cannot save sharp
+      bool lensReady = !Pfocusing && !PfocusPending && frame.stampNs >= PsettleNs;
+      float rate = ringRateDps(frame.stampNs);
+
+      Pverdict = Pspin->Offer(frame.stampNs, pose, a.accuracyDeg, freeSlots() > 0 && lensReady, rate);
       PposeOk = Pspin->PoseAllowed();
 
       // a pending focus runs once the pose sits in its band and holds still: the aim is then what will be captured
@@ -1415,7 +1790,7 @@ void TCapApp::OnFrame(const TCamFrame &frame)
       else if (curBand >= 0 && binLive(curBand, curBin))
       {
          PkeepErr = fminf(1.f, PkeepErr + 1.f/fmaxf(1.f, PfocusSec*PcamFps)); // frames taken per camera frame
-         if (PkeepErr >= 1.f && Pverdict != svTooFast && !Pfocusing && freeSlots() > appSlotReserve
+         if (PkeepErr >= 1.f && Pverdict != svTooFast && lensReady && freeSlots() > appSlotReserve
              && queueKeyframe(frame, pose, a, false, curBand, curBin, false))
          {
             PkeepErr -= 1.f;
@@ -1430,7 +1805,8 @@ void TCapApp::OnFrame(const TCamFrame &frame)
       {
          Pahead->AimFan(floorViewHeadingDeg());
 
-         TSpinVerdict fv = Pahead->Offer(frame.stampNs, pose, a.accuracyDeg, freeSlots() > 0 && !Pfocusing && !PfocusPending);
+         TSpinVerdict fv = Pahead->Offer(frame.stampNs, pose, a.accuracyDeg, freeSlots() > 0 && !Pfocusing && !PfocusPending,
+                                         rate);
 
          PposeOk = fv != svOffBand && fv != svOutside;
          if (fv == svKeep)
@@ -2071,7 +2447,7 @@ bool TCapApp::openSession(void)
 //--------------------------------------------------------------------------------
 void TCapApp::startRoom(void)
 {
-   if (!PcamReady || !Pspin)
+   if (!PcamReady || !Pspin || Pclosing) // the last property is still being saved
       return;
    if (!Psession.IsOpen() && !openSession())
    {
@@ -2134,6 +2510,17 @@ void TCapApp::beginStation(TStationKind kind)
    Pahead = kind == skCorner ? new TSpinTracker(PfloorCfg) : NULL; // the floor view, should it come early
    Pverdict = svCovered;
    PfocusTries = 0;
+   for (int k = 0; k < 3; k++)
+      PaimDiopters[k] = NAN;
+   PsettleNs = 0u;
+
+   // this station's side of the work area starts empty (a station two back still waiting there is given up)
+   int side = (int)(Pstation.index%appCellSides);
+
+   if (cellsBusy(side))
+      Pport->Log("work area: an old station's frames given up");
+   clearWork(side);
+   PworkUsed[side] = false;
    PfocusBand = kind == skCenter ? PcenterCfg.bandCount - 1 : 0; // the center spin starts at the ceiling
    wantFocus(kind == skCenter && PcenterCfg.bandCount > 1 ? faCeiling : faLevel);
 }
@@ -2329,22 +2716,41 @@ void TCapApp::writeLayout(bool doorScaled)
    Psession.WriteLayout(Pport->SensorClockNs(), rec);
 }
 
-//--------------------------------------------------------------------------------
+/*--------------------------------------------------------------------------------
+   The property ends: the writer compacts and closes the log once the pipeline and the work area are
+   empty (20260930_101732: compacting 360 MB on the main thread froze it 6 s - Android's "not
+   responding"). Until then no new room starts.
+  --------------------------------------------------------------------------------*/
 void TCapApp::finishProperty(void)
 {
-   TSessionCounts c = Psession.Counts();
-
+   if (Pclosing)
+      return;
    finishRoom();
+   Pclosing = true;
+   snprintf(Pstatus, sizeof(Pstatus), "Salvando o imóvel...");
+   PwriteWorker.Post();
+}
 
+//--------------------------------------------------------------------------------
+void TCapApp::closeProperty(void)
+{
    // production: a replaced photo is overwritten - the log drops it once, now (user, 2026-09-27); debug keeps both
    if (!appKeepSuperseded && PsupersededCount)
       Psession.Compact(Psuperseded, PsupersededCount);
-   PsupersededCount = 0;
-   c = Psession.Counts();
+
+   TSessionCounts c = Psession.Counts();
+
    Psession.Close(Pport->WallClockNs());
+
+   TMutexLock lock(Pmutex, thisInfo);
+
+   PsupersededCount = 0;
    snprintf(Pstatus, sizeof(Pstatus), "Imóvel salvo: %lu cômodos, %llu imagens", (unsigned long)c.rooms,
             (unsigned long long)c.images);
    Prooms = 0;
+   Pclosing = false;
+   PcloseRunning = false;
+   Pport->RequestPaint();
 }
 
 //--------------------------------------------------------------------------------
@@ -2565,10 +2971,32 @@ void TCapApp::hintText(LPSTR out, size_t cap) const
       return;
    }
 
+   /* the zigzag (user, 2026-09-30): tilt to the next cell of the column, turn to the next column at its end;
+      a nudge only when the pose is a band away or the column is not yet the next one */
+   int   zigBand,
+         zigBin;
+   float pitch = spin->LastPitchDeg();
+
+   if (Pphase == rpCenter && spin->GuidedCell(zigBand, zigBin))
+   {
+      float  target = spin->BandPitchDeg(zigBand),
+             gap = fabsf(geomHeadingDiffDeg(spin->BinCenterDeg(zigBin, spin->LastHeadingDeg()), spin->LastHeadingDeg()));
+      LPCSTR what = target > 0.f ? "linha do teto" : (target < 0.f ? "linha do piso" : "paredes");
+
+      if (spin->PitchSide(zigBand, pitch) < 0)
+         snprintf(out, cap, "Incline para cima (%s)", what);
+      else if (spin->PitchSide(zigBand, pitch) > 0)
+         snprintf(out, cap, "Incline para baixo (%s)", what);
+      else if (gap > 0.6f*spin->BinWidthDeg())
+         snprintf(out, cap, "Gire devagar até a próxima coluna");
+      else
+         snprintf(out, cap, "Segure firme (%s)", what);
+      return;
+   }
+
    /* ceiling first: its creases are rarely hidden by furniture, so the room axes (vanishing points) are
       agreed early and every later frame is checked against a firm reference; then down to the floor */
-   int   best = spin->BandCount() - 1;
-   float pitch = spin->LastPitchDeg();
+   int best = spin->BandCount() - 1;
 
    while (best > 0 && spin->BandFilled(best) >= spin->HeadingBins())
       best--;
@@ -3244,6 +3672,16 @@ void TCapApp::drawCoverage(TSurface &s, int cx, int cy, int radius)
          bestGap = gap;
          target = bin;
       }
+   }
+
+   int zigBand,
+       zigBin;
+
+   if (Pphase == rpCenter && Pspin->GuidedCell(zigBand, zigBin)) // the zigzag: the serpentine's next cell, wherever it lies
+   {
+      targetBand = zigBand;
+      target = zigBin;
+      bestGap = fabsf(geomHeadingDiffDeg(Pspin->BinCenterDeg(zigBin, heading), heading));
    }
    canvasFillRect(s, cx - halfW, yTop, 2*halfW, 2*halfH, tilted
                                                         ? canvasRGBA(220, 30, 30, 120) : canvasRGBA(0, 0, 0, 90));

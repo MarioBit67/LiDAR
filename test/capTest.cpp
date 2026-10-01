@@ -154,8 +154,40 @@ static void testSpin(void)
              && closeTo(moto.bandPitchDeg[2], 25.f, 0.01f) && moto.bandLoDeg[2] == 10.f && moto.bandHiDeg[0] == -10.f);
    checkThat(ultra.bandCount == 2 && ultra.headingBins == 36);
 
+   /* the zigzag (user, 2026-09-30): column by column in a serpentine, ceiling first; every cell stays free (a pose in
+      any band fills its own), the serpentine only names the next one */
+   TSpinTracker zig(moto);
+   QWORD        zns = 1000000000u;
+   int          zb = -1,
+                zc = -1;
+   const float  zh0 = 0.5f*360.f/(float)moto.headingBins,
+                zh1 = 1.5f*360.f/(float)moto.headingBins;
+
+   checkThat(moto.zigzag && zig.GuidedCell(zb, zc) && zb == 2);
+   checkThat(zig.Offer(zns, headPitchPose(zh0, 25.f), NAN) == svKeep);
+   checkThat(zig.GuidedCell(zb, zc) && zb == 1 && zc == 0);
+   zns += 2000000000u;
+   checkThat(zig.Offer(zns, headPitchPose(zh0, 0.f), NAN) == svKeep);
+   checkThat(zig.GuidedCell(zb, zc) && zb == 0 && zc == 0);
+   zns += 2000000000u;
+   checkThat(zig.Offer(zns, headPitchPose(zh0, -25.f), NAN) == svKeep);
+   checkThat(zig.GuidedCell(zb, zc) && zb == 0 && zc == 1); // the next column back up from the floor
+   zns += 2000000000u;
+   checkThat(zig.Offer(zns, headPitchPose(zh1, -25.f), NAN) == svKeep);
+   checkThat(zig.GuidedCell(zb, zc) && zb == 1 && zc == 1);
+   zns += 2000000000u;
+   checkThat(zig.Offer(zns, headPitchPose(60.f, 0.f), NAN) == svKeep && zig.PoseAllowed()); // a free cell off the serpentine
+   checkThat(zig.GuidedCell(zb, zc) && zb == 1 && zc == 1);
+   zns += 2000000000u;
+   zig.Offer(zns, headPitchPose(zh1, 0.f), NAN);
+   checkThat(zig.Offer(zns + 33333333u, headPitchPose(zh1, 3.f), NAN) == svTooFast); // a tilt of 90 degrees/s, heading still
+
    // one band at a time, ceiling first: down while the ceiling is due is red and never kept, then the opposite
-   TSpinTracker guided(moto);
+   TSpinConfig layered = moto;
+
+   layered.zigzag = false;
+
+   TSpinTracker guided(layered);
    QWORD        gns = 1000000000u;
    const int    top = moto.bandCount - 1;
    const float  up = moto.bandPitchDeg[top],

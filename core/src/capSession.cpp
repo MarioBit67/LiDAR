@@ -11,7 +11,7 @@ static LPCSTR cManifestFile = "session.json",
               cRecordFile = "capture.lrec";
 
 //--------------------------------------------------------------------------------
-static bool sessionMakeDir(LPCSTR dir)
+bool sessionMakeDir(LPCSTR dir)
 {
 #ifdef _WIN32
    int rc = _mkdir(dir);

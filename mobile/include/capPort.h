@@ -100,6 +100,8 @@ class TCapPort
    /* focus measured in count rectangles of the NATIVE image, 4 floats each (left, top, right, bottom, 0..1 on each
       axis), most telling first: the platform takes as many as the camera allows */
    virtual bool Autofocus(const float *rects, int count) = 0;
+   // the lens moved to and held at this distance (a manual lens; false without one): a focus found before, reused
+   virtual bool HoldFocus(float diopters) = 0;
    virtual void StartSensors(void) = 0;             // attitude at ~100 Hz
    virtual void StopSensors(void) = 0;
    virtual void StartLocation(void) = 0;            // GNSS fixes as they come

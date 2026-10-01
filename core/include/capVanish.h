@@ -34,6 +34,8 @@ struct TVanishConfig {
          tolDeg,       // angular tolerance of an edge to a vanishing direction
          stepDeg,      // heading search step
          maxTiltDeg,   // accepted gap between the gravity vertical and a refined direction's prediction
+         priorAxisDeg, // room-axis heading (world, [0, 90)) the heading search is held near
+         priorWindowDeg, // half window about priorAxisDeg (0: the whole quadrant)
          upBias[3];    // camera-to-sensor tilt: rotation vector (radians, camera axes) turning gravity into the true vertical
 
    static TVanishConfig Default(void);

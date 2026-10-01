@@ -576,10 +576,16 @@ static float vanishSearch(const TMat4 &pose, const TVec3 &up, const float *norma
          prevScore = 0.f,
          nextScore = 0.f;
 
+   /* held near a prior (user, 2026-09-30: "a horizontal vector in the region of the gyroscope's degree cannot be
+      ignored"): beside diagonal tiles the wall's own minority lines are the room axis */
    for (int i = 0; i < steps; i++)
    {
-      float hDeg = (float)i*step,
-            s = vanishScore(normals, labels, count, vanishAxisAt(pose, up, hDeg), vanishAxisAt(pose, up, hDeg + 90.f),
+      float hDeg = (float)i*step;
+
+      if (cfg.priorWindowDeg > 0.f && fabsf(vanishAxisDiffDeg(hDeg, cfg.priorAxisDeg)) > cfg.priorWindowDeg)
+         continue;
+
+      float s = vanishScore(normals, labels, count, vanishAxisAt(pose, up, hDeg), vanishAxisAt(pose, up, hDeg + 90.f),
                             tolSin);
 
       if (s > bestScore)

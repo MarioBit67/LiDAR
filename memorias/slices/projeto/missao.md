@@ -40,3 +40,9 @@ estação, pontos de fuga, borrão, portas, eleição). A combinação de todos 
 3. CAMADAS DE MOBILIÁRIO de níveis distintos, do mais simples ao mais luxuoso e sofisticado.
 Critério: toda decisão de captura e de metadado é julgada por quanto ela ajuda esses três passos, além da área de
 vassoura.
+
+PASSEIO EM VÍDEO NOS TRÊS MODELOS (usuário, 2026-09-30): depois do imóvel atual vem a remoção dos objetos (o
+ambiente o mais limpo possível) e, numa terceira etapa, novos móveis e decoração. Cada um dos três modelos (atual,
+limpo, mobiliado) deve permitir a um gerador de vídeo um passeio pela planta, para a apresentação virtual. "Esse é
+o substrato que estamos buscando com os mínimos quadrados": uma geometria sem fantasmas, com todos os graus de
+liberdade orquestrados (rotação e centro de cada foto, profundidade dos objetos, focal etc.).

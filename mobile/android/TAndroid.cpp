@@ -505,6 +505,18 @@ void TAndroid::DeliverResult(const ACameraMetadata *result)
 }
 
 //--------------------------------------------------------------------------------
+bool TAndroid::HoldFocus(float diopters)
+{
+   TMutexLock lock(Pmutex, thisInfo);
+
+   if (!Psession || !Prequest || !PmanualLens || diopters != diopters)
+      return false;
+   PfocusStartNs = 0u; // a run still watched gives way
+   holdFocus(diopters);
+   return true;
+}
+
+//--------------------------------------------------------------------------------
 // Manual lens at this distance, no result callbacks: the repeating request as StartCamera left it
 void TAndroid::holdFocus(float diopters)
 {

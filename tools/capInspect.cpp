@@ -564,36 +564,1215 @@ static void inspectCreaseLine(LPCBYTE out, int ow, int oh, int rowBytes, float f
           && (!floor || used >= ow/6); // furniture hides floor creases: the line must run twice as long
 }
 
-/*--------------------------------------------------------------------------------
-   One frontal view: a pure rotation of the camera (homography K R K^-1, no depth needed) onto a
-   virtual camera looking straight along the horizontal wall normal n, level and without roll -
-   verticals vertical, that wall's creases horizontal. A shift of the principal point keeps the
-   original view centered, like an architectural shift lens, so nothing tilts. 24-bit BMP, upright
-   (path NULL: nothing written); measure (optional): the crease line of the view.
-  --------------------------------------------------------------------------------*/
-static void inspectFrontal(const TImageRecord &img, LPCBYTE bgr, const TVec3 &up, const TVec3 &n, LPCSTR path,
-                           TRectMeasure *measure)
-{
-   const int    ow = 900,
-                oh = 1200,
-                rowBytes = (ow*3 + 3) & ~3;
-   const float  f = 0.3f*img.intr.fx;
-   int          w = (int)img.width,
-                h = (int)img.height;
-   TAlloc<BYTE> out((size_t)rowBytes*oh);
+static bool  inspectRectOut = false, // --rectify: write the frontal views
+             inspectDoors = false,   // --doors: look for doors in them
+             inspectDoorsAll = false, // --doors-all: and write every view, door or not (diagnosis)
+             inspectRectOwn = false,  // --rectify-own: frontal views by each frame's own lines, no crease levelling
+             inspectThirdAxis = false, // --third: the receding lines join the frontal square (measured either way)
+             inspectRollOnly = false;  // --roll-only: the frontal square turns the view about its axis only
+static void inspectPanoExp(const float *w, float *e);
+static bool inspectPanoSolve(float *a, float *b, int n);
+static float inspectQuantile(float *v, int n, float q);
 
-   // virtual camera: looks along n, y = true up, x = y cross z
+/*--------------------------------------------------------------------------------
+   The squareness of a frontal view (user, 2026-09-30: "no rectification is valid if the ceiling/
+   floor is not horizontal or cabinets/doors/windows are not vertical"). In the view's own normalized
+   coordinates (x right, y up, from its principal point), a small turn w of the virtual camera leans a
+   vertical line by dx/dy = -w_z + w_x x and slopes a horizontal line of the wall by dy/dx = w_z - w_y y.
+   Every strong edge within cSquareTolDeg of vertical or horizontal votes (weight: its gradient);
+   robust line fits of lean against x and slope against y give w. Degrees out: the lean and slope at
+   the view's center and their spread across it; false with too few edges of either family.
+  --------------------------------------------------------------------------------*/
+static const float cSquareTolDeg = 12.f,  // an edge this near vertical or horizontal votes
+                   cSquareLeanBinDeg = 0.3f, // a line's lean bins
+                   cSquarePosBinPx = 4.f,    // and its crossing bins (view pixels)
+                   cSquareEdgeDeg = 4.f,     // leans an edge votes for around its gradient's
+                   cSquareRidge = 0.02f,     // the pull of w_x, w_y toward 0 in the joint fit
+                   cSquareHorzShare = 0.05f, // the horizontals' weight in the fit beside the verticals
+                   cSquareLineSpan = 0.03f,  // the spread (focals, 1 sigma) of a line's edges its own fit needs
+                   cSquareConsensusDeg = 3.f, // a line this far off its family's median lean is other structure
+                   cSquareMinGrad = 30.f,  // Sobel magnitude of a voting edge
+                   cSquareFaintGrad = 12.f, // and the second look of a view short of a family (a white frame on beige: ~15)
+                   cCornerWindowDeg = 2.5f, // a vertical line this near the corner's predicted bearing is the corner
+                   cCornerEyeM = 0.3f,      // the eye's offset from the spin point along the aim (the arm's sphere)
+                   cSquareGain = 0.6f,      // the share of a round's measured turn applied
+                   cSquareDoneDeg = 0.05f;  // a turn below this ends the rounds
+
+enum {
+   cSquareMinVotes = 45,  // edges of long lines a family's fit needs: one clear line is a needle (user)
+   cSquareLineVotes = 45, // edges (sampled every 2 px, about one per column) a line needs: ~100 px of it
+   cSquareRounds = 7,     // measure-and-turn rounds of one view (the last only measures)
+   cSquareMaxLines = 48   // vertical lines a view reports (the corner's candidates)
+};
+
+// The long vertical lines of a view: where each crosses the visible center row (normalized x) and its edges
+struct TSquareLines {
+   int   count;
+   float x[cSquareMaxLines];
+   int   votes[cSquareMaxLines];
+};
+
+// The room corners of the wall a view faces, as bearings from the eye against the wall's normal (plan, center spin)
+struct TCornerHint {
+   int   count;
+   float bearing[2];
+};
+
+static const TCornerHint *inspectSquareCorner = NULL; // the corner hint of the view being squared
+
+//--------------------------------------------------------------------------------
+// A view point (normalized x) within cCornerWindowDeg of a corner bearing of the view being squared
+static bool inspectNearCorner(float x)
+{
+   if (!inspectSquareCorner)
+      return false;
+
+   float b = atanf(x);
+
+   for (int c = 0; c < inspectSquareCorner->count; c++)
+      if (fabsf(b - inspectSquareCorner->bearing[c]) <= cCornerWindowDeg*0.01745329f)
+         return true;
+   return false;
+}
+static const TLayoutPlan *inspectCornerPlan = NULL; // the plan the corner anchor reads (the center spin's frames)
+static bool               inspectCornerCenter = false; // the frame being rectified is of the center spin
+static int                inspectCornerFrame = -1;
+
+/*--------------------------------------------------------------------------------
+   The third canonical axis of a frontal view (user, 2026-09-30: "81 has a sharp point where three axes
+   meet... mark the three canonical axes and you will see they are not normalized"): the lines running
+   straight away from the wall (a cabinet's base, a door's reveal, the neighbor wall's creases) meet at the
+   view's principal point when the view is square. Long such lines by a Hough vote about the principal
+   point (direction t, offset o = cos t y - sin t x), each refined by the fit of its edges. A small turn w
+   of the virtual camera moves their meeting point by (w_y, -w_x), so each line tells o = sin t w_y +
+   cos t w_x: the square's least squares takes them with the verticals and the horizontals.
+  --------------------------------------------------------------------------------*/
+static const float cRecedeDeg = 8.f,      // an edge this near the ray to the principal point may recede
+                   cRecedeOffMax = 0.35f; // a receding line passes this near the principal point (focals)
+
+enum {
+   cRecedeMaxLines = 64
+};
+
+// The receding lines of a view: direction, offset from the principal point (normalized), edges
+struct TRecedeLines {
+   int   count;
+   float t[cRecedeMaxLines],
+         o[cRecedeMaxLines], // from the family's meeting point
+         w[cRecedeMaxLines];
+   BYTE  fam[cRecedeMaxLines]; // 0 straight away from the wall; 1, 2 the floor's diagonals (cRecedeTargetX)
+};
+
+/* where each family meets on the horizon of a square view, normalized x from the principal point: straight away
+   from the wall, and with --diagonal-floor the tiles laid at 45 degrees to the walls (101732; user: the tiles are
+   diagonal) */
+static const float cRecedeTargetX[3] = { 0.f, 1.f, -1.f };
+static bool        inspectDiagonalFloor = false; // --diagonal-floor
+
+//--------------------------------------------------------------------------------
+static void inspectFrontalRecede(const float *px, const float *py, const float *pt, LPCBYTE pk, int n, float f,
+                                 TRecedeLines &rl)
+{
+   const float bin = cSquareLeanBinDeg*0.01745329f;
+   const int   bins = (int)(3.14159265f/bin) + 1,
+               cuts = (int)(2.f*cRecedeOffMax*f/cSquarePosBinPx) + 1,
+               spread = (int)(cSquareEdgeDeg/cSquareLeanBinDeg),
+               cells = 3*bins*cuts; // a plane of cells per family
+   TAlloc<int> count((size_t)cells),
+               lineOf((size_t)n + 1u);
+
+   rl.count = 0;
+   if (n <= 0)
+      return;
+   memset(count(), 0, sizeof(int)*(size_t)cells);
+   for (int pass = 0; pass < 2; pass++)
+      for (int k = 0; k < n; k++)
+      {
+         int li0 = (int)(pt[k]/bin),
+             plane = (int)pk[k]*bins*cuts,
+             best = -1;
+
+         for (int dl = -spread; dl <= spread; dl++)
+         {
+            int   li = (li0 + dl + bins)%bins;
+            float t = ((float)li + 0.5f)*bin,
+                  o = cosf(t)*py[k] - sinf(t)*px[k];
+            int   pi = (int)((o + cRecedeOffMax)*f/cSquarePosBinPx);
+
+            if (pi < 0 || pi >= cuts)
+               continue;
+            if (pass == 0)
+               count[plane + li*cuts + pi]++;
+            else if (best < 0 || count[plane + li*cuts + pi] > count[best])
+               best = plane + li*cuts + pi;
+         }
+         if (pass == 1)
+            lineOf[k] = best >= 0 && count[best] >= cSquareLineVotes ? best : -1;
+      }
+
+   // each line's edges: their straight fit (the principal direction of the positions) gives its direction and offset
+   TAlloc<float> s((size_t)cells*6u);
+
+   memset(s(), 0, sizeof(float)*(size_t)cells*6u);
+   for (int k = 0; k < n; k++)
+   {
+      float *c = s() + (size_t)6*(size_t)(lineOf[k] >= 0 ? lineOf[k] : 0);
+
+      if (lineOf[k] < 0)
+         continue;
+      c[0] += 1.f;
+      c[1] += px[k];
+      c[2] += py[k];
+      c[3] += px[k]*px[k];
+      c[4] += px[k]*py[k];
+      c[5] += py[k]*py[k];
+   }
+
+   rl.count = 0;
+   for (int c = 0; c < cells && rl.count < cRecedeMaxLines; c++)
+   {
+      const float *q = s() + (size_t)6*(size_t)c;
+
+      if (q[0] < (float)cSquareLineVotes)
+         continue;
+
+      float mx = q[1]/q[0],
+            my = q[2]/q[0],
+            cxx = q[3]/q[0] - mx*mx,
+            cxy = q[4]/q[0] - mx*my,
+            cyy = q[5]/q[0] - my*my,
+            t = 0.5f*atan2f(2.f*cxy, cxx - cyy),
+            o = cosf(t)*my - sinf(t)*mx;
+
+      if (fabsf(o) > cRecedeOffMax)
+         continue;
+      rl.t[rl.count] = t;
+      rl.o[rl.count] = o;
+      rl.fam[rl.count] = (BYTE)(c/(bins*cuts));
+      rl.w[rl.count++] = q[0];
+   }
+}
+
+//--------------------------------------------------------------------------------
+// Where a view's receding lines meet, by themselves (the measure of the third axis): degrees off the principal point
+static bool inspectRecedeMeet(const TRecedeLines &rl, float f, float *deg)
+{
+   float v[2] = {},
+         gate = 1e9f;
+
+   if (rl.count == 0)
+      return false;
+   for (int round = 0; round < 3; round++)
+   {
+      float a[3] = {},
+            b[2] = {},
+            sw = 0.f,
+            sq = 0.f;
+
+      for (int j = 0; j < rl.count; j++)
+      {
+         float jx = -sinf(rl.t[j]),
+               jy = cosf(rl.t[j]),
+               res = rl.o[j] - (jx*v[0] + jy*v[1]);
+
+         if (rl.fam[j] != 0 || fabsf(res) > gate) // the receding family only
+            continue;
+         a[0] += rl.w[j]*jx*jx;
+         a[1] += rl.w[j]*jx*jy;
+         a[2] += rl.w[j]*jy*jy;
+         b[0] += rl.w[j]*jx*rl.o[j];
+         b[1] += rl.w[j]*jy*rl.o[j];
+         sw += rl.w[j];
+      }
+      if (sw <= 0.f)
+         return false;
+      a[0] += 1e-3f*sw; // one line fixes the point across it only: the ridge holds it along
+      a[2] += 1e-3f*sw;
+
+      float det = a[0]*a[2] - a[1]*a[1];
+
+      if (fabsf(det) < 1e-12f)
+         return false;
+      v[0] = (a[2]*b[0] - a[1]*b[1])/det;
+      v[1] = (a[0]*b[1] - a[1]*b[0])/det;
+      for (int j = 0; j < rl.count; j++)
+      {
+         float res = rl.o[j] - (-sinf(rl.t[j])*v[0] + cosf(rl.t[j])*v[1]);
+
+         if (rl.fam[j] == 0 && fabsf(res) <= gate)
+            sq += rl.w[j]*res*res;
+      }
+      gate = 3.f*sqrtf(sq/sw) + 2.f/f;
+   }
+   deg[0] = atanf(v[0])*57.2957795f;
+   deg[1] = atanf(v[1])*57.2957795f;
+   return true;
+}
+
+//--------------------------------------------------------------------------------
+// One equation of the square's least squares: family 0 a vertical edge, 1 a horizontal edge, 2 a receding line
+static void inspectSquareRow(int fam, int k, const float *vx, const float *vl, const float *vw, const float *hy,
+                             const float *hs, const float *hw, const TRecedeLines &rl, float *j, float &obs, float &wt)
+{
+   if (fam == 0)
+   {
+      j[0] = vx[k];
+      j[1] = 0.f;
+      j[2] = -1.f;
+      obs = vl[k];
+      wt = vw[k];
+   }
+   else if (fam == 1)
+   {
+      j[0] = 0.f;
+      j[1] = -hy[k];
+      j[2] = 1.f;
+      obs = hs[k];
+      wt = hw[k];
+   }
+   else // its family meets at (T, 0): a turn w moves that point by (w_y (1 + T^2), -w_x - w_z T)
+   {
+      float tx = cRecedeTargetX[rl.fam[k]];
+
+      j[0] = cosf(rl.t[k]);
+      j[1] = sinf(rl.t[k])*(1.f + tx*tx);
+      j[2] = cosf(rl.t[k])*tx;
+      obs = rl.o[k];
+      wt = rl.w[k];
+   }
+}
+
+//--------------------------------------------------------------------------------
+static bool inspectFrontalSquare(LPCBYTE out, int ow, int oh, int rowBytes, float f, float cxv, float cyv, float *w,
+                                 float *stats, TSquareLines *lines, float *vp)
+{
+   TAlloc<float> vx((size_t)ow*oh/4u + 1u),
+                 vl((size_t)ow*oh/4u + 1u),
+                 vw((size_t)ow*oh/4u + 1u),
+                 hy((size_t)ow*oh/4u + 1u),
+                 hs((size_t)ow*oh/4u + 1u),
+                 hw((size_t)ow*oh/4u + 1u),
+                 vy((size_t)ow*oh/4u + 1u),
+                 hx((size_t)ow*oh/4u + 1u),
+                 rx((size_t)ow*oh/4u + 1u),
+                 ry((size_t)ow*oh/4u + 1u),
+                 rt((size_t)ow*oh/4u + 1u);
+   TAlloc<BYTE>  rk((size_t)ow*oh/4u + 1u);
+   int           nv = 0,
+                 nh = 0,
+                 nr = 0,
+                 cap = ow*oh/4;
+   const float   tol = tanf(cSquareTolDeg*0.01745329f),
+                 recede = sinf(cRecedeDeg*0.01745329f);
+
+   if (lines)
+      lines->count = 0;
+   for (int vv = 2; vv + 2 < oh; vv += 2)
+      for (int uu = 2; uu + 2 < ow; uu += 2)
+      {
+         // gray of a pixel of the bottom-up BMP rows; v grows downward in the view
+         LPCBYTE r0 = out + (size_t)(oh - 1 - (vv - 1))*rowBytes + (size_t)uu*3u,
+                 r1 = out + (size_t)(oh - 1 - vv)*rowBytes + (size_t)uu*3u,
+                 r2 = out + (size_t)(oh - 1 - (vv + 1))*rowBytes + (size_t)uu*3u;
+         float   g00 = (float)(r0[-3] + r0[-2] + r0[-1]),
+                 g01 = (float)(r0[0] + r0[1] + r0[2]),
+                 g02 = (float)(r0[3] + r0[4] + r0[5]),
+                 g10 = (float)(r1[-3] + r1[-2] + r1[-1]),
+                 g12 = (float)(r1[3] + r1[4] + r1[5]),
+                 g20 = (float)(r2[-3] + r2[-2] + r2[-1]),
+                 g21 = (float)(r2[0] + r2[1] + r2[2]),
+                 g22 = (float)(r2[3] + r2[4] + r2[5]);
+
+         if (g00 == 0.f || g02 == 0.f || g20 == 0.f || g22 == 0.f) // off the photo (black border)
+            continue;
+
+         float gx = ((g02 + 2.f*g12 + g22) - (g00 + 2.f*g10 + g20))/3.f,
+               gd = ((g20 + 2.f*g21 + g22) - (g00 + 2.f*g01 + g02))/3.f, // toward v growing (down)
+               gy = -gd,                                                // toward y up
+               mag = sqrtf(gx*gx + gy*gy);
+
+         float x = ((float)uu - cxv)/f,
+               y = -((float)vv - cyv)/f;
+
+         /* faint edges count only as a vertical where the plan puts the room's corner (user: "you know which line is
+            the corner"): 101732's 75 on wall O, a white cabinet frame on a beige wall */
+         if (mag < cSquareMinGrad
+             && !(mag >= cSquareFaintGrad && fabsf(gy) < tol*fabsf(gx) && inspectNearCorner(x)))
+            continue;
+
+         if (fabsf(gy) < tol*fabsf(gx) && nv < cap) // a near-vertical line: its lean dx/dy = -gy/gx
+         {
+            vx[nv] = x;
+            vl[nv] = -gy/gx;
+            vw[nv] = mag;
+            vy[nv++] = y;
+         }
+         else if (fabsf(gx) < tol*fabsf(gy) && nh < cap) // a near-horizontal line: its slope dy/dx = -gx/gy
+         {
+            hy[nh] = y;
+            hs[nh] = -gx/gy;
+            hw[nh] = mag;
+            hx[nh++] = x;
+         }
+         else if (vp && nr < cap) // a line running toward a family's meeting point: the third axis
+         {
+            float dx = -gy/mag,
+                  dy = gx/mag,
+                  bestMiss = recede;
+            int   bestK = -1;
+
+            for (int k = 0; k < (inspectDiagonalFloor ? 3 : 1); k++)
+            {
+               float xs = x - cRecedeTargetX[k],
+                     r = sqrtf(xs*xs + y*y),
+                     miss = r > 0.05f ? fabsf(dx*y - dy*xs)/r : 1.f;
+
+               if (miss < bestMiss)
+               {
+                  bestMiss = miss;
+                  bestK = k;
+               }
+            }
+            if (bestK >= 0)
+            {
+               float t = atan2f(dy, dx);
+
+               rx[nr] = x - cRecedeTargetX[bestK]; // about the family's meeting point
+               ry[nr] = y;
+               rk[nr] = (BYTE)bestK;
+               rt[nr++] = t < 0.f ? t + 3.14159265f : (t >= 3.14159265f ? t - 3.14159265f : t);
+            }
+         }
+      }
+   TRecedeLines rl;
+
+   rl.count = 0;
+   if (vp) // measured always; it joins the fit unless --no-third
+   {
+      vp[0] = 0.f;
+      vp[1] = NAN;
+      vp[2] = NAN;
+      vp[3] = NAN;
+      inspectFrontalRecede(rx(), ry(), rt(), rk(), nr, f, rl);
+      inspectRecedeMeet(rl, f, vp + 2);
+   }
+
+   const int nr3 = inspectThirdAxis ? rl.count : 0; // the receding lines in the fit
+
+   /* only long straight lines count (user: the ceiling's lines and the columns). A Hough vote: each edge votes for
+      every lean within cSquareEdgeDeg of its gradient's (one pixel's gradient wanders degrees) at the crossing that
+      lean gives with the view's middle row (column for the horizontals); a line is a peak of cSquareLineVotes edges,
+      and its edges take the peak's lean. A bed sheet's folds and a neighbor wall's slant scatter and drop out */
+   for (int fam = 0; fam < 2; fam++)
+   {
+      float *P = fam == 0 ? vx() : hy(),  // the position the fit runs on
+            *O = fam == 0 ? vy() : hx(),  // the other coordinate
+            *L = fam == 0 ? vl() : hs(),
+            *W = fam == 0 ? vw() : hw();
+      /* the crossings span the image itself, not a window about the principal point: a view turned toward a corner
+         has its principal point far off the image (101732's frame 81 on wall O: 663 px left of it) */
+      float x0 = -cxv/f,
+            x1 = ((float)ow - cxv)/f,
+            y0 = -((float)oh - cyv)/f,
+            y1 = cyv/f,
+            reachO = fam == 0 ? fmaxf(fabsf(y0), fabsf(y1)) : fmaxf(fabsf(x0), fabsf(x1)),
+            lo = (fam == 0 ? x0 : y0) - tol*reachO,
+            hi = (fam == 0 ? x1 : y1) + tol*reachO;
+      int   &n = fam == 0 ? nv : nh,
+            bins = (int)(2.f*cSquareTolDeg/cSquareLeanBinDeg) + 1,
+            cuts = (int)((hi - lo)*f/cSquarePosBinPx) + 1,
+            spread = (int)(cSquareEdgeDeg/cSquareLeanBinDeg);
+      TAlloc<int> count((size_t)bins*cuts),
+                  lineOf((size_t)n + 1u);
+
+      memset(count(), 0, sizeof(int)*(size_t)bins*cuts);
+      for (int pass = 0; pass < 2; pass++)
+      {
+         int kept = 0;
+
+         for (int k = 0; k < n; k++)
+         {
+            int li0 = (int)((atanf(L[k])*57.2957795f + cSquareTolDeg)/cSquareLeanBinDeg),
+                best = -1,
+                bestLi = 0;
+
+            for (int li = li0 - spread; li <= li0 + spread; li++)
+            {
+               if (li < 0 || li >= bins)
+                  continue;
+
+               float t = tanf(((float)li + 0.5f)*cSquareLeanBinDeg*0.01745329f - cSquareTolDeg*0.01745329f);
+               int   pi = (int)((P[k] - t*O[k] - lo)*f/cSquarePosBinPx);
+
+               if (pi < 0 || pi >= cuts)
+                  continue;
+               if (pass == 0)
+                  count[li*cuts + pi]++;
+               else if (best < 0 || count[li*cuts + pi] > count[best])
+               {
+                  best = li*cuts + pi;
+                  bestLi = li;
+               }
+            }
+            if (pass == 1 && best >= 0 && count[best] >= cSquareLineVotes)
+            {
+               P[kept] = P[k];
+               O[kept] = O[k];
+               L[kept] = tanf(((float)bestLi + 0.5f)*cSquareLeanBinDeg*0.01745329f - cSquareTolDeg*0.01745329f);
+               lineOf[kept] = best;
+               W[kept] = W[k];
+               kept++;
+            }
+         }
+         if (pass == 1)
+            n = kept;
+      }
+      /* the peak's lean is only as fine as its bin: each line's lean comes from a straight fit of its edges' positions
+         (P against O), sub-pixel, the bin's kept when the edges span too short a stretch */
+      TAlloc<float> s0((size_t)bins*cuts),
+                    s1((size_t)bins*cuts),
+                    s2((size_t)bins*cuts),
+                    s3((size_t)bins*cuts),
+                    s4((size_t)bins*cuts);
+
+      memset(s0(), 0, sizeof(float)*(size_t)bins*cuts);
+      memset(s1(), 0, sizeof(float)*(size_t)bins*cuts);
+      memset(s2(), 0, sizeof(float)*(size_t)bins*cuts);
+      memset(s3(), 0, sizeof(float)*(size_t)bins*cuts);
+      memset(s4(), 0, sizeof(float)*(size_t)bins*cuts);
+      for (int k = 0; k < n; k++)
+      {
+         int c = lineOf[k];
+
+         s0[c] += 1.f;
+         s1[c] += O[k];
+         s2[c] += P[k];
+         s3[c] += O[k]*O[k];
+         s4[c] += O[k]*P[k];
+      }
+      for (int k = 0; k < n; k++)
+      {
+         int   c = lineOf[k];
+         float den = s0[c]*s3[c] - s1[c]*s1[c];
+
+         if (den > s0[c]*s0[c]*cSquareLineSpan*cSquareLineSpan)
+            L[k] = (s0[c]*s4[c] - s1[c]*s2[c])/den;
+      }
+
+      // the vertical lines out (the corner's candidates): each at the visible center row, near ones (4 px) merged
+      float cyRow = -(0.5f*(float)oh - cyv)/f;
+
+      for (int k = 0; fam == 0 && lines && k < n; k++)
+      {
+         int c = lineOf[k];
+
+         if (s0[c] < (float)cSquareLineVotes)
+            continue; // too short, or already out (the mark below)
+
+         float x = s2[c]/s0[c] + L[k]*(cyRow - s1[c]/s0[c]);
+         int   votes = (int)s0[c],
+               j = 0;
+
+         s0[c] = -1.f;
+         while (j < lines->count && fabsf(lines->x[j] - x)*f > cSquarePosBinPx)
+            j++;
+         if (j < lines->count)
+         {
+            if (votes > lines->votes[j])
+               lines->x[j] = x;
+            lines->votes[j] += votes;
+         }
+         else if (lines->count < cSquareMaxLines)
+         {
+            lines->x[lines->count] = x;
+            lines->votes[lines->count++] = votes;
+         }
+      }
+   }
+   // a family short of long lines drops out; the other still squares what it can (the ridge holds the rest)
+   if (nv < cSquareMinVotes)
+      nv = 0;
+   if (nh < cSquareMinVotes)
+      nh = 0;
+   if (nv == 0 && nh == 0 && nr3 == 0)
+      return false;
+
+   /* the lines of one family are parallel in the world (user: several verticals, one at the corner, the rest
+      parallel to it): the family's consensus is its median lean, and a line off it by more than cSquareConsensusDeg
+      is other structure (the floor's tile joints, a neighbor wall's slant) and drops out */
+   for (int fam = 0; fam < 2; fam++)
+   {
+      float *P = fam == 0 ? vx() : hy(),
+            *O = fam == 0 ? vy() : hx(),
+            *L = fam == 0 ? vl() : hs(),
+            *W = fam == 0 ? vw() : hw();
+      int   &n = fam == 0 ? nv : nh;
+
+      if (n == 0)
+         continue;
+
+      TAlloc<float> tmp((size_t)n);
+
+      memcpy(tmp(), L, sizeof(float)*(size_t)n);
+
+      float med = inspectQuantile(tmp(), n, 0.5f),
+            tol = tanf(cSquareConsensusDeg*0.01745329f);
+      int   kept = 0;
+
+      for (int k = 0; k < n; k++)
+         if (fabsf(L[k] - med) <= tol)
+         {
+            P[kept] = P[k];
+            O[kept] = O[k];
+            L[kept] = L[k];
+            W[kept] = W[k];
+            kept++;
+         }
+      n = kept >= cSquareMinVotes ? kept : 0;
+   }
+   if (nv == 0 && nh == 0 && nr3 == 0)
+      return false;
+
+   /* one least squares for the turn w of the three canonical families (the view's principal point sits far off
+      the image when the frame looked up or down, so a family alone cannot tell its lean at x = 0 from its
+      keystone): lean_i = -w_z + w_x x_i, slope_j = w_z - w_y y_j, and each receding line o_k = cos t_k w_x +
+      sin t_k w_y; each family weighs the same in total, a mild ridge keeps w_x and w_y from an edge set bunched in
+      one row, and 3 rounds drop the far ones beyond 3x the weighted RMS */
+   float gate[3] = { 1e9f, 1e9f, 1e9f },
+         famW[3] = {},
+         cx = (0.5f*(float)ow - cxv)/f, // the visible center, in the view's normalized coordinates
+         cy = -(0.5f*(float)oh - cyv)/f,
+         /* the verticals are the needle (user: several verticals, one at the corner, the rest parallel to it): with
+            them in the view and no receding line the horizontals only steer what the verticals cannot see (w_y), at
+            cSquareHorzShare; with the third axis all three weigh alike */
+         share[3] = { 1.f, nv > 0 && nr3 == 0 ? cSquareHorzShare : 1.f, 1.f };
+
+   for (int k = 0; k < nv; k++)
+      famW[0] += vw[k];
+   for (int k = 0; k < nh; k++)
+      famW[1] += hw[k];
+   for (int k = 0; k < nr3; k++)
+      famW[2] += rl.w[k];
+   w[0] = w[1] = w[2] = 0.f;
+   for (int round = 0; round < 3; round++)
+   {
+      float A[9] = {},
+            B[3] = {},
+            sq[3] = {},
+            sw[3] = {};
+
+      for (int fam = 0; fam < 3; fam++)
+      {
+         int   n = fam == 0 ? nv : (fam == 1 ? nh : nr3);
+         float scale = share[fam]/fmaxf(famW[fam], 1.f);
+
+         for (int k = 0; k < n; k++)
+         {
+            float j[3],
+                  obs,
+                  wt;
+
+            inspectSquareRow(fam, k, vx(), vl(), vw(), hy(), hs(), hw(), rl, j, obs, wt);
+            wt *= scale;
+
+            float res = obs - (j[0]*w[0] + j[1]*w[1] + j[2]*w[2]);
+
+            if (fabsf(res) > gate[fam])
+               continue;
+            for (int r = 0; r < 3; r++)
+            {
+               for (int c = 0; c < 3; c++)
+                  A[r*3 + c] += wt*j[r]*j[c];
+               B[r] += wt*j[r]*obs;
+            }
+         }
+      }
+      A[0] += cSquareRidge;
+      A[4] += cSquareRidge*share[1]; // w_y is the horizontals' (and the receding lines'): its ridge at their share
+      if (!inspectPanoSolve(A, B, 3))
+         return false;
+      memcpy(w, B, sizeof(B));
+      for (int fam = 0; fam < 3; fam++)
+      {
+         int n = fam == 0 ? nv : (fam == 1 ? nh : nr3);
+
+         for (int k = 0; k < n; k++)
+         {
+            float j[3],
+                  obs,
+                  wt;
+
+            inspectSquareRow(fam, k, vx(), vl(), vw(), hy(), hs(), hw(), rl, j, obs, wt);
+
+            float res = obs - (j[0]*w[0] + j[1]*w[1] + j[2]*w[2]);
+
+            if (fabsf(res) <= gate[fam])
+            {
+               sq[fam] += wt*res*res;
+               sw[fam] += wt;
+            }
+         }
+         gate[fam] = 3.f*sqrtf(sq[fam]/fmaxf(sw[fam], 1.f)) + (fam == 2 ? 2.f/f : 0.002f);
+         if (fam == 2 && vp)
+         {
+            vp[0] = (float)nr3;
+            vp[1] = sqrtf(sq[2]/fmaxf(sw[2], 1.f))*f; // the receding lines' miss of the principal point, view pixels
+         }
+      }
+   }
+   // what the lines measure, not the fit: each family's mean residual added back
+   float mean[2] = {},
+         msw[2] = {};
+
+   for (int k = 0; k < nv; k++)
+   {
+      float res = vl[k] - (vx[k]*w[0] - w[2]);
+
+      if (fabsf(res) <= gate[0])
+      {
+         mean[0] += vw[k]*res;
+         msw[0] += vw[k];
+      }
+   }
+   for (int k = 0; k < nh; k++)
+   {
+      float res = hs[k] - (-hy[k]*w[1] + w[2]);
+
+      if (fabsf(res) <= gate[1])
+      {
+         mean[1] += hw[k]*res;
+         msw[1] += hw[k];
+      }
+   }
+   mean[0] /= fmaxf(msw[0], 1.f);
+   mean[1] /= fmaxf(msw[1], 1.f);
+   stats[0] = atanf(-w[2] + w[0]*cx + mean[0])*57.2957795f; // the verticals' lean at the visible center
+   stats[1] = atanf(w[2] - w[1]*cy + mean[1])*57.2957795f;  // the horizontals' slope there
+   stats[2] = w[0]*57.2957795f*0.5f;               // the verticals' lean change over half a focal of x (keystone)
+   stats[3] = -w[1]*57.2957795f*0.5f;              // the horizontals' slope change over half a focal of y
+   if (nv == 0)
+      stats[0] = stats[2] = NAN;
+   if (nh == 0)
+      stats[1] = stats[3] = NAN;
+   return true;
+}
+
+/*--------------------------------------------------------------------------------
+   The square of a floor view (user, 2026-10-01: 75 face O "completely out of square"; the floor's lines
+   are a needle too): the floor lies square to the view, so its lines keep their true angles - the
+   baseboards at 0 and 90 degrees, and with --diagonal-floor the tiles at +-45. For a line of unit
+   direction u at the view point (x, y), a small turn w of the virtual camera changes its angle by
+   -w_z + w_y (u_x^2 y - u_x u_y x) + w_x (u_y^2 x - u_x u_y y) (the verticals' and horizontals' rows are
+   its cases), so every long line of a known angle is one row of a least squares for w: the floor's
+   normal (w_x, w_y) and its turn (w_z). Long lines by the same Hough vote, in coordinates turned to each
+   family; each family weighs the same. Degrees out: each family's mean angle off its own (0, 90, +45,
+   -45; NaN without the family); false with fewer than two families.
+  --------------------------------------------------------------------------------*/
+static const float cFloorTolDeg = 8.f,    // an edge this near a family's angle votes for it
+                   cFloorMaxTurnDeg = 3.f; // a floor's square moves the frame's vertical at most this much
+
+enum {
+   cFloorMinLines = 2 // long lines a family needs
+};
+
+//--------------------------------------------------------------------------------
+static bool inspectFloorSquare(LPCBYTE out, int ow, int oh, int rowBytes, float f, float cxv, float cyv, float *w,
+                               float *stats)
+{
+   const float   fam0[4] = { 0.f, 90.f, 45.f, -45.f };
+   const int     cap = ow*oh/4,
+                 famCount = inspectDiagonalFloor ? 4 : 2;
+   TAlloc<float> ex((size_t)cap + 1u),
+                 ey((size_t)cap + 1u),
+                 et((size_t)cap + 1u),
+                 ew((size_t)cap + 1u);
+   TAlloc<BYTE>  ek((size_t)cap + 1u);
+   int           n = 0;
+
+   for (int vv = 2; vv + 2 < oh; vv += 2)
+      for (int uu = 2; uu + 2 < ow; uu += 2)
+      {
+         LPCBYTE r0 = out + (size_t)(oh - 1 - (vv - 1))*rowBytes + (size_t)uu*3u,
+                 r1 = out + (size_t)(oh - 1 - vv)*rowBytes + (size_t)uu*3u,
+                 r2 = out + (size_t)(oh - 1 - (vv + 1))*rowBytes + (size_t)uu*3u;
+         float   g00 = (float)(r0[-3] + r0[-2] + r0[-1]),
+                 g01 = (float)(r0[0] + r0[1] + r0[2]),
+                 g02 = (float)(r0[3] + r0[4] + r0[5]),
+                 g10 = (float)(r1[-3] + r1[-2] + r1[-1]),
+                 g12 = (float)(r1[3] + r1[4] + r1[5]),
+                 g20 = (float)(r2[-3] + r2[-2] + r2[-1]),
+                 g21 = (float)(r2[0] + r2[1] + r2[2]),
+                 g22 = (float)(r2[3] + r2[4] + r2[5]);
+
+         if (g00 == 0.f || g02 == 0.f || g20 == 0.f || g22 == 0.f || n >= cap)
+            continue;
+
+         float gx = ((g02 + 2.f*g12 + g22) - (g00 + 2.f*g10 + g20))/3.f,
+               gy = -((g20 + 2.f*g21 + g22) - (g00 + 2.f*g01 + g02))/3.f, // toward y up
+               mag = sqrtf(gx*gx + gy*gy);
+
+         if (mag < cSquareMinGrad)
+            continue;
+
+         // the line's angle (counterclockwise, y up), folded into [-90, 90)
+         float t = atan2f(gx, -gy)*57.2957795f,
+               bestD = cFloorTolDeg;
+         int   best = -1;
+
+         t -= 180.f*floorf((t + 90.f)/180.f);
+         for (int k = 0; k < famCount; k++)
+         {
+            float d = t - fam0[k];
+
+            d -= 180.f*floorf((d + 90.f)/180.f);
+            if (fabsf(d) < bestD)
+            {
+               bestD = fabsf(d);
+               best = k;
+            }
+         }
+         if (best < 0)
+            continue;
+         ex[n] = ((float)uu - cxv)/f;
+         ey[n] = -((float)vv - cyv)/f;
+         et[n] = t;
+         ew[n] = mag;
+         ek[n++] = (BYTE)best;
+      }
+
+   // per family, in coordinates turned to it: the long lines' edges, their lean from the line's own fit
+   float         famW[4] = {};
+   int           famN[4] = {};
+   TAlloc<float> lean((size_t)n + 1u);
+   TAlloc<BYTE>  keep((size_t)n + 1u);
+
+   memset(keep(), 0, (size_t)n + 1u);
+   for (int k = 0; k < famCount; k++)
+   {
+      float c0 = cosf(fam0[k]*0.01745329f),
+            s0 = sinf(fam0[k]*0.01745329f),
+            reach = 0.f;
+
+      for (int i = 0; i < n; i++)
+         if (ek[i] == k)
+            reach = fmaxf(reach, fabsf(-s0*ex[i] + c0*ey[i]) + cFloorTolDeg*0.01745329f*fabsf(c0*ex[i] + s0*ey[i]));
+
+      const int     bins = (int)(2.f*cFloorTolDeg/cSquareLeanBinDeg) + 1,
+                    cuts = (int)(2.f*(reach + 0.01f)*f/cSquarePosBinPx) + 1,
+                    spread = (int)(cSquareEdgeDeg/cSquareLeanBinDeg);
+      TAlloc<int>   count((size_t)bins*cuts),
+                    cellOf((size_t)n + 1u);
+      TAlloc<float> s((size_t)bins*cuts*5u);
+
+      memset(count(), 0, sizeof(int)*(size_t)bins*cuts);
+      memset(s(), 0, sizeof(float)*(size_t)bins*cuts*5u);
+      for (int pass = 0; pass < 2; pass++)
+         for (int i = 0; i < n; i++)
+         {
+            if (ek[i] != k)
+               continue;
+
+            float pp = -s0*ex[i] + c0*ey[i], // across the family
+                  oo = c0*ex[i] + s0*ey[i],  // along it
+                  d = et[i] - fam0[k];
+            int   best = -1;
+
+            d -= 180.f*floorf((d + 90.f)/180.f);
+
+            int li0 = (int)((d + cFloorTolDeg)/cSquareLeanBinDeg);
+
+            for (int li = li0 - spread; li <= li0 + spread; li++)
+            {
+               if (li < 0 || li >= bins)
+                  continue;
+
+               float tl = tanf(((float)li + 0.5f)*cSquareLeanBinDeg*0.01745329f - cFloorTolDeg*0.01745329f);
+               int   pi = (int)((pp - tl*oo + reach + 0.01f)*f/cSquarePosBinPx);
+
+               if (pi < 0 || pi >= cuts)
+                  continue;
+               if (pass == 0)
+                  count[li*cuts + pi]++;
+               else if (best < 0 || count[li*cuts + pi] > count[best])
+                  best = li*cuts + pi;
+            }
+            if (pass == 1)
+            {
+               cellOf[i] = best >= 0 && count[best] >= cSquareLineVotes ? best : -1;
+               if (cellOf[i] >= 0)
+               {
+                  float *q = s() + (size_t)5*(size_t)cellOf[i];
+
+                  q[0] += 1.f;
+                  q[1] += oo;
+                  q[2] += pp;
+                  q[3] += oo*oo;
+                  q[4] += oo*pp;
+               }
+            }
+         }
+      for (int i = 0; i < n; i++)
+      {
+         if (ek[i] != k || cellOf[i] < 0)
+            continue;
+
+         const float *q = s() + (size_t)5*(size_t)cellOf[i];
+         float        den = q[0]*q[3] - q[1]*q[1];
+
+         if (!(den > q[0]*q[0]*cSquareLineSpan*cSquareLineSpan))
+            continue;
+         lean[i] = (q[0]*q[4] - q[1]*q[2])/den; // the line's slope in the family's coordinates: its angle off
+         keep[i] = 1;
+         famW[k] += ew[i];
+         famN[k]++;
+      }
+      int famLines = 0;
+
+      for (int c = 0; c < bins*cuts; c++)
+         famLines += s[(size_t)5*(size_t)c] >= (float)cSquareLineVotes ? 1 : 0;
+      if (famN[k] < cSquareMinVotes || famLines < cFloorMinLines) // a family short of long lines drops out (a blanket's edge)
+      {
+         for (int i = 0; i < n; i++)
+            if (ek[i] == k)
+               keep[i] = 0;
+         famW[k] = 0.f;
+         famN[k] = 0;
+      }
+   }
+
+   int families = 0;
+
+   for (int k = 0; k < famCount; k++)
+      families += famN[k] > 0 ? 1 : 0;
+   if (families < 2)
+      return false;
+
+   float allW = famW[0] + famW[1] + famW[2] + famW[3];
+
+   // the least squares: 3 rounds, the far edges out beyond 3x the weighted rms of their family
+   float gate[4] = { 1e9f, 1e9f, 1e9f, 1e9f },
+         mean[4] = {},
+         msw[4] = {};
+
+   w[0] = w[1] = w[2] = 0.f;
+   for (int round = 0; round < 3; round++)
+   {
+      float A[9] = {},
+            B[3] = {},
+            sq[4] = {},
+            sw[4] = {};
+
+      for (int i = 0; i < n; i++)
+      {
+         if (!keep[i])
+            continue;
+
+         int   k = ek[i];
+         float ux = cosf(fam0[k]*0.01745329f),
+               uy = sinf(fam0[k]*0.01745329f),
+               j[3] = { -(uy*uy*ex[i] - ux*uy*ey[i]), -(ux*ux*ey[i] - ux*uy*ex[i]), 1.f },
+               wt = ew[i]/allW, // by edges: a family weighs as much as its long lines
+               res = lean[i] - (j[0]*w[0] + j[1]*w[1] + j[2]*w[2]);
+
+         if (fabsf(res) > gate[k])
+            continue;
+         for (int r = 0; r < 3; r++)
+         {
+            for (int c = 0; c < 3; c++)
+               A[r*3 + c] += wt*j[r]*j[c];
+            B[r] += wt*j[r]*lean[i];
+         }
+      }
+      A[0] += cSquareRidge;
+      A[4] += cSquareRidge;
+      if (!inspectPanoSolve(A, B, 3))
+         return false;
+      memcpy(w, B, sizeof(B));
+      memset(mean, 0, sizeof(mean));
+      memset(msw, 0, sizeof(msw));
+      for (int i = 0; i < n; i++)
+      {
+         if (!keep[i])
+            continue;
+
+         int   k = ek[i];
+         float ux = cosf(fam0[k]*0.01745329f),
+               uy = sinf(fam0[k]*0.01745329f),
+               res = lean[i] - (-(uy*uy*ex[i] - ux*uy*ey[i])*w[0] - (ux*ux*ey[i] - ux*uy*ex[i])*w[1] + w[2]);
+
+         if (fabsf(res) <= gate[k])
+         {
+            sq[k] += ew[i]*res*res;
+            sw[k] += ew[i];
+         }
+         mean[k] += ew[i]*lean[i];
+         msw[k] += ew[i];
+      }
+      for (int k = 0; k < 4; k++)
+         gate[k] = 3.f*sqrtf(sq[k]/fmaxf(sw[k], 1.f)) + 0.002f;
+   }
+   for (int k = 0; k < 4; k++) // what the lines measure: each family's mean angle off its own
+      stats[k] = msw[k] > 0.f ? atanf(mean[k]/msw[k])*57.2957795f : NAN;
+   return true;
+}
+
+/*--------------------------------------------------------------------------------
+   The merge (--merge; user, 2026-10-01: "we are very close to the panorama... shall we merge the files?"):
+   a canvas per wall (along the wall by height, meters) and one of the floor (the plan, w right, u up),
+   cMergePixelM a pixel. A squared frontal view stands square to the room, so a wall point (s, h) is seen
+   at x = (s - s_eye)/D, y = (h - h_eye)/D, D the eye's distance to the wall (the plan's), the eye the spin
+   point plus cCornerEyeM along the aim (the arm's sphere); the floor alike with the eye's height. Each view
+   is laid onto its canvas as it is written, weighed 1/(1 + x^2 + y^2)^2: the middle of a photo, the least
+   stretched (user: the image center has the least distortion), wins.
+  --------------------------------------------------------------------------------*/
+static const float cMergePixelM = 0.004f,  // a canvas pixel
+                   cMergeMarginM = 0.05f;  // beyond the wall's corners (farther shows the neighbor wall)
+
+enum {
+   cMergeCanvases = 5 // walls 0..3 (clockwise from the room axis), the floor
+};
+
+struct TMergeCanvas {
+   int           w,
+                 h;
+   float         x0,  // the left edge's coordinate (wall: along it; floor: plan w)
+                 top; // the top edge's (wall: height; floor: plan u)
+   TBlock<float> acc; // rgb sums and the weight, 4 a pixel
+};
+
+struct TMergeTarget {
+   int   canvas; // -1: the view is not merged
+   float nu, nw, // wall: the normal in plan axes (into the wall), its right, the wall's offset along the normal
+         ru, rw,
+         reach,
+         tu, tw, // floor: the plan direction at the view's top
+         eu, ew, // the eye in plan axes, and its height
+         eh;
+};
+
+static bool          inspectMergeOn = false; // --merge
+static TMergeCanvas  inspectMergeCanvas[cMergeCanvases];
+static TMergeTarget  inspectMergeTarget = { -1 };
+
+//--------------------------------------------------------------------------------
+// A canvas's extent from the plan: a wall from corner to corner (and margin) by floor to ceiling; the floor's box
+static void inspectMergeCanvasInit(int k, const TLayoutPlan &pl, float nu, float nw, float ru, float rw)
+{
+   TMergeCanvas &c = inspectMergeCanvas[k];
+
+   if (c.acc)
+      return;
+
+   float x0 = 1e9f,
+         x1 = -1e9f,
+         y0 = 0.f,
+         y1 = pl.ceilingM + 0.1f;
+
+   if (k < 4)
+   {
+      float reach = -1e9f;
+
+      for (int v = 0; v < pl.vertexCount; v++)
+         reach = fmaxf(reach, pl.verts[v].u*nu + pl.verts[v].w*nw);
+      for (int v = 0; v < pl.vertexCount; v++)
+         if (pl.verts[v].u*nu + pl.verts[v].w*nw >= reach - 0.05f)
+         {
+            float s = pl.verts[v].u*ru + pl.verts[v].w*rw;
+
+            x0 = fminf(x0, s);
+            x1 = fmaxf(x1, s);
+         }
+   }
+   else
+   {
+      y0 = 1e9f;
+      y1 = -1e9f;
+      for (int v = 0; v < pl.vertexCount; v++)
+      {
+         x0 = fminf(x0, pl.verts[v].w);
+         x1 = fmaxf(x1, pl.verts[v].w);
+         y0 = fminf(y0, pl.verts[v].u);
+         y1 = fmaxf(y1, pl.verts[v].u);
+      }
+   }
+   c.x0 = x0 - cMergeMarginM;
+   c.top = y1 + (k < 4 ? 0.f : cMergeMarginM);
+   c.w = (int)((x1 - x0 + 2.f*cMergeMarginM)/cMergePixelM) + 1;
+   c.h = (int)((c.top - (y0 - (k < 4 ? 0.f : cMergeMarginM)))/cMergePixelM) + 1;
+
+   TAlloc<float> a((size_t)c.w*c.h*4u);
+
+   memset(a(), 0, sizeof(float)*(size_t)c.w*c.h*4u);
+   a.Drop(c.acc);
+}
+
+//--------------------------------------------------------------------------------
+// One squared view laid onto its canvas (the target set by inspectRectify): the box its footprint covers, sampled
+static void inspectMergeSplat(LPCBYTE out, int ow, int oh, int rowBytes, float f, float cxv, float cyv)
+{
+   const TMergeTarget &t = inspectMergeTarget;
+
+   if (t.canvas < 0 || t.canvas >= cMergeCanvases || !inspectMergeCanvas[t.canvas].acc)
+      return;
+
+   TMergeCanvas &c = inspectMergeCanvas[t.canvas];
+   bool          wall = t.canvas < 4;
+   // the view's axes in plan terms: x along (xu, xw), y along (yu, yw) (the floor) or up (a wall)
+   float         xu = wall ? t.ru : -t.tw,
+                 xw = wall ? t.rw : t.tu,
+                 depth = wall ? t.reach - (t.eu*t.nu + t.ew*t.nw) : t.eh,
+                 xe = t.eu*xu + t.ew*xw,                  // the eye along the view's x
+                 ye = wall ? t.eh : t.eu*t.tu + t.ew*t.tw; // and along its y
+
+   if (!(depth > 0.2f))
+      return;
+
+   /* the footprint: the view's corners on the canvas plane, in the canvas's own coordinates (a wall: along it and up;
+      the floor: plan w and u, the view's axes any of the room's) */
+   float cmin[2] = { 1e9f, 1e9f },
+         cmax[2] = { -1e9f, -1e9f };
+
+   for (int k = 0; k < 4; k++)
+   {
+      float vx = xe + depth*((k & 1 ? (float)ow : 0.f) - cxv)/f, // along the view's x and y
+            vy = ye + depth*(cyv - (k & 2 ? (float)oh : 0.f))/f,
+            cx = wall ? vx : vx*xw + vy*t.tw, // plan w = x xw + y tw (the axes are orthonormal)
+            cy = wall ? vy : vx*xu + vy*t.tu; // plan u
+
+      cmin[0] = fminf(cmin[0], cx);
+      cmax[0] = fmaxf(cmax[0], cx);
+      cmin[1] = fminf(cmin[1], cy);
+      cmax[1] = fmaxf(cmax[1], cy);
+   }
+
+   int i0 = (int)fmaxf(0.f, (cmin[0] - c.x0)/cMergePixelM),
+       i1 = (int)fminf((float)(c.w - 1), (cmax[0] - c.x0)/cMergePixelM),
+       j0 = (int)fmaxf(0.f, (c.top - cmax[1])/cMergePixelM),
+       j1 = (int)fminf((float)(c.h - 1), (c.top - cmin[1])/cMergePixelM);
+
+   for (int j = j0; j <= j1; j++)
+      for (int i = i0; i <= i1; i++)
+      {
+         // the canvas point in the view's axes; floor canvas: x = plan w, y = plan u
+         float cxp = c.x0 + (float)i*cMergePixelM,
+               cyp = c.top - (float)j*cMergePixelM,
+               px,
+               py;
+
+         if (wall)
+         {
+            px = cxp;
+            py = cyp;
+         }
+         else
+         {
+            px = cyp*xu + cxp*xw; // the plan point (u = cyp, w = cxp) along the view's axes
+            py = cyp*t.tu + cxp*t.tw;
+         }
+
+         float x = (px - xe)/depth,
+               y = (py - ye)/depth,
+               su = cxv + f*x,
+               sv = cyv - f*y;
+         int   iu = (int)floorf(su),
+               iv = (int)floorf(sv);
+
+         if (iu < 0 || iv < 0 || iu + 1 >= ow || iv + 1 >= oh)
+            continue;
+
+         float   du = su - (float)iu,
+                 dv = sv - (float)iv,
+                 rgb[3];
+         LPCBYTE r0 = out + (size_t)(oh - 1 - iv)*rowBytes + (size_t)iu*3u,
+                 r1 = out + (size_t)(oh - 2 - iv)*rowBytes + (size_t)iu*3u;
+
+         if (r0[0] + r0[1] + r0[2] == 0 || r0[3] + r0[4] + r0[5] == 0 || r1[0] + r1[1] + r1[2] == 0
+             || r1[3] + r1[4] + r1[5] == 0)
+            continue; // off the photo
+         for (int ch = 0; ch < 3; ch++)
+            rgb[ch] = ((float)r0[ch]*(1.f - du) + (float)r0[3 + ch]*du)*(1.f - dv)
+                      + ((float)r1[ch]*(1.f - du) + (float)r1[3 + ch]*du)*dv;
+
+         float  q = 1.f + x*x + y*y,
+                wt = 1.f/(q*q),
+               *a = c.acc() + ((size_t)j*c.w + i)*4u;
+
+         a[0] += wt*rgb[0];
+         a[1] += wt*rgb[1];
+         a[2] += wt*rgb[2];
+         a[3] += wt;
+      }
+}
+
+//--------------------------------------------------------------------------------
+// The canvases out: mosaico_paredeK.bmp (K as the views' rect_NNN_paredeK) and mosaico_piso.bmp
+static void inspectMergeWrite(LPCSTR outDir)
+{
+   for (int k = 0; k < cMergeCanvases; k++)
+   {
+      TMergeCanvas &c = inspectMergeCanvas[k];
+
+      if (!c.acc)
+         continue;
+
+      int          rowBytes = (c.w*3 + 3) & ~3;
+      TAlloc<BYTE> img((size_t)rowBytes*c.h);
+      char         path[sessionPathMax];
+
+      memset(img(), 0, (size_t)rowBytes*c.h);
+      for (int j = 0; j < c.h; j++)
+         for (int i = 0; i < c.w; i++)
+         {
+            const float *a = c.acc() + ((size_t)j*c.w + i)*4u;
+            LPBYTE       p = img() + (size_t)(c.h - 1 - j)*rowBytes + (size_t)i*3u;
+
+            if (a[3] <= 0.f)
+               continue;
+            for (int ch = 0; ch < 3; ch++)
+               p[ch] = (BYTE)fminf(255.f, a[ch]/a[3] + 0.5f);
+         }
+      if (k < 4)
+         snprintf(path, sizeof(path), "%s/mosaico_parede%d.bmp", outDir, k);
+      else
+         snprintf(path, sizeof(path), "%s/mosaico_piso.bmp", outDir);
+
+      FILE *bmp = fopen(path, "wb");
+
+      if (!bmp)
+         continue;
+
+      DWORD imageBytes = (DWORD)rowBytes*(DWORD)c.h,
+            header[13] = { 54u + imageBytes, 0u, 54u, 40u, (DWORD)c.w, (DWORD)c.h, 0x00180001u, 0u, imageBytes, 2835u,
+                           2835u, 0u, 0u };
+      BYTE  magic[2] = { 'B', 'M' };
+
+      fwrite(magic, 1u, 2u, bmp);
+      fwrite(header, sizeof(header), 1u, bmp);
+      fwrite(img(), 1u, imageBytes, bmp);
+      fclose(bmp);
+      printf("merge: %s, %d x %d px (%.2f x %.2f m)\n", path, c.w, c.h, (float)c.w*cMergePixelM,
+             (float)c.h*cMergePixelM);
+   }
+}
+
+//--------------------------------------------------------------------------------
+// The view rendered for the virtual camera (x, y = up, z = -n in the real camera's axes); its principal point out
+static void inspectFrontalRender(const TImageRecord &img, LPCBYTE bgr, const TVec3 &up, const TVec3 &n, LPBYTE out,
+                                 int ow, int oh, int rowBytes, float f, float &cxv, float &cyv)
+{
+   int   w = (int)img.width,
+         h = (int)img.height;
    TVec3 zv = { -n.x, -n.y, -n.z },
          xv = { up.y*zv.z - up.z*zv.y, up.z*zv.x - up.x*zv.z, up.x*zv.y - up.y*zv.x };
    float elev = asinf(fmaxf(-0.9f, fminf(0.9f, -up.z))), // the real camera looks down -z
-         yaw = atan2f(-xv.z, zv.z),
-         cxv = 0.5f*(float)ow - f*tanf(fmaxf(-0.9f, fminf(0.9f, yaw))),
-         cyv = 0.5f*(float)oh + f*tanf(elev);
+         yaw = atan2f(-xv.z, zv.z);
 
-   memset(out(), 0, (size_t)rowBytes*oh);
+   cxv = 0.5f*(float)ow - f*tanf(fmaxf(-0.9f, fminf(0.9f, yaw)));
+   cyv = 0.5f*(float)oh + f*tanf(elev);
+   memset(out, 0, (size_t)rowBytes*oh);
    for (int vv = 0; vv < oh; vv++)
    {
-      LPBYTE row = out() + (size_t)(oh - 1 - vv)*rowBytes; // bottom-up
+      LPBYTE row = out + (size_t)(oh - 1 - vv)*rowBytes; // bottom-up
 
       for (int uu = 0; uu < ow; uu++)
       {
@@ -627,6 +1806,181 @@ static void inspectFrontal(const TImageRecord &img, LPCBYTE bgr, const TVec3 &up
          }
       }
    }
+}
+
+static FILE *inspectSquareCsv = NULL; // --rectify-own: each view's squareness before and after its rounds
+
+/*--------------------------------------------------------------------------------
+   One frontal view: a pure rotation of the camera (homography K R K^-1, no depth needed) onto a
+   virtual camera looking straight along the horizontal wall normal n, level and without roll -
+   verticals vertical, that wall's creases horizontal. A shift of the principal point keeps the
+   original view centered, like an architectural shift lens, so nothing tilts. 24-bit BMP, upright
+   (path NULL: nothing written); measure (optional): the crease line of the view.
+  --------------------------------------------------------------------------------*/
+static void inspectFrontal(const TImageRecord &img, LPCBYTE bgr, const TVec3 &up, const TVec3 &n, LPCSTR path,
+                           TRectMeasure *measure, const TCornerHint *corner = NULL, bool floor = false,
+                           TVec3 *finalU = NULL, TVec3 *finalN = NULL)
+{
+   const int    ow = 900,
+                oh = 1200,
+                rowBytes = (ow*3 + 3) & ~3;
+   const float  f = 0.3f*img.intr.fx;
+   TAlloc<BYTE> out((size_t)rowBytes*oh);
+   TVec3        U = up,
+                N = n;
+   float        cxv = 0.f,
+                cyv = 0.f,
+                first[6] = { NAN, NAN, NAN, NAN, NAN, NAN }, // lean, slope, keystones, the receding lines' meeting x y
+                last[6] = { NAN, NAN, NAN, NAN, NAN, NAN };
+
+   inspectSquareCorner = floor ? NULL : corner;
+   /* own lines (--rectify-own): measured in the view itself, and the virtual camera turned until its verticals and
+      horizontals stand square (the needle of the balance), a few rounds; else as the directions came */
+   for (int round = 0; round < (inspectRectOwn ? cSquareRounds : 1); round++)
+   {
+      float        wv[3],
+                   st[4],
+                   vp[4],
+                   yaw = 0.f;
+      TSquareLines lines;
+
+      inspectFrontalRender(img, bgr, U, N, out(), ow, oh, rowBytes, f, cxv, cyv);
+      lines.count = 0;
+      vp[0] = 0.f;
+      vp[1] = vp[2] = vp[3] = NAN;
+      if (!inspectRectOwn
+          || !(floor ? inspectFloorSquare(out(), ow, oh, rowBytes, f, cxv, cyv, wv, st)
+                     : inspectFrontalSquare(out(), ow, oh, rowBytes, f, cxv, cyv, wv, st, &lines, vp)))
+         break;
+
+      bool third = vp[0] > 0.f; // receding lines in the square's least squares: they set the pitch and the yaw
+
+      if (floor && path)
+         printf("  floor square %s round %d: off 0/90/+45/-45 %.2f %.2f %.2f %.2f deg, turn %+.2f %+.2f %+.2f\n",
+                strrchr(path, '/') ? strrchr(path, '/') + 1 : path, round, st[0], st[1], st[2], st[3],
+                wv[0]*57.2957795f, wv[1]*57.2957795f, wv[2]*57.2957795f);
+
+      if (third && path)
+         printf("  third axis %s round %d: %d receding lines, %.1f px rms off the principal point after the fit, turn"
+                " %+.2f %+.2f %+.2f deg\n", strrchr(path, '/') ? strrchr(path, '/') + 1 : path, round, (int)vp[0], vp[1],
+                wv[0]*57.2957795f, wv[1]*57.2957795f, wv[2]*57.2957795f);
+      if (round == 0)
+      {
+         memcpy(first, st, sizeof(st));
+         first[4] = vp[2];
+         first[5] = vp[3];
+      }
+      memcpy(last, st, sizeof(st));
+      last[4] = vp[2];
+      last[5] = vp[3];
+
+      /* the corner anchor (user: "you know which line is the corner, the rotation must be forced to align that
+         axis"): the plan's corner is seen from the eye at a known bearing against the wall's normal; the vertical
+         line nearest it (within cCornerWindowDeg) is the corner, and the view turns about its vertical until the
+         line stands there - only in a view without horizontals: where it has them, they are the needle (user: the
+         ceiling and floor lines), and a corner from the plan misses by about a degree */
+      if (!third && isnan(st[1]) && corner && corner->count > 0 && round >= 1) // round 0 plumbs the verticals first
+      {
+         float best = 1e9f,
+               bestX = NAN,
+               bestBearing = NAN;
+
+         for (int j = 0; j < lines.count; j++)
+            for (int c = 0; c < corner->count; c++)
+            {
+               float d = fabsf(atanf(lines.x[j]) - corner->bearing[c]);
+
+               if (d < best && d <= cCornerWindowDeg*0.01745329f)
+               {
+                  best = d;
+                  bestX = lines.x[j];
+                  bestBearing = corner->bearing[c];
+               }
+            }
+         if (isnan(bestX) && path && round == 1)
+         {
+            float nearest = 1e9f;
+
+            for (int j = 0; j < lines.count; j++)
+               for (int c = 0; c < corner->count; c++)
+                  if (fabsf(atanf(lines.x[j]) - corner->bearing[c]) < fabsf(nearest))
+                     nearest = atanf(lines.x[j]) - corner->bearing[c];
+            printf("  corner %s: predicted %+.2f / %+.2f deg, %d lines, the nearest %+.2f off (cx %.0f):",
+                   strrchr(path, '/') ? strrchr(path, '/') + 1 : path, corner->bearing[0]*57.2957795f,
+                   corner->count > 1 ? corner->bearing[1]*57.2957795f : NAN, lines.count, nearest*57.2957795f, cxv);
+            for (int j = 0; j < lines.count; j++)
+               printf(" %.0fpx/%.1f(%d)", cxv + lines.x[j]*f, atanf(lines.x[j])*57.2957795f, lines.votes[j]);
+            printf("\n");
+         }
+         if (!isnan(bestX))
+         {
+            yaw = atanf(bestX) - bestBearing;
+            wv[1] = 0.f;
+            if (path)
+               printf("  corner %s round %d: predicted %+.2f, the line at %+.2f deg: turn %+.2f\n",
+                      strrchr(path, '/') ? strrchr(path, '/') + 1 : path, round, bestBearing*57.2957795f,
+                      atanf(bestX)*57.2957795f, yaw*57.2957795f);
+         }
+      }
+      if (round + 1 == cSquareRounds
+          || (fmaxf(fabsf(wv[0]), fmaxf(fabsf(wv[1]), fabsf(wv[2]))) < cSquareDoneDeg*0.01745329f && yaw == 0.f))
+         break; // the last round only measures; a view already square stops early
+
+      // V' = V E(w): the virtual camera's axes (columns x, up, -n, in the real camera's) turned by w in its own axes
+      float lim = 5.f*0.01745329f,
+            e[9];
+
+      for (int k = 0; k < 3; k++) // damped: the receding lines and the keystone pull a little against each other
+         wv[k] = fmaxf(-lim, fminf(lim, cSquareGain*wv[k]));
+      inspectPanoExp(wv, e);
+
+      TVec3 zv = { -N.x, -N.y, -N.z },
+            xv = { U.y*zv.z - U.z*zv.y, U.z*zv.x - U.x*zv.z, U.x*zv.y - U.y*zv.x },
+            col[3] = { xv, U, zv },
+            nc[3];
+
+      for (int j = 0; j < 3; j++)
+      {
+         nc[j].x = col[0].x*e[j] + col[1].x*e[3 + j] + col[2].x*e[6 + j];
+         nc[j].y = col[0].y*e[j] + col[1].y*e[3 + j] + col[2].y*e[6 + j];
+         nc[j].z = col[0].z*e[j] + col[1].z*e[3 + j] + col[2].z*e[6 + j];
+      }
+      U = nc[1];
+      N.x = -nc[2].x;
+      N.y = -nc[2].y;
+      N.z = -nc[2].z;
+      if (yaw != 0.f) // the corner's turn about the view's vertical: the normal toward the view's right by yaw
+      {
+         TVec3 zn = { -N.x, -N.y, -N.z },
+               xn = { U.y*zn.z - U.z*zn.y, U.z*zn.x - U.x*zn.z, U.x*zn.y - U.y*zn.x };
+         float t = fmaxf(-lim, fminf(lim, yaw)),
+               cy = cosf(t),
+               sy = sinf(t);
+
+         N.x = N.x*cy + xn.x*sy;
+         N.y = N.y*cy + xn.y*sy;
+         N.z = N.z*cy + xn.z*sy;
+      }
+   }
+   inspectSquareCorner = NULL;
+   if (inspectMergeOn && path)
+      inspectMergeSplat(out(), ow, oh, rowBytes, f, cxv, cyv);
+   inspectMergeTarget.canvas = -1;
+   if (finalU)
+      *finalU = U;
+   if (finalN)
+      *finalN = N;
+   if (inspectRectOwn && path)
+      printf("  view %s: principal point %.1f %.1f, focal %.1f px\n", strrchr(path, '/') ? strrchr(path, '/') + 1 : path,
+             cxv, cyv, f);
+   if (inspectSquareCsv && path)
+   {
+      LPCSTR base = strrchr(path, '/');
+
+      fprintf(inspectSquareCsv, "%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\r\n", base ? base + 1 : path,
+              first[0], first[1], first[2], first[3], last[0], last[1], last[2], last[3], first[4], first[5], last[4],
+              last[5]);
+   }
    if (measure)
    {
       inspectCreaseLine(out(), ow, oh, rowBytes, f, cyv, false, *measure);
@@ -654,9 +2008,6 @@ static void inspectFrontal(const TImageRecord &img, LPCBYTE bgr, const TVec3 &up
 
 static float inspectDoorTiltDeg = 0.f, // --door-tilt deg
              inspectBlurNoise = 0.f;   // --blur-noise sigma (gray levels)
-static bool  inspectRectOut = false, // --rectify: write the frontal views
-             inspectDoors = false,   // --doors: look for doors in them
-             inspectDoorsAll = false; // --doors-all: and write every view, door or not (diagnosis)
 
 /*--------------------------------------------------------------------------------
    Doors on one frontal view (--doors): the view is built from the frame's YUV (BGR converted, chroma
@@ -871,6 +2222,108 @@ static void inspectRectify(const TImageRecord &img, const TVanishResult &vr, flo
    a.y /= len;
    a.z /= len;
 
+   /* the floor first, by the same rule (user, 2026-09-30: N/S/L/O/P): its normal is the measured vertical, the view
+      looks straight down, and its top is the room axis nearest to where the camera faced. Its lines keep their true
+      angles (user, 2026-10-01: the floor's lines are a needle), so with --diagonal-floor the floor's square turns the
+      frame itself: the vertical and the room axis it settles on go into the wall views (101732's frame 75: the tiles
+      at 86 degrees in its floor view, its walls out of square) */
+   float down = -up.z; // the camera's forward (0, 0, -1) against the measured up
+
+   if (inspectRectOut && inspectRectOwn && write && down < -0.34f) // tilted down beyond ~20 degrees
+   {
+      TVec3 b0 = { up.y*a.z - up.z*a.y, up.z*a.x - up.x*a.z, up.x*a.y - up.y*a.x },
+            fh = { -down*up.x, -down*up.y, -1.f - down*up.z }, // the forward laid flat: its vertical part taken out
+            cand[4] = { a, { -a.x, -a.y, -a.z }, b0, { -b0.x, -b0.y, -b0.z } };
+      int   best = 0;
+      float bestDot = -2.f;
+
+      for (int k = 0; k < 4; k++)
+      {
+         float dd = cand[k].x*fh.x + cand[k].y*fh.y + cand[k].z*fh.z;
+
+         if (dd > bestDot)
+         {
+            bestDot = dd;
+            best = k;
+         }
+      }
+
+      char  floorPath[sessionPathMax];
+      TVec3 into = { -up.x, -up.y, -up.z }, // the view's normal runs along the aim, into the surface: down
+            fu = cand[best],
+            fn = into;
+
+      snprintf(floorPath, sizeof(floorPath), "%s/rect_%03d_piso.bmp", outDir, index);
+      if (inspectMergeOn && inspectCornerCenter && inspectCornerPlan && inspectCornerPlan->vertexCount >= 3)
+      {
+         // the merge: the floor's canvas; the view's top as a plan direction (axis A, B = A turned -90), the eye
+         const TLayoutPlan &pl = *inspectCornerPlan;
+         float axisF = !isnan(refAxisDeg) ? refAxisDeg
+                                          : (!isnan(vr.roomAxisDeg) ? vr.roomAxisDeg
+                                                                    : fmodf(geomHeadingDeg(pose.RotateVector(a)), 90.f)),
+               thA = 90.f*floorf((axisF - pl.axisDeg)/90.f + 0.5f)*0.01745329f,
+               au = cosf(thA),
+               aw = sinf(thA),
+               tu = best == 0 ? au : (best == 1 ? -au : (best == 2 ? aw : -aw)),
+               tw = best == 0 ? aw : (best == 1 ? -aw : (best == 2 ? -au : au));
+         TVec3 cr = { cand[best].y*up.z - cand[best].z*up.y, cand[best].z*up.x - cand[best].x*up.z,
+                      cand[best].x*up.y - cand[best].y*up.x }; // the view's right: its top turned +90
+         float phi = atan2f(-cr.z, -cand[best].z),
+               el = asinf(fmaxf(-1.f, fminf(1.f, -up.z)));
+         TMergeTarget &mt = inspectMergeTarget;
+
+         inspectMergeCanvasInit(4, pl, 0.f, 0.f, 0.f, 0.f);
+         mt.canvas = 4;
+         mt.tu = tu;
+         mt.tw = tw;
+         mt.eu = cCornerEyeM*cosf(el)*(cosf(phi)*tu - sinf(phi)*tw);
+         mt.ew = cCornerEyeM*cosf(el)*(cosf(phi)*tw + sinf(phi)*tu);
+         mt.eh = pl.cameraHeightM + cCornerEyeM*sinf(el);
+      }
+      inspectFrontal(img, bgr(), cand[best], into, floorPath, NULL, NULL, true, &fu, &fn);
+      if (inspectDiagonalFloor)
+      {
+         // the turn R taking the floor view's axes (x, top, normal) as they came onto the squared ones: R = V1 V0^T
+         TVec3 u0 = cand[best],
+               n0 = into,
+               x0 = { u0.y*-n0.z - u0.z*-n0.y, u0.z*-n0.x - u0.x*-n0.z, u0.x*-n0.y - u0.y*-n0.x },
+               x1 = { fu.y*-fn.z - fu.z*-fn.y, fu.z*-fn.x - fu.x*-fn.z, fu.x*-fn.y - fu.y*-fn.x },
+               v0[3] = { x0, u0, n0 },
+               v1[3] = { x1, fu, fn },
+               src[2] = { up, a },
+               dst[2];
+
+         for (int s = 0; s < 2; s++)
+         {
+            float c[3];
+
+            for (int k = 0; k < 3; k++) // the vector in the old axes
+               c[k] = v0[k].x*src[s].x + v0[k].y*src[s].y + v0[k].z*src[s].z;
+            dst[s].x = v1[0].x*c[0] + v1[1].x*c[1] + v1[2].x*c[2];
+            dst[s].y = v1[0].y*c[0] + v1[1].y*c[1] + v1[2].y*c[2];
+            dst[s].z = v1[0].z*c[0] + v1[1].z*c[1] + v1[2].z*c[2];
+         }
+
+         float turn = acosf(fminf(1.f, fabsf(dst[0].x*up.x + dst[0].y*up.y + dst[0].z*up.z)))*57.2957795f,
+               d = dst[1].x*dst[0].x + dst[1].y*dst[0].y + dst[1].z*dst[0].z,
+               l;
+
+         if (turn <= cFloorMaxTurnDeg) // farther is a floor read wrong (a bed, a blanket), not the gyroscope's error
+         {
+            up = dst[0];
+            a.x = dst[1].x - d*up.x;
+            a.y = dst[1].y - d*up.y;
+            a.z = dst[1].z - d*up.z;
+            l = sqrtf(a.x*a.x + a.y*a.y + a.z*a.z);
+            a.x /= l;
+            a.y /= l;
+            a.z /= l;
+         }
+         printf("  floor %03d: its square turns the frame's vertical by %.2f deg%s\n", index, turn,
+                turn <= cFloorMaxTurnDeg ? "" : " - not taken");
+      }
+   }
+
    TVec3 b = { up.y*a.z - up.z*a.y, up.z*a.x - up.x*a.z, up.x*a.y - up.y*a.x };
    float fa = -a.z,  // camera forward (0, 0, -1) along each axis
          fb = -b.z;
@@ -883,7 +2336,7 @@ static void inspectRectify(const TImageRecord &img, const TVanishResult &vr, flo
    if (corner && (vr.flags & vfAxisA) && (vr.flags & vfAxisB))
       facingA = vr.support[2] >= vr.support[1];
 
-   for (int pass = 0; pass < (corner && !inspectDoors ? 1 : 2); pass++) // corner: the second wall for doors only
+   for (int pass = 0; pass < (corner && !inspectDoors && !inspectRectOwn ? 1 : 2); pass++) // corner: the second wall for doors (or own lines)
    {
       bool  useA = pass == 0 ? facingA : !facingA;
       float s = (useA ? fa : fb) >= 0.f ? 1.f : -1.f;
@@ -891,7 +2344,7 @@ static void inspectRectify(const TImageRecord &img, const TVanishResult &vr, flo
       float along = fabsf(useA ? fa : fb),
             across = fabsf(useA ? fb : fa);
 
-      if (pass == 1 && atan2f(across, along) > 60.f*0.01745329f)
+      if (pass == 1 && atan2f(across, along) > (inspectRectOwn ? 75.f : 60.f)*0.01745329f)
          break; // the second wall is barely seen: the frame faces the first one
       n.x *= s;
       n.y *= s;
@@ -936,12 +2389,62 @@ static void inspectRectify(const TImageRecord &img, const TVanishResult &vr, flo
          n.y = n.y*cp + xn.y*sp;
          n.z = n.z*cp + xn.z*sp;
       }
+      /* the corner anchor's hint (own lines, center spin): the wall's normal in plan axes (u along plan.axisDeg, w
+         clockwise from it), the eye cCornerEyeM from the spin point along the aim, and the bearing of each corner of
+         the wall from there against the normal, positive to the view's right */
+      TCornerHint hint = {};
+
+      if (inspectRectOwn && inspectCornerCenter && inspectCornerPlan && inspectCornerPlan->vertexCount >= 3)
+      {
+         const TLayoutPlan &pl = *inspectCornerPlan;
+         float th = 90.f*floorf((axis + 90.f*(float)wall - pl.axisDeg)/90.f + 0.5f)*0.01745329f,
+               nu = cosf(th),
+               nw = sinf(th),
+               ru = -nw,
+               rw = nu;
+         TVec3 zv = { -n.x, -n.y, -n.z },
+               xv = { upv.y*zv.z - upv.z*zv.y, upv.z*zv.x - upv.x*zv.z, upv.x*zv.y - upv.y*zv.x };
+         float phi = atan2f(-xv.z, -n.z), // the aim against the normal
+               eu = cCornerEyeM*(cosf(phi)*nu + sinf(phi)*ru),
+               ew = cCornerEyeM*(cosf(phi)*nw + sinf(phi)*rw),
+               reach = -1e9f;
+
+         for (int v = 0; v < pl.vertexCount; v++)
+            reach = fmaxf(reach, pl.verts[v].u*nu + pl.verts[v].w*nw);
+         for (int v = 0; v < pl.vertexCount && hint.count < 2; v++)
+         {
+            float du = pl.verts[v].u - eu,
+                  dw = pl.verts[v].w - ew;
+
+            if (pl.verts[v].u*nu + pl.verts[v].w*nw < reach - 0.05f)
+               continue; // not on the wall
+            hint.bearing[hint.count++] = atan2f(du*ru + dw*rw, du*nu + dw*nw);
+         }
+         if (inspectMergeOn && write) // the merge: this wall's canvas, the eye on the arm's sphere
+         {
+            float el = asinf(fmaxf(-1.f, fminf(1.f, -upv.z))); // the aim's elevation
+            TMergeTarget &mt = inspectMergeTarget;
+
+            inspectMergeCanvasInit(wall, pl, nu, nw, ru, rw);
+            mt.canvas = wall;
+            mt.nu = nu;
+            mt.nw = nw;
+            mt.ru = ru;
+            mt.rw = rw;
+            mt.reach = reach;
+            mt.eu = eu*cosf(el);
+            mt.ew = ew*cosf(el);
+            mt.eh = pl.cameraHeightM + cCornerEyeM*sinf(el);
+         }
+      }
       if (inspectRectOut && pass == 0) // one frontal view per frame: the dominant wall
       {
-         inspectFrontal(img, bgr(), upv, n, write ? path : NULL, measure);
+         inspectFrontal(img, bgr(), upv, n, write ? path : NULL, measure, &hint);
          if (measure)
             measure->wall = wall;
       }
+      else if (inspectRectOut && inspectRectOwn && write) // own lines: the second wall of a corner as well
+         inspectFrontal(img, bgr(), upv, n, path, NULL, &hint);
       if (inspectDoors)
          inspectDoorView(img, bgr(), up, n, outDir, index, wall);
       if (pass == 0 && atan2f(across, along) < 25.f*0.01745329f)
@@ -951,13 +2454,27 @@ static void inspectRectify(const TImageRecord &img, const TVanishResult &vr, flo
 
 static BYTE    inspectHidden[inspectMaxFrames]; // --hidden-floor 51-53,42: frames whose hidden floor lines are traced
 static LPCSTR inspectOutDir = NULL;
-static float  inspectFocalScale = 1.f; // --focal-scale: the lens's focal length against the app's (panorama and faces)
+static float  inspectFocalScale = 1.f, // --focal-scale: the lens's focal length against the app's (panorama and faces)
+              inspectIntrScale = 1.f;  // --intr-scale: every image record's focal scaled as read (the square-tile lens check)
 static bool   inspectFaceFramesOn = false; // --face-frames: each frame rectified alone onto each face, a folder per face
 static const TVanishResult *inspectFrameVr = NULL; // each keyframe's vanishing measure (the main loop's), for the registration's check
 static bool                 inspectPlumbOn = true,  // --no-plumb: keep the registered tilt (no plumb from the vanishing points)
                             inspectLeverOn = true,  // --no-lever: every camera center at the pivot (pure rotation)
                             inspectLeverScan = false; // --lever-scan: the registration's residual at trial levers (diagnosis)
 static TVec3                inspectLever = {};      // the camera center from the spin's pivot, camera axes (m): c = R o
+static int                  inspectPanoTop = 3;     // --pano-top L: the registration starts at level L (0 = 1/8; 3 = 1/64: coarser drifts by degrees without the parallax)
+static float                inspectVpAlpha = NAN;   // the room axis heading the lines aligned the frames to (radians; NaN: none)
+static bool                 inspectPanoFixedOn = true, // --no-fixed-pattern: keep the camera-fixed pattern in the registration pyramid
+                            inspectFocalOn = true;     // --no-focal: the registration keeps the focal scale as given
+static int                  inspectPairA = -1,      // --pair-scan A,B: one pair's relative turn by brute force, per image band
+                            inspectPairB = -1;
+static bool                 inspectDtScan = false;  // --dt-scan: the registration's residual at trial pose-to-image delays
+static float                inspectPoseDtSec = 0.f; // --pose-dt S: every frame's attitude taken S seconds off its picture's stamp
+static bool                 inspectPairsOn = false, // --pairs: the points' pair search before the Gauss-Newton (diagnosis until the bundle)
+                            inspectPairDebug = false, // --pair-debug: every failed pair of the first round listed
+                            inspectVpSolveOn = false, // --vp-solve: the rotations by the lines + gyroscope links, no photometric fit
+                            inspectCircleHeights = false, // --circle-heights: the body circle also solves each band's height
+                            inspectCircleFlat = false;    // --circle: the centers on the trunk's circle (flat aim), not the sphere
 static float  inspectHiddenCeilingM = 2.7f,  // --hidden-heights H h: the room's ceiling and the camera height
               inspectHiddenCameraM = 1.49f;  // (defaults: the bedroom 064701 plan)
 static const float cHiddenGateShare = 0.1f,   // a floor line crosses the vertical this near the expected foot (share of the corner's height)
@@ -2338,6 +3855,14 @@ static void inspectHiddenFloor(const TImageRecord &img, const TVanishResult &vr,
    fclose(csv);
 }
 
+static const float cAxisPriorGateDeg = 12.f,  // a frame's axis this far off the room's (mod 90) is measured again
+                   cAxisPriorWindowDeg = 10.f, // held within this of the room's (the gyroscope's drift and sway)
+                   cDiagonalAgreeDeg = 3.f;    // the tiles' axis (less 45) and the walls' agree within this
+
+enum {
+   cDiagonalMinSupport = 300 // tile edges (both diagonals) the joint axis needs
+};
+
 /*--------------------------------------------------------------------------------
    Vanishing measure of one keyframe: the app's own rtVanish record (written right before the
    image) when its seq matches, otherwise decoded and measured here against the room's check.
@@ -2373,6 +3898,85 @@ static void inspectMeasure(const TImageRecord &img, const TFrameMeta &meta, bool
    ok = inspectDecode(img.pixels, img.pixelBytes, img.width, img.height, false, luma)
         && vanishDetect(luma(), (int)img.width, (int)img.height, (int)img.width, img.intr, img.cameraToWorld,
                         tuned, vr, &edges);
+
+   /* own lines (--rectify-own): a horizontal axis far off the room's (101732's frame 81 took the diagonal tiles,
+      44 degrees off) is measured again held near the room's (user: "a horizontal vector in the region of the
+      gyroscope's degree cannot be ignored"); the wall's own lines - a cabinet's base, a baseboard - win there */
+   if (ok && inspectRectOwn && axis.HasReference() && (vr.flags & (vfAxisA | vfAxisB)) && !isnan(vr.roomAxisDeg)
+       && fabsf(vanishAxisDiffDeg(vr.roomAxisDeg, axis.ReferenceDeg())) > cAxisPriorGateDeg)
+   {
+      TVanishConfig held = tuned;
+      TVanishResult again = {};
+
+      held.priorAxisDeg = axis.ReferenceDeg();
+      held.priorWindowDeg = cAxisPriorWindowDeg;
+      if (vanishDetect(luma(), (int)img.width, (int)img.height, (int)img.width, img.intr, img.cameraToWorld, held,
+                       again, &edges)
+          && (again.flags & (vfAxisA | vfAxisB)))
+      {
+         printf("  frame %d: axis %.2f is %.1f deg off the room's %.2f; held near it: %.2f (support A %lu B %lu)\n",
+                index, vr.roomAxisDeg, vanishAxisDiffDeg(vr.roomAxisDeg, axis.ReferenceDeg()), axis.ReferenceDeg(),
+                again.roomAxisDeg, (unsigned long)again.support[1], (unsigned long)again.support[2]);
+         vr = again;
+      }
+      else // the held search found nothing: the edges go back to the frame's own measure
+         vanishDetect(luma(), (int)img.width, (int)img.height, (int)img.width, img.intr, img.cameraToWorld, tuned, vr,
+                      &edges);
+   }
+   /* --diagonal-floor: the tiles laid at 45 degrees to the walls are the room's axis too (user: the floor's lines are
+      a needle). The frame measured again held near the tiles' heading; the room axis is the walls' and the tiles'
+      (less 45) together, by support, when the two agree within cDiagonalAgreeDeg - in 101732's frame 75 the walls'
+      own lines (A 375 edges) sat 1.9 degrees off the tiles' */
+   if (ok && inspectDiagonalFloor && axis.HasReference() && (vr.flags & (vfAxisA | vfAxisB)) && !isnan(vr.roomAxisDeg))
+   {
+      TVanishConfig held = tuned;
+      TVanishResult tiles = {};
+
+      held.priorAxisDeg = fmodf(vr.roomAxisDeg + 45.f, 90.f);
+      held.priorWindowDeg = cDiagonalAgreeDeg;
+      if (vanishDetect(luma(), (int)img.width, (int)img.height, (int)img.width, img.intr, img.cameraToWorld, held,
+                       tiles, NULL)
+          && (tiles.flags & vfAxisA) && (tiles.flags & vfAxisB) && !isnan(tiles.roomAxisDeg))
+      {
+         float tilesAxis = fmodf(tiles.roomAxisDeg + 45.f, 90.f),
+               gap = vanishAxisDiffDeg(tilesAxis, vr.roomAxisDeg),
+               ww = (float)(vr.support[1] + vr.support[2]),
+               wt = (float)(tiles.support[1] + tiles.support[2]),
+               joint = vr.roomAxisDeg + gap*wt/fmaxf(ww + wt, 1.f);
+
+         if (fabsf(gap) <= cDiagonalAgreeDeg && wt >= (float)cDiagonalMinSupport)
+         {
+            const TMat4 &pose = img.cameraToWorld;
+            TVec3        up = vr.dirCam[0];
+
+            for (int k = 1; k <= 2; k++) // axes A and B at the joint heading, square to the measured vertical
+            {
+               float h = (joint + (k == 2 ? 90.f : 0.f))*0.01745329f;
+               TVec3 aw = { sinf(h), 0.f, -cosf(h) },
+                     a = { pose.m[0]*aw.x + pose.m[1]*aw.y + pose.m[2]*aw.z, pose.m[4]*aw.x + pose.m[5]*aw.y + pose.m[6]*aw.z,
+                           pose.m[8]*aw.x + pose.m[9]*aw.y + pose.m[10]*aw.z };
+               float d = a.x*up.x + a.y*up.y + a.z*up.z,
+                     l;
+
+               a.x -= d*up.x;
+               a.y -= d*up.y;
+               a.z -= d*up.z;
+               l = sqrtf(a.x*a.x + a.y*a.y + a.z*a.z);
+               if (l > 1e-6f)
+               {
+                  vr.dirCam[k].x = a.x/l;
+                  vr.dirCam[k].y = a.y/l;
+                  vr.dirCam[k].z = a.z/l;
+               }
+            }
+            printf("  frame %d: walls %.2f (A %lu B %lu), tiles %.2f less 45 (A %lu B %lu): the room axis %.2f\n", index,
+                   vr.roomAxisDeg, (unsigned long)vr.support[1], (unsigned long)vr.support[2], tilesAxis,
+                   (unsigned long)tiles.support[1], (unsigned long)tiles.support[2], joint);
+            vr.roomAxisDeg = joint;
+            vr.flags |= (BYTE)(vfAxisA | vfAxisB);
+         }
+      }
+   }
    kept = vr; // the frame's own measure (or its predictions): the wall composition turns the frame with it
    if (ok)
       tilt.Add(vr);
@@ -3207,8 +4811,9 @@ static void inspectFloorBMP(const TFloorGrid &g, float ppm, const TLayoutPlan *p
 /*--------------------------------------------------------------------------------
    Panorama registration (user, 2026-09-28: a panorama is worth only its coherent seams - no ghosts).
    The gyroscope places each center-spin frame to a few degrees; the overlaps (each view shares
-   ~3/4 with the next) fix it. Every frame becomes a pyramid of high-pass images (1/8, 1/16 and 1/32
-   of the picture, normalized: exposure differences drop out). At each strong-edge pixel of a frame
+   ~3/4 with the next) fix it. Every frame becomes a pyramid of high-pass images (1/8 down to 1/256
+   of the picture, normalized: exposure differences drop out; user, 2026-09-30: the coarse levels
+   catch what the gyroscope misses by degrees, before any finer freedom is let loose). At each strong-edge pixel of a frame
    its world direction is projected into every neighbor seeing it, and the two intensities there are
    one residual. All rotations are solved together, coarse to fine, by Gauss-Newton on small world
    rotations (3 per frame, least squares), each residual weighed by Huber (furniture near the camera shifts by
@@ -3217,7 +4822,7 @@ static void inspectFloorBMP(const TFloorGrid &g, float ppm, const TLayoutPlan *p
   --------------------------------------------------------------------------------*/
 enum {
    inspectPanoMax    = 128,  // center-spin frames registered at most
-   inspectPanoLevels = 3,
+   inspectPanoLevels = 6,    // 1/8 .. 1/256: the coarsest pixel ~5 degrees, wide enough for the gyroscope's errors
    inspectPanoShrink = 8,    // the finest level's pixel: this many picture pixels
    inspectPanoIters  = 8     // Gauss-Newton rounds per level
 };
@@ -3226,11 +4831,24 @@ static const float cPanoNeighborCos = 0.5f,   // frames whose forwards lie withi
                    cPanoHuber = 1.5f,         // Huber knee, in RMS residuals of the previous round
                    cPanoPrior = 1e-4f,        // damping, share of the mean diagonal
                    cPanoShiftPrior = 1e-2f,   // each frame's own shift held harder (alone on one wall it trades with the turn)
-                   cPanoEdgeShare = 1.f;      // sample pixels: gradient above this share of the frame's mean
+                   cPanoEdgeShare = 1.f,      // sample pixels: gradient above this share of the frame's mean
+                   cDtScanStepSec = 0.05f,    // --dt-scan: between trial delays
+                   cPairCos = 0.8f,           // the pairs: forwards within ~37 degrees
+                   cPairHuberDeg = 0.5f,      // a pair's misfit beyond this weighs less
+                   cPairGyroPull = 1e-3f;     // the weak pull toward the gyroscope (share of the mean diagonal)
+
+enum {
+   cPanoFocalLevel = 2, // the focal scale is solved from this level (1/32) down
+   cDtScanSteps = 20,   // --dt-scan: trial delays each side
+   cPairRounds = 2,     // the pairs: measured and solved this many times
+   cPairIters = 5,      // reweighed solves per round
+   cPairMinInliers = 12 // a pair with fewer points meeting gives no turn
+};
 
 // One center-spin frame being registered: its pinhole, rotation (camera to world, TMat4 layout) and pyramid
 struct TPanoFrame {
    int           index;
+   QWORD         stamp;       // its picture's stamp (the attitude log is searched by it)
    float         fx,
                  fy,
                  cx,
@@ -3242,6 +4860,9 @@ struct TPanoFrame {
    int           w[inspectPanoLevels],
                  h[inspectPanoLevels];
    TBlock<float> hp[inspectPanoLevels];
+   TBlock<BYTE>  gray[3];     // plain gray at 1/2, 1/4 and 1/16 (the points' pyramid)
+   int           gw[3],
+                 gh[3];
 };
 
 static TPanoFrame inspectPano[inspectPanoMax];
@@ -3264,7 +4885,21 @@ static float inspectBoxN[inspectBoxMax][3], // outward normals: n X = D on the p
              inspectBoxD[inspectBoxMax];
 static int   inspectBoxCount = 0;
 static bool  inspectLeverFit = false,      // the registration solves the lever arm too
-             inspectShiftFit = false;      // and each frame's own shift
+             inspectShiftFit = false,      // and each frame's own shift
+             inspectBodyFit = false;       // and the body's radius and the phone's height per band (below)
+static bool  inspectFocalFit = false;      // and the lens's focal scale (every frame alike: inspectFocalScale follows)
+
+/* The operator turns the body about its own vertical, the phone held out in front (user, 2026-09-30:
+   the furniture on L, the window on O, the handles on N, the bed on S - the freedoms not yet orchestrated).
+   Per band b the camera center sits r_b ahead of the pivot along the frame's horizontal forward and y_b
+   above it: c = r_b f_h + y_b up, plus the frame's own sway. Tilting to the ceiling or to the floor moves
+   the phone about the wrist, not about the body: each band has its own pair, not one arm turned with the
+   camera (c = R o coupled the tilt into the height and came out ~0). */
+enum {
+   inspectBodyBands = 3
+};
+
+static float inspectBody[inspectBodyBands][2]; // r_b, y_b (m), carried into every frame's shift
 
 //--------------------------------------------------------------------------------
 // A frame's camera center in the world: the lever turned by its rotation (TMat4 layout, 3x3), plus its own shift (NULL: none)
@@ -3281,6 +4916,30 @@ static TVec3 inspectCenter(const float *rot, const float *shift)
       c.z += shift[2];
    }
    return c;
+}
+
+//--------------------------------------------------------------------------------
+// A frame's forward laid flat (unit, world): the body turns about the vertical, the phone held along it
+static TVec3 inspectHorizontalForward(const float *rot)
+{
+   TVec3 f = { -rot[6], 0.f, -rot[8] };
+   float l = sqrtf(f.x*f.x + f.z*f.z);
+
+   if (l > 1e-6f)
+   {
+      f.x /= l;
+      f.z /= l;
+   }
+   return f;
+}
+
+//--------------------------------------------------------------------------------
+// The body pair a frame's band uses
+static int inspectBodyBandOf(const TPanoFrame &p)
+{
+   int b = (int)inspectBand[p.index];
+
+   return b >= 0 && b < inspectBodyBands ? b : 0;
 }
 
 //--------------------------------------------------------------------------------
@@ -3500,7 +5159,9 @@ static float inspectPanoRound(int level, float knee, int &residuals)
    const bool    shifts = inspectShiftFit && inspectBoxCount;
    const int     rots = inspectPanoCount*3,
                  lever0 = rots + (shifts ? rots : 0),
-                 n = lever0 + (inspectLeverFit && inspectBoxCount ? 3 : 0);
+                 body0 = lever0 + (inspectLeverFit && inspectBoxCount ? 3 : 0),
+                 focal0 = body0 + (inspectBodyFit && inspectBoxCount ? 2*inspectBodyBands : 0),
+                 n = focal0 + (inspectFocalFit ? 1 : 0);
    TAlloc<float> H((size_t)n*n),
                   g((size_t)n);
    float        sq = 0.f,
@@ -3594,8 +5255,8 @@ static float inspectPanoRound(int level, float knee, int &residuals)
 
                float r = v0 - val,
                      wt = fabsf(r) <= knee ? 1.f : knee/fabsf(r),
-                     J[15];
-               int   at[15],
+                     J[24];
+               int   at[24],
                      m = 6;
                // d(u, v)/d(rc), then back to world: gw = R_b (dval/drc)
                TVec3 grc = { gu*fx*iz, -gv*fy*iz, gu*fx*rc.x*iz*iz - gv*fy*rc.y*iz*iz },
@@ -3644,7 +5305,7 @@ static float inspectPanoRound(int level, float knee, int &residuals)
                      }
                      m += 6;
                   }
-                  if (n > lever0)
+                  if (body0 > lever0)
                   {
                      for (int k = 0; k < 3; k++)
                      {
@@ -3654,6 +5315,46 @@ static float inspectPanoRound(int level, float knee, int &residuals)
                      }
                      m += 3;
                   }
+                  if (focal0 > body0) // a's center moves the point on its plane (-pg), b's its view (+gw): radius along f_h, height along up
+                  {
+                     int   ba = inspectBodyBandOf(a),
+                           bb = inspectBodyBandOf(b);
+                     TVec3 fa = inspectHorizontalForward(a.rot),
+                           fb = inspectHorizontalForward(b.rot);
+
+                     J[m] = -(pg.x*fa.x + pg.y*fa.y + pg.z*fa.z);
+                     at[m] = body0 + 2*ba;
+                     J[m + 1] = -pg.y;
+                     at[m + 1] = body0 + 2*ba + 1;
+                     J[m + 2] = gw.x*fb.x + gw.y*fb.y + gw.z*fb.z;
+                     at[m + 2] = body0 + 2*bb;
+                     J[m + 3] = gw.y;
+                     at[m + 3] = body0 + 2*bb + 1;
+                     m += 4;
+                  }
+               }
+               if (n > focal0)
+               {
+                  /* the focal scale s (fx, fy x (1 + s), every frame): a's ray leans away from its center (d d_u/ds =
+                     -(rx x_cam + ry y_cam), onto its plane when it has one), b's projection spreads from its center
+                     (du/ds = u - cx, dv/ds = v - cy) */
+                  TVec3 dd = { -(rx*a.rot[0] + ry*a.rot[3]), -(rx*a.rot[1] + ry*a.rot[4]), -(rx*a.rot[2] + ry*a.rot[5]) },
+                        pv = gw;
+                  float along = 1.f/dl;
+
+                  if (plane >= 0)
+                  {
+                     const float *pn = inspectBoxN[plane];
+                     float        gd = (gw.x*d.x + gw.y*d.y + gw.z*d.z)/nd;
+
+                     pv.x = gw.x - pn[0]*gd;
+                     pv.y = gw.y - pn[1]*gd;
+                     pv.z = gw.z - pn[2]*gd;
+                     along = t/dl;
+                  }
+                  J[m] = -(along*(pv.x*dd.x + pv.y*dd.y + pv.z*dd.z) + gu*(u - cx) + gv*(v - cy));
+                  at[m] = focal0;
+                  m++;
                }
                for (int p = 0; p < m; p++)
                {
@@ -3667,12 +5368,14 @@ static float inspectPanoRound(int level, float knee, int &residuals)
          }
    }
 
-   // damping per block (turns, shifts, lever): the turns' holds the whole set's free rotation near the gyroscope's
-   const int   lo[3] = { 0, rots, lever0 },
-               hi[3] = { rots, lever0, n };
-   const float pull[3] = { cPanoPrior, cPanoShiftPrior, cPanoPrior };
+   // damping per block (turns, shifts, lever, body, focal): the turns' holds the whole set's free rotation near the gyroscope's
+   const int   lo[5] = { 0, rots, lever0, body0, focal0 },
+               hi[5] = { rots, lever0, body0, focal0, n };
+   // a coarse level's few, blurred residuals hold less: its turns lean harder on the gyroscope (x4 per level)
+   const float coarse = (float)(1 << 2*level),
+               pull[5] = { cPanoPrior*coarse, cPanoShiftPrior, cPanoPrior, cPanoPrior, cPanoPrior };
 
-   for (int blk = 0; blk < 3; blk++)
+   for (int blk = 0; blk < 5; blk++)
    {
       diag = 0.f;
       for (int k = lo[blk]; k < hi[blk]; k++)
@@ -3685,6 +5388,26 @@ static float inspectPanoRound(int level, float knee, int &residuals)
       g[k] = -g[k];
    if (count && inspectPanoSolve(H(), g(), n))
    {
+      if (focal0 > body0) // the body's pair moves every frame of its band, along the forward it had at this round
+      {
+         for (int i = 0; i < inspectPanoCount; i++)
+         {
+            TPanoFrame &a = inspectPano[i];
+            int         b = inspectBodyBandOf(a);
+            TVec3       fh = inspectHorizontalForward(a.rot);
+            float       dr = g[body0 + 2*b],
+                        dy = g[body0 + 2*b + 1];
+
+            a.shift[0] += dr*fh.x;
+            a.shift[1] += dr*fh.y + dy;
+            a.shift[2] += dr*fh.z;
+         }
+         for (int b = 0; b < inspectBodyBands; b++)
+         {
+            inspectBody[b][0] += g[body0 + 2*b];
+            inspectBody[b][1] += g[body0 + 2*b + 1];
+         }
+      }
       for (int i = 0; i < inspectPanoCount; i++)
       {
          float w[3] = { g[3*i], g[3*i + 1], g[3*i + 2] },
@@ -3705,11 +5428,22 @@ static float inspectPanoRound(int level, float knee, int &residuals)
          for (int i = 0; i < inspectPanoCount; i++)
             for (int k = 0; k < 3; k++)
                inspectPano[i].shift[k] += g[rots + 3*i + k];
-      if (n > lever0)
+      if (body0 > lever0)
       {
          inspectLever.x += g[lever0];
          inspectLever.y += g[lever0 + 1];
          inspectLever.z += g[lever0 + 2];
+      }
+      if (n > focal0)
+      {
+         float f = 1.f + fmaxf(-0.05f, fminf(0.05f, g[focal0])); // a step never beyond 5%
+
+         for (int i = 0; i < inspectPanoCount; i++)
+         {
+            inspectPano[i].fx *= f;
+            inspectPano[i].fy *= f;
+         }
+         inspectFocalScale *= f;
       }
    }
    residuals = count;
@@ -3892,12 +5626,22 @@ static float inspectPanoGN(DWORD room, int top)
 {
    float fine = 0.f;
 
+   if (inspectVpSolveOn) // the lines hold the rotations: the photometric fit would drag them off (the parallax)
+   {
+      for (int i = 0; i < inspectPanoCount; i++)
+         if (inspectPanoHas[inspectPano[i].index])
+            memcpy(inspectPanoRot[inspectPano[i].index], inspectPano[i].rot, sizeof(inspectPano[i].rot));
+      return 0.f;
+   }
+
    for (int l = top; l >= 0; l--)
    {
       float knee = 1e9f,
             first = 0.f,
             last = 0.f;
       int   count = 0;
+
+      inspectFocalFit = inspectFocalOn && l <= cPanoFocalLevel; // a 1% focal error moves the frame edges ~1 px from 1/32 on
 
       for (int it = 0; it < inspectPanoIters; it++)
       {
@@ -3908,14 +5652,2391 @@ static float inspectPanoGN(DWORD room, int top)
          last = rms;
          knee = cPanoHuber*rms;
       }
-      printf("  panorama room %lu: level 1/%d, %d residuals, RMS %.3f -> %.3f\n", (unsigned long)room,
-             inspectPanoShrink << l, count, first, last);
+      float mean = 0.f,
+            worst = 0.f;
+
+      for (int i = 0; i < inspectPanoCount; i++)
+      {
+         float a = inspectPanoAngleDeg(inspectPano[i].rot, inspectPano[i].gyro);
+
+         mean += a;
+         worst = fmaxf(worst, a);
+      }
+      printf("  panorama room %lu: level 1/%d, %d residuals, RMS %.3f -> %.3f; focal scale %.4f; correction to the gyroscope mean %.2f,"
+             " worst %.2f degrees\n", (unsigned long)room, inspectPanoShrink << l, count, first, last, inspectFocalScale,
+             inspectPanoCount ? mean/(float)inspectPanoCount : 0.f, worst);
       fine = last;
+      inspectFocalFit = false;
    }
    for (int i = 0; i < inspectPanoCount; i++)
       if (inspectPanoHas[inspectPano[i].index])
          memcpy(inspectPanoRot[inspectPano[i].index], inspectPano[i].rot, sizeof(inspectPano[i].rot));
    return fine;
+}
+
+/*--------------------------------------------------------------------------------
+   The gyroscope's attitude against the picture's time (user, 2026-09-30: every freedom counted - the
+   pose-to-image delay among them). The session logs the attitude at the sensor's rate (rtPose); a
+   frame's rotation at its picture's stamp plus dt comes from the two samples around it, blended and
+   made orthonormal again. --dt-scan measures the registration's residual (level 1/32, the gyroscope's
+   rotations as they are) at trial delays; --pose-dt S takes the attitude S seconds off every stamp.
+  --------------------------------------------------------------------------------*/
+enum {
+   inspectPoseMax = 131072
+};
+
+static QWORD inspectPoseNs[inspectPoseMax];
+static float inspectPoseRot[inspectPoseMax][9]; // camera to world, TMat4 layout 3x3
+static int   inspectPoseCount = 0;
+
+//--------------------------------------------------------------------------------
+// The attitude at stamp + dt (seconds); false outside the log
+static bool inspectPoseAt(QWORD stamp, float dt, float *rot)
+{
+   LONG  shiftUs = (LONG)(dt*1e6f);
+   QWORD t = shiftUs >= 0 ? stamp + (QWORD)shiftUs*1000u : stamp - (QWORD)(-shiftUs)*1000u;
+   int   lo = 0,
+         hi = inspectPoseCount - 1;
+
+   if (inspectPoseCount < 2 || t < inspectPoseNs[0] || t > inspectPoseNs[hi])
+      return false;
+   while (hi - lo > 1)
+   {
+      int m = (lo + hi)/2;
+
+      if (inspectPoseNs[m] <= t)
+         lo = m;
+      else
+         hi = m;
+   }
+
+   float span = (float)(inspectPoseNs[hi] - inspectPoseNs[lo]),
+         u = span > 0.f ? (float)(t - inspectPoseNs[lo])/span : 0.f;
+
+   for (int k = 0; k < 9; k++)
+      rot[k] = inspectPoseRot[lo][k]*(1.f - u) + inspectPoseRot[hi][k]*u;
+
+   // columns orthonormal again (Gram-Schmidt: x, then y off x, z = x cross y)
+   float *x = rot,
+         *y = rot + 3,
+         *z = rot + 6,
+         l = sqrtf(x[0]*x[0] + x[1]*x[1] + x[2]*x[2]),
+         d = 0.f;
+
+   for (int k = 0; k < 3; k++)
+      x[k] /= l;
+   d = x[0]*y[0] + x[1]*y[1] + x[2]*y[2];
+   for (int k = 0; k < 3; k++)
+      y[k] -= d*x[k];
+   l = sqrtf(y[0]*y[0] + y[1]*y[1] + y[2]*y[2]);
+   for (int k = 0; k < 3; k++)
+      y[k] /= l;
+   z[0] = x[1]*y[2] - x[2]*y[1];
+   z[1] = x[2]*y[0] - x[0]*y[2];
+   z[2] = x[0]*y[1] - x[1]*y[0];
+   return true;
+}
+
+//--------------------------------------------------------------------------------
+static void inspectPanoDtScan(DWORD room)
+{
+   TAlloc<float> keep((size_t)inspectPanoCount*9u);
+   float         bestDt = 0.f,
+                 bestRms = 1e9f;
+
+   for (int i = 0; i < inspectPanoCount; i++)
+      memcpy(&keep[(size_t)i*9u], inspectPano[i].rot, sizeof(inspectPano[i].rot));
+   printf("  panorama room %lu: %d attitude samples logged\n", (unsigned long)room, inspectPoseCount);
+   for (int s = -cDtScanSteps; s <= cDtScanSteps; s++)
+   {
+      float dt = (float)s*cDtScanStepSec,
+            rms = 0.f;
+      int   count = 0,
+            placed = 0;
+
+      for (int i = 0; i < inspectPanoCount; i++)
+         placed += inspectPoseAt(inspectPano[i].stamp, dt, inspectPano[i].rot) ? 1 : 0;
+      rms = inspectPanoRound(2, 1e9f, count);
+      printf("  panorama room %lu: pose delay %+.3f s: RMS %.4f (%d residuals, %d frames placed)\n", (unsigned long)room, dt,
+             rms, count, placed);
+      if (rms < bestRms)
+      {
+         bestRms = rms;
+         bestDt = dt;
+      }
+      for (int i = 0; i < inspectPanoCount; i++)
+         memcpy(inspectPano[i].rot, &keep[(size_t)i*9u], sizeof(inspectPano[i].rot));
+   }
+   printf("  panorama room %lu: pose delay scan: best %+.3f s (RMS %.4f)\n", (unsigned long)room, bestDt, bestRms);
+}
+
+/*--------------------------------------------------------------------------------
+   One pair's relative turn by brute force (--pair-scan A,B; diagnosis, user 2026-09-30: the ghosts come
+   from freedoms not yet orchestrated). A's rotation is held; B is turned about its own camera axes
+   (x: pitch, y: heading, z: roll) on a grid, and at each trial A's strong-edge pixels of one image
+   band (rows lo..hi, shares of the height) are compared at infinity (pure rotation) with B's. Two bands
+   of the same pair that ask for different turns show a parallax - a translation meeting depths.
+  --------------------------------------------------------------------------------*/
+static void inspectPairScanBand(const TPanoFrame &a, const TPanoFrame &b, const float *rotB, int level, float lo, float hi, float span,
+                                float step, float *best, float &bestRms, int &bestCount)
+{
+   const float *ia = a.hp[level](),
+               *ib = b.hp[level]();
+   float        s = 1.f/(float)(inspectPanoShrink << level),
+                fx = a.fx*s,
+                fy = a.fy*s,
+                cx = (a.cx + 0.5f)*s - 0.5f,
+                cy = (a.cy + 0.5f)*s - 0.5f;
+   int          w = a.w[level],
+                h = a.h[level],
+                steps = (int)(span/step + 0.5f);
+
+   bestRms = 1e9f;
+   bestCount = 0;
+   for (int ix = -steps; ix <= steps; ix++)
+      for (int iy = -steps; iy <= steps; iy++)
+         for (int iz = -steps; iz <= steps; iz++)
+         {
+            // B turned about its own axes: R' = R_b E (E in camera axes, columns of R_b mixed)
+            float wv[3] = { (float)ix*step*0.01745329f, (float)iy*step*0.01745329f, (float)iz*step*0.01745329f },
+                  e[9],
+                  rb[9],
+                  sq = 0.f;
+            int   count = 0;
+
+            inspectPanoExp(wv, e);
+            for (int c = 0; c < 3; c++)
+               for (int r = 0; r < 3; r++)
+                  rb[3*c + r] = rotB[r]*e[c] + rotB[3 + r]*e[3 + c] + rotB[6 + r]*e[6 + c];
+            for (int y = (int)(lo*(float)h) + 2; y + 2 < h && y < (int)(hi*(float)h); y++)
+               for (int x = 2; x + 2 < w; x++)
+               {
+                  float v0 = ia[(size_t)y*w + x],
+                        ex = ia[(size_t)y*w + x + 1] - ia[(size_t)y*w + x - 1],
+                        ey = ia[(size_t)(y + 1)*w + x] - ia[(size_t)(y - 1)*w + x];
+
+                  if (fabsf(ex) + fabsf(ey) < cPanoEdgeShare*a.edge[level])
+                     continue;
+
+                  float rx = ((float)x - cx)/fx,
+                        ry = -((float)y - cy)/fy;
+                  TVec3 d = { a.rot[0]*rx + a.rot[3]*ry - a.rot[6], a.rot[1]*rx + a.rot[4]*ry - a.rot[7],
+                              a.rot[2]*rx + a.rot[5]*ry - a.rot[8] },
+                        rc = { rb[0]*d.x + rb[1]*d.y + rb[2]*d.z, rb[3]*d.x + rb[4]*d.y + rb[5]*d.z,
+                               rb[6]*d.x + rb[7]*d.y + rb[8]*d.z };
+
+                  if (rc.z > -1e-3f)
+                     continue;
+
+                  float iz2 = 1.f/-rc.z,
+                        val,
+                        gu,
+                        gv;
+
+                  if (!inspectPanoAt(ib, b.w[level], b.h[level], cx + fx*rc.x*iz2, cy - fy*rc.y*iz2, val, gu, gv))
+                     continue;
+                  sq += (v0 - val)*(v0 - val);
+                  count++;
+               }
+            if (count < 50)
+               continue;
+
+            float rms = sqrtf(sq/(float)count);
+
+            if (rms < bestRms)
+            {
+               bestRms = rms;
+               bestCount = count;
+               best[0] = wv[0]*57.2957795f;
+               best[1] = wv[1]*57.2957795f;
+               best[2] = wv[2]*57.2957795f;
+            }
+         }
+}
+
+//--------------------------------------------------------------------------------
+static void inspectPairScan(DWORD room)
+{
+   int ia = -1,
+       ib = -1;
+
+   for (int i = 0; i < inspectPanoCount; i++)
+   {
+      ia = inspectPano[i].index == inspectPairA ? i : ia;
+      ib = inspectPano[i].index == inspectPairB ? i : ib;
+   }
+   if (ia < 0 || ib < 0)
+   {
+      printf("  pair scan room %lu: frames %d and %d not both in the center spin\n", (unsigned long)room, inspectPairA,
+             inspectPairB);
+      return;
+   }
+
+   const float band[4][2] = { { 0.f, 1.f }, { 0.f, 0.34f }, { 0.34f, 0.67f }, { 0.67f, 1.f } };
+   LPCSTR      name[4] = { "whole", "top third", "middle third", "bottom third" };
+
+   for (int k = 0; k < 4; k++)
+   {
+      float coarse[3] = { 0.f, 0.f, 0.f },
+            fine[3] = { 0.f, 0.f, 0.f },
+            rms = 0.f;
+      int   count = 0;
+      const TPanoFrame &b = inspectPano[ib];
+
+      inspectPairScanBand(inspectPano[ia], b, b.rot, 1, band[k][0], band[k][1], 5.f, 0.5f, coarse, rms, count);
+
+      float e[9],
+            rot[9],
+            wv[3] = { coarse[0]*0.01745329f, coarse[1]*0.01745329f, coarse[2]*0.01745329f };
+
+      inspectPanoExp(wv, e);
+      for (int c = 0; c < 3; c++)
+         for (int r = 0; r < 3; r++)
+            rot[3*c + r] = b.rot[r]*e[c] + b.rot[3 + r]*e[3 + c] + b.rot[6 + r]*e[6 + c];
+      inspectPairScanBand(inspectPano[ia], b, rot, 0, band[k][0], band[k][1], 0.5f, 0.05f, fine, rms, count);
+      printf("  pair scan room %lu: %d -> %d, %s of %d: B turned pitch %.2f heading %.2f roll %.2f degrees (RMS %.3f, %d px)\n",
+             (unsigned long)room, inspectPairA, inspectPairB, name[k], inspectPairA, coarse[0] + fine[0], coarse[1] + fine[1],
+             coarse[2] + fine[2], rms, count);
+   }
+}
+
+/*--------------------------------------------------------------------------------
+   Points that must meet (user, 2026-09-30: "a first calibration of points that must fit, reduced
+   16x, then gradually refined down to 1x"). Each frame keeps plain gray at 1/2, 1/4 and 1/16. Corners
+   (Shi-Tomasi at 1/4, spread over a grid) of A are looked for in B through the homography of the
+   current rotations (H = K R_b^T R_a K^-1, pure turn): NCC of A's patch against B's patch warped by
+   H, offsets searched wide at 1/16, then narrow at 1/4 and at 1/2, a parabola for the subpixel. The
+   matched bearings give B's turn relative to A by RANSAC on two points and Horn's quaternion on all
+   the inliers.
+  --------------------------------------------------------------------------------*/
+enum {
+   cPointCorners = 400,  // corners per frame at most
+   cPointGridX = 10,     // corner buckets across and down (spread over the picture)
+   cPointGridY = 8,
+   cPointHalf = 5,       // NCC patch half side (11 x 11)
+   cPointCoarseWin = 24, // 1/16 search half window (px: ~7.5 degrees)
+   cPointRansac = 256,   // RANSAC trials
+   cPointEpiIters = 12   // the two-view model's Gauss-Newton rounds per start
+};
+
+static const float cPointMinNcc = 0.85f,         // a match's NCC at 1/2
+                   cPointMinCornerShare = 0.01f, // corner response against the frame's best
+                   cPointInlierDeg = 0.08f,   // a match that fits: within this angle of the two-view model
+                   cPointLooseDeg = 1.5f;     // the pure turn's RANSAC: loose, the baseline's parallax still in
+
+static const int   cPointShrink[3] = { 2, 4, 16 };
+
+//--------------------------------------------------------------------------------
+static void inspectPointGrays(LPCBYTE bgr, DWORD width, DWORD height, TPanoFrame &p)
+{
+   for (int l = 0; l < 3; l++)
+   {
+      int    s = cPointShrink[l],
+             w = (int)width/s,
+             h = (int)height/s;
+      LPBYTE g = new BYTE[(size_t)w*h];
+
+      for (int y = 0; y < h; y++)
+         for (int x = 0; x < w; x++)
+         {
+            DWORD sum = 0;
+
+            for (int dy = 0; dy < s; dy++)
+            {
+               LPCBYTE q = bgr + ((size_t)(y*s + dy)*width + (size_t)x*s)*3u;
+
+               for (int dx = 0; dx < s; dx++, q += 3)
+                  sum += (DWORD)q[0]*29u + (DWORD)q[1]*150u + (DWORD)q[2]*77u;
+            }
+            g[(size_t)y*w + x] = (BYTE)(sum/(DWORD)(256*s*s));
+         }
+      p.gray[l] = g;
+      p.gw[l] = w;
+      p.gh[l] = h;
+   }
+}
+
+//--------------------------------------------------------------------------------
+// Bilinear gray; false outside
+static bool inspectGrayAt(LPCBYTE g, int w, int h, float x, float y, float &v)
+{
+   if (x < 0.f || y < 0.f || x >= (float)(w - 1) || y >= (float)(h - 1))
+      return false;
+
+   int     ix = (int)x,
+           iy = (int)y;
+   float   fx = x - (float)ix,
+           fy = y - (float)iy;
+   LPCBYTE q = g + (size_t)iy*w + ix;
+
+   v = (float)q[0]*(1.f - fx)*(1.f - fy) + (float)q[1]*fx*(1.f - fy) + (float)q[w]*(1.f - fx)*fy + (float)q[w + 1]*fx*fy;
+   return true;
+}
+
+//--------------------------------------------------------------------------------
+// A frame's corners at 1/4 (x, y pairs); returns how many
+static int inspectPointCorners(const TPanoFrame &p, float *xy)
+{
+   LPCBYTE       g = p.gray[1]();
+   int           w = p.gw[1],
+                 h = p.gh[1],
+                 found = 0;
+   TAlloc<float> resp((size_t)w*h);
+   float         top = 0.f;
+
+   memset(resp(), 0, sizeof(float)*(size_t)w*h);
+   for (int y = 3; y + 3 < h; y++)
+      for (int x = 3; x + 3 < w; x++)
+      {
+         float a = 0.f,
+               b = 0.f,
+               c = 0.f;
+
+         for (int dy = -2; dy <= 2; dy++)
+            for (int dx = -2; dx <= 2; dx++)
+            {
+               LPCBYTE q = g + (size_t)(y + dy)*w + x + dx;
+               float   gx = (float)q[1] - (float)q[-1],
+                       gy = (float)q[w] - (float)q[-w];
+
+               a += gx*gx;
+               b += gx*gy;
+               c += gy*gy;
+            }
+
+         // the smaller eigenvalue of the structure tensor
+         float m = 0.5f*(a + c) - sqrtf(0.25f*(a - c)*(a - c) + b*b);
+
+         resp[(size_t)y*w + x] = m;
+         top = fmaxf(top, m);
+      }
+
+   // per bucket: the strongest local maxima (7 x 7)
+   const int perCell = cPointCorners/(cPointGridX*cPointGridY);
+
+   for (int cy = 0; cy < cPointGridY; cy++)
+      for (int cx = 0; cx < cPointGridX; cx++)
+      {
+         int x0 = cx*w/cPointGridX,
+             x1 = (cx + 1)*w/cPointGridX,
+             y0 = cy*h/cPointGridY,
+             y1 = (cy + 1)*h/cPointGridY;
+
+         for (int k = 0; k < perCell && found < cPointCorners; k++)
+         {
+            float best = cPointMinCornerShare*top;
+            int   bx = -1,
+                  by = -1;
+
+            for (int y = y0 > 8 ? y0 : 8; y < y1 && y + 8 < h; y++)
+               for (int x = x0 > 8 ? x0 : 8; x < x1 && x + 8 < w; x++)
+               {
+                  float r = resp[(size_t)y*w + x];
+
+                  if (r <= best)
+                     continue;
+
+                  bool peak = true;
+
+                  for (int dy = -3; dy <= 3 && peak; dy++)
+                     for (int dx = -3; dx <= 3 && peak; dx++)
+                        peak = resp[(size_t)(y + dy)*w + x + dx] <= r;
+                  if (peak)
+                  {
+                     best = r;
+                     bx = x;
+                     by = y;
+                  }
+               }
+            if (bx < 0)
+               break;
+            xy[2*found] = (float)bx;
+            xy[2*found + 1] = (float)by;
+            found++;
+            for (int dy = -6; dy <= 6; dy++) // taken: its neighborhood out of the next picks
+               for (int dx = -6; dx <= 6; dx++)
+                  if (by + dy >= 0 && by + dy < h && bx + dx >= 0 && bx + dx < w)
+                     resp[(size_t)(by + dy)*w + bx + dx] = 0.f;
+         }
+      }
+   return found;
+}
+
+//--------------------------------------------------------------------------------
+// A pixel of A (level l coords) carried to B's level l coords by the pure turn; false behind B
+static bool inspectPointMap(const TPanoFrame &a, const TPanoFrame &b, const float *rotB, int l, float x, float y,
+                            float &u, float &v)
+{
+   float s = 1.f/(float)cPointShrink[l],
+         fx = a.fx*s,
+         fy = a.fy*s,
+         cx = (a.cx + 0.5f)*s - 0.5f,
+         cy = (a.cy + 0.5f)*s - 0.5f,
+         rx = (x - cx)/fx,
+         ry = -(y - cy)/fy;
+   TVec3 d = { a.rot[0]*rx + a.rot[3]*ry - a.rot[6], a.rot[1]*rx + a.rot[4]*ry - a.rot[7], a.rot[2]*rx + a.rot[5]*ry - a.rot[8] },
+         rc = { rotB[0]*d.x + rotB[1]*d.y + rotB[2]*d.z, rotB[3]*d.x + rotB[4]*d.y + rotB[5]*d.z,
+                rotB[6]*d.x + rotB[7]*d.y + rotB[8]*d.z };
+
+   if (rc.z > -1e-3f)
+      return false;
+   u = cx + fx*rc.x/-rc.z;
+   v = cy - fy*rc.y/-rc.z;
+   return true;
+}
+
+enum {
+   cPointPatchMax = 128 // samples of a patch at most
+};
+
+// A's patch at one level and where each of its pixels falls in B (the turn's warp, offset-free)
+struct TPointPatch {
+   int   level,
+         n;
+   float va[cPointPatchMax],
+         ub[cPointPatchMax],
+         vb[cPointPatchMax],
+         mean,
+         dev;
+};
+
+//--------------------------------------------------------------------------------
+// Builds A's patch at (x, y), level l; false off A, behind B or flat
+static bool inspectPointPatch(const TPanoFrame &a, const TPanoFrame &b, const float *rotB, int l, float x, float y,
+                              int half, int stride, TPointPatch &p)
+{
+   float s = 0.f,
+         ss = 0.f;
+
+   p.level = l;
+   p.n = 0;
+   for (int j = -half; j <= half; j += stride)
+      for (int i = -half; i <= half; i += stride)
+      {
+         if (p.n >= cPointPatchMax)
+            return false;
+
+         float v;
+
+         if (!inspectGrayAt(a.gray[l](), a.gw[l], a.gh[l], x + (float)i, y + (float)j, v))
+            return false;
+         if (!inspectPointMap(a, b, rotB, l, x + (float)i, y + (float)j, p.ub[p.n], p.vb[p.n]))
+            return false;
+         p.va[p.n++] = v;
+         s += v;
+         ss += v*v;
+      }
+   p.mean = s/(float)p.n;
+   p.dev = ss/(float)p.n - p.mean*p.mean;
+   return p.dev >= 4.f; // flat: no texture to match
+}
+
+//--------------------------------------------------------------------------------
+// NCC of the patch against B offset by (du, dv) in B's level pixels; -2 when off B or flat there
+static float inspectPointNcc(const TPanoFrame &b, const TPointPatch &p, float du, float dv)
+{
+   LPCBYTE gb = b.gray[p.level]();
+   int     w = b.gw[p.level],
+           h = b.gh[p.level];
+   float   sb = 0.f,
+           sbb = 0.f,
+           sab = 0.f;
+
+   for (int k = 0; k < p.n; k++)
+   {
+      float v;
+
+      if (!inspectGrayAt(gb, w, h, p.ub[k] + du, p.vb[k] + dv, v))
+         return -2.f;
+      sb += v;
+      sbb += v*v;
+      sab += p.va[k]*v;
+   }
+
+   float mb = sb/(float)p.n,
+         vb = sbb/(float)p.n - mb*mb;
+
+   if (vb < 4.f)
+      return -2.f;
+   return (sab/(float)p.n - p.mean*mb)/sqrtf(p.dev*vb);
+}
+
+//--------------------------------------------------------------------------------
+// Unit bearing of a level-l pixel in the camera's own axes
+static TVec3 inspectPointBearing(const TPanoFrame &p, int l, float x, float y)
+{
+   float s = 1.f/(float)cPointShrink[l],
+         rx = (x - ((p.cx + 0.5f)*s - 0.5f))/(p.fx*s),
+         ry = -(y - ((p.cy + 0.5f)*s - 0.5f))/(p.fy*s),
+         n = sqrtf(rx*rx + ry*ry + 1.f);
+   TVec3 d = { rx/n, ry/n, -1.f/n };
+
+   return d;
+}
+
+//--------------------------------------------------------------------------------
+// Horn: the rotation M (row-major 3x3) minimizing sum w |a - M b|^2, by the quaternion of largest eigenvalue
+static void inspectHorn(const TVec3 *a, const TVec3 *b, LPCBYTE use, int n, float *M)
+{
+   float S[9] = {},
+         N[16],
+         q[4] = { 1.f, 0.f, 0.f, 0.f },
+         len = 0.f;
+
+   for (int k = 0; k < n; k++)
+      if (!use || use[k])
+      {
+         const float bv[3] = { b[k].x, b[k].y, b[k].z },
+                     av[3] = { a[k].x, a[k].y, a[k].z };
+
+         for (int r = 0; r < 3; r++)
+            for (int c = 0; c < 3; c++)
+               S[3*r + c] += bv[r]*av[c];
+      }
+   N[0] = S[0] + S[4] + S[8];
+   N[1] = N[4] = S[5] - S[7];
+   N[2] = N[8] = S[6] - S[2];
+   N[3] = N[12] = S[1] - S[3];
+   N[5] = S[0] - S[4] - S[8];
+   N[6] = N[9] = S[1] + S[3];
+   N[7] = N[13] = S[6] + S[2];
+   N[10] = -S[0] + S[4] - S[8];
+   N[11] = N[14] = S[5] + S[7];
+   N[15] = -S[0] - S[4] + S[8];
+
+   // cyclic Jacobi on the symmetric 4 x 4 (power iteration stalls when two eigenvalues lie close): V holds the vectors
+   float V[16] = { 1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f };
+
+   for (int sweep = 0; sweep < 12; sweep++)
+      for (int p = 0; p < 3; p++)
+         for (int r = p + 1; r < 4; r++)
+         {
+            float apr = N[4*p + r];
+
+            if (fabsf(apr) < 1e-12f)
+               continue;
+
+            float th = 0.5f*(N[4*r + r] - N[4*p + p])/apr,
+                  t = (th >= 0.f ? 1.f : -1.f)/(fabsf(th) + sqrtf(th*th + 1.f)),
+                  c = 1.f/sqrtf(t*t + 1.f),
+                  s = t*c;
+
+            for (int k = 0; k < 4; k++) // columns p, r
+            {
+               float kp = N[4*k + p],
+                     kr = N[4*k + r];
+
+               N[4*k + p] = c*kp - s*kr;
+               N[4*k + r] = s*kp + c*kr;
+            }
+            for (int k = 0; k < 4; k++) // rows p, r
+            {
+               float pk = N[4*p + k],
+                     rk = N[4*r + k];
+
+               N[4*p + k] = c*pk - s*rk;
+               N[4*r + k] = s*pk + c*rk;
+            }
+            for (int k = 0; k < 4; k++)
+            {
+               float kp = V[4*k + p],
+                     kr = V[4*k + r];
+
+               V[4*k + p] = c*kp - s*kr;
+               V[4*k + r] = s*kp + c*kr;
+            }
+         }
+
+   int top = 0;
+
+   for (int k = 1; k < 4; k++)
+      top = N[5*k] > N[5*top] ? k : top;
+   for (int k = 0; k < 4; k++)
+      q[k] = V[4*k + top];
+   len = sqrtf(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
+   for (int k = 0; k < 4; k++)
+      q[k] /= len > 0.f ? len : 1.f;
+
+   float w = q[0],
+         x = q[1],
+         y = q[2],
+         z = q[3];
+
+   M[0] = 1.f - 2.f*(y*y + z*z);
+   M[1] = 2.f*(x*y - w*z);
+   M[2] = 2.f*(x*z + w*y);
+   M[3] = 2.f*(x*y + w*z);
+   M[4] = 1.f - 2.f*(x*x + z*z);
+   M[5] = 2.f*(y*z - w*x);
+   M[6] = 2.f*(x*z - w*y);
+   M[7] = 2.f*(y*z + w*x);
+   M[8] = 1.f - 2.f*(x*x + y*y);
+}
+
+//--------------------------------------------------------------------------------
+// Angle between a and M b, degrees
+static float inspectPointMisDeg(const TVec3 &a, const float *M, const TVec3 &b)
+{
+   float x = M[0]*b.x + M[1]*b.y + M[2]*b.z,
+         y = M[3]*b.x + M[4]*b.y + M[5]*b.z,
+         z = M[6]*b.x + M[7]*b.y + M[8]*b.z,
+         c = fmaxf(-1.f, fminf(1.f, a.x*x + a.y*y + a.z*z));
+
+   return acosf(c)*57.2957795f;
+}
+
+static float inspectQuantile(float *v, int n, float q);
+
+/*--------------------------------------------------------------------------------
+   The two-view model (user, 2026-09-30: the ghosts are freedoms not orchestrated - the body sways, the
+   furniture stands off the walls). B's center lies along c (unit, A's axes) from A's; a match is right
+   when a, M b and c are coplanar: its error is the angle of a off the plane spanned by c and M b. The
+   turn M (3) and c (2, on the sphere) are solved by Gauss-Newton (numeric Jacobian, Cauchy weights at
+   the median), from the pure turn and from six starting baselines; the best is kept. A pure turn is the
+   limit c -> anything with every point far: the error then is the pure turn's own.
+  --------------------------------------------------------------------------------*/
+
+//--------------------------------------------------------------------------------
+// Signed angle of a off the epipolar plane of (c, M b), degrees; the pure turn's angle when c is zero
+static float inspectPointEpiDeg(const TVec3 &a, const float *M, const float *c, const TVec3 &b)
+{
+   float x = M[0]*b.x + M[1]*b.y + M[2]*b.z,
+         y = M[3]*b.x + M[4]*b.y + M[5]*b.z,
+         z = M[6]*b.x + M[7]*b.y + M[8]*b.z,
+         nx = c[1]*z - c[2]*y,
+         ny = c[2]*x - c[0]*z,
+         nz = c[0]*y - c[1]*x,
+         nl = sqrtf(nx*nx + ny*ny + nz*nz);
+
+   if (nl < 1e-6f)
+      return inspectPointMisDeg(a, M, b);
+
+   float s = (a.x*nx + a.y*ny + a.z*nz)/nl;
+
+   return asinf(fmaxf(-1.f, fminf(1.f, s)))*57.2957795f;
+}
+
+//--------------------------------------------------------------------------------
+// The model's errors (radians) for parameters p (turn increment 3, baseline tilt 2) about (M0, c0, u, v)
+static void inspectPointEpiModel(const float *p, const float *M0, const float *c0, const float *u, const float *v,
+                                 float *M, float *c)
+{
+   float e[9];
+
+   inspectPanoExp(p, e); // M = exp(p) M0 (row-major both)
+   for (int r = 0; r < 3; r++)
+      for (int k = 0; k < 3; k++)
+         M[3*r + k] = e[3*r]*M0[k] + e[3*r + 1]*M0[3 + k] + e[3*r + 2]*M0[6 + k];
+   for (int k = 0; k < 3; k++)
+      c[k] = c0[k] + p[3]*u[k] + p[4]*v[k];
+
+   float l = sqrtf(c[0]*c[0] + c[1]*c[1] + c[2]*c[2]);
+
+   for (int k = 0; k < 3; k++)
+      c[k] /= l;
+}
+
+//--------------------------------------------------------------------------------
+// Solves M and c on the points marked in use (M in and out); returns the median error of those, degrees
+static float inspectPointEpipolar(const TVec3 *a, const TVec3 *b, LPCBYTE use, int n, float *M, float *cBest)
+{
+   const float starts[6][3] = { { 1.f, 0.f, 0.f }, { -1.f, 0.f, 0.f }, { 0.f, 1.f, 0.f }, { 0.f, -1.f, 0.f },
+                                { 0.f, 0.f, 1.f }, { 0.f, 0.f, -1.f } };
+   TAlloc<float> err((size_t)n);
+   float         bestMed = 1e9f,
+                 bestM[9];
+
+   memcpy(bestM, M, sizeof(bestM));
+   for (int s = 0; s < 6; s++)
+   {
+      float M0[9],
+            c0[3] = { starts[s][0], starts[s][1], starts[s][2] };
+
+      memcpy(M0, M, sizeof(M0));
+      for (int it = 0; it < cPointEpiIters; it++)
+      {
+         // the sphere's tangent at c0: u off an axis c0 is not near, v = c0 x u
+         float ref[3] = { 0.f, 0.f, 0.f },
+               u[3],
+               v[3],
+               dot = 0.f,
+               ul = 0.f;
+
+         ref[fabsf(c0[0]) < 0.9f ? 0 : 1] = 1.f;
+         dot = ref[0]*c0[0] + ref[1]*c0[1] + ref[2]*c0[2];
+         for (int k = 0; k < 3; k++)
+            u[k] = ref[k] - dot*c0[k];
+         ul = sqrtf(u[0]*u[0] + u[1]*u[1] + u[2]*u[2]);
+         for (int k = 0; k < 3; k++)
+            u[k] /= ul;
+         v[0] = c0[1]*u[2] - c0[2]*u[1];
+         v[1] = c0[2]*u[0] - c0[0]*u[2];
+         v[2] = c0[0]*u[1] - c0[1]*u[0];
+
+         // residuals at p = 0 and their Cauchy scale
+         float p0[5] = { 0.f, 0.f, 0.f, 0.f, 0.f },
+               Mt[9],
+               ct[3];
+         int   used = 0;
+
+         inspectPointEpiModel(p0, M0, c0, u, v, Mt, ct);
+         for (int k = 0; k < n; k++)
+            if (use[k])
+               err[used++] = fabsf(inspectPointEpiDeg(a[k], Mt, ct, b[k]));
+
+         float scale = fmaxf(0.01f, 1.5f*inspectQuantile(err(), used, 0.5f)),
+               H[25] = {},
+               g[5] = {};
+
+         for (int k = 0; k < n; k++)
+         {
+            if (!use[k])
+               continue;
+
+            float r0 = inspectPointEpiDeg(a[k], Mt, ct, b[k]),
+                  wt = 1.f/(1.f + (r0/scale)*(r0/scale)),
+                  J[5];
+
+            for (int q = 0; q < 5; q++)
+            {
+               float pq[5] = { 0.f, 0.f, 0.f, 0.f, 0.f },
+                     Mq[9],
+                     cq[3];
+
+               pq[q] = 1e-4f;
+               inspectPointEpiModel(pq, M0, c0, u, v, Mq, cq);
+               J[q] = (inspectPointEpiDeg(a[k], Mq, cq, b[k]) - r0)/1e-4f;
+            }
+            for (int r = 0; r < 5; r++)
+            {
+               for (int q = 0; q < 5; q++)
+                  H[5*r + q] += wt*J[r]*J[q];
+               g[r] -= wt*J[r]*r0;
+            }
+         }
+         for (int r = 0; r < 5; r++)
+            H[6*r] += 1e-3f*H[6*r] + 1e-9f;
+         if (!inspectPanoSolve(H, g, 5))
+            break;
+         for (int r = 0; r < 5; r++)
+            g[r] = fmaxf(-0.2f, fminf(0.2f, g[r]));
+         inspectPointEpiModel(g, M0, c0, u, v, Mt, ct);
+         memcpy(M0, Mt, sizeof(M0));
+         memcpy(c0, ct, sizeof(c0));
+      }
+
+      int used = 0;
+
+      for (int k = 0; k < n; k++)
+         if (use[k])
+            err[used++] = fabsf(inspectPointEpiDeg(a[k], M0, c0, b[k]));
+
+      float med = inspectQuantile(err(), used, 0.5f);
+
+      if (med < bestMed)
+      {
+         bestMed = med;
+         memcpy(bestM, M0, sizeof(bestM));
+         memcpy(cBest, c0, sizeof(c0));
+      }
+   }
+   memcpy(M, bestM, sizeof(bestM));
+   return bestMed;
+}
+
+/*--------------------------------------------------------------------------------
+   B's turn w (degrees, its own axes) from a measured M that carries B's camera vectors into A's; the
+   current one is R_a^T R_b: R_a^T R_b E = M, so E = (R_a^T R_b)^T M = R_b^T R_a M; w = log E
+  --------------------------------------------------------------------------------*/
+static void inspectPairTurn(const TPanoFrame &a, const TPanoFrame &b, const float *M, float *wDeg)
+{
+   float C[9],
+         E[9];
+
+   for (int r = 0; r < 3; r++)
+      for (int c = 0; c < 3; c++)
+         C[3*r + c] = a.rot[3*r]*b.rot[3*c] + a.rot[3*r + 1]*b.rot[3*c + 1] + a.rot[3*r + 2]*b.rot[3*c + 2]; // (R_a^T R_b)(r,c)
+   for (int r = 0; r < 3; r++)
+      for (int c = 0; c < 3; c++)
+         E[3*r + c] = C[r]*M[c] + C[3 + r]*M[3 + c] + C[6 + r]*M[6 + c]; // (C^T M)(r,c)
+
+   float ang = acosf(fmaxf(-1.f, fminf(1.f, 0.5f*(E[0] + E[4] + E[8] - 1.f)))),
+         k = ang > 1e-6f ? ang/(2.f*sinf(ang)) : 0.5f;
+
+   wDeg[0] = k*(E[7] - E[5])*57.2957795f;
+   wDeg[1] = k*(E[2] - E[6])*57.2957795f;
+   wDeg[2] = k*(E[3] - E[1])*57.2957795f;
+}
+
+/*--------------------------------------------------------------------------------
+   One pair by its points: B's turn w (degrees, about B's own axes) that best carries A's corners onto
+   their matches; inliers and their RMS misfit (degrees) out; false when too few meet
+  --------------------------------------------------------------------------------*/
+static bool inspectPointPair(const TPanoFrame &a, const TPanoFrame &b, const float *cornersA, int corners, float *wDeg,
+                             int &inliers, float &misDeg, int &matched, float &rotMedDeg, float &epiMedDeg, float *baseDir,
+                             float *pureDeg, float *gyroMedDeg, TVec3 *outA = NULL, TVec3 *outB = NULL, int *outN = NULL,
+                             int outCap = 0)
+{
+   rotMedDeg = epiMedDeg = 0.f;
+   baseDir[0] = baseDir[1] = baseDir[2] = 0.f;
+   pureDeg[0] = pureDeg[1] = pureDeg[2] = 0.f;
+   gyroMedDeg[0] = gyroMedDeg[1] = 0.f;
+
+   TAlloc<TVec3> ba((size_t)corners),
+                 bb((size_t)corners);
+   TAlloc<BYTE>  use((size_t)corners),
+                 best((size_t)corners);
+   int           m = 0;
+
+   matched = 0;
+   inliers = 0;
+   misDeg = 0.f;
+
+   /* the pair's own offset first, at 1/16 (the gyroscope's error is shared by the whole picture): every other
+      corner votes its NCC at each offset of a wide window, two pixels a step, then one pixel around the best */
+   const int   sampleStep = corners > 60 ? corners/60 : 1;
+   float       pairU = 0.f,
+               pairV = 0.f,
+               pairTop = -1e9f;
+   TPointPatch patch;
+
+   for (int pass = 0; pass < 2; pass++)
+   {
+      int   win = pass == 0 ? cPointCoarseWin : 2,
+            step = pass == 0 ? 2 : 1;
+      float cu = pass == 0 ? 0.f : pairU,
+            cv = pass == 0 ? 0.f : pairV;
+
+      for (int j = -win; j <= win; j += step)
+         for (int i = -win; i <= win; i += step)
+         {
+            float sum = 0.f;
+
+            for (int k = 0; k < corners; k += sampleStep)
+            {
+               if (!inspectPointPatch(a, b, b.rot, 2, cornersA[2*k]*0.25f, cornersA[2*k + 1]*0.25f, 3, 1, patch))
+                  continue;
+
+               float c = inspectPointNcc(b, patch, cu + (float)i, cv + (float)j);
+
+               sum += c > 0.f ? c : 0.f;
+            }
+            if (sum > pairTop)
+            {
+               pairTop = sum;
+               pairU = cu + (float)i;
+               pairV = cv + (float)j;
+            }
+         }
+   }
+
+   // each corner: +-3 around the pair's offset at 1/16, then +-3 at 1/4, +-2 at 1/2, and a parabola
+   for (int k = 0; k < corners; k++)
+   {
+      float x4 = cornersA[2*k],
+            y4 = cornersA[2*k + 1],
+            du = pairU,
+            dv = pairV,
+            top = -2.f;
+      bool  ok = true;
+
+      for (int l = 2; l >= 0 && ok; l--)
+      {
+         float sc = l == 2 ? 0.25f : (l == 1 ? 1.f : 2.f),
+               c0 = -2.f,
+               bu = du,
+               bv = dv;
+         int   win = l == 0 ? 2 : 3;
+
+         if (!inspectPointPatch(a, b, b.rot, l, x4*sc, y4*sc, l == 2 ? 3 : cPointHalf*(l == 0 ? 2 : 1), l == 0 ? 2 : 1, patch))
+         {
+            ok = false;
+            break;
+         }
+         for (int j = -win; j <= win; j++)
+            for (int i = -win; i <= win; i++)
+            {
+               float c = inspectPointNcc(b, patch, du + (float)i, dv + (float)j);
+
+               if (c > c0)
+               {
+                  c0 = c;
+                  bu = du + (float)i;
+                  bv = dv + (float)j;
+               }
+            }
+         top = c0;
+         du = bu;
+         dv = bv;
+         if (l == 2 && top < 0.6f) // no clear match already at the coarse level
+            ok = false;
+         if (l > 0) // the offset into the next finer level
+         {
+            du *= l == 2 ? 4.f : 2.f;
+            dv *= l == 2 ? 4.f : 2.f;
+         }
+      }
+      if (!ok || top < cPointMinNcc)
+         continue;
+
+      // subpixel at 1/2: a parabola through the neighbors in each direction (the patch is the 1/2 one)
+      float cl = inspectPointNcc(b, patch, du - 1.f, dv),
+            cr = inspectPointNcc(b, patch, du + 1.f, dv),
+            cu = inspectPointNcc(b, patch, du, dv - 1.f),
+            cd = inspectPointNcc(b, patch, du, dv + 1.f),
+            den = cl - 2.f*top + cr,
+            x2 = x4*2.f,
+            y2 = y4*2.f,
+            u2,
+            v2;
+
+      if (cl > -2.f && cr > -2.f && den < -1e-6f)
+         du += fmaxf(-0.5f, fminf(0.5f, 0.5f*(cl - cr)/den));
+      den = cu - 2.f*top + cd;
+      if (cu > -2.f && cd > -2.f && den < -1e-6f)
+         dv += fmaxf(-0.5f, fminf(0.5f, 0.5f*(cu - cd)/den));
+      if (!inspectPointMap(a, b, b.rot, 0, x2, y2, u2, v2))
+         continue;
+      ba[m] = inspectPointBearing(a, 0, x2, y2);
+      bb[m] = inspectPointBearing(b, 0, u2 + du, v2 + dv);
+      m++;
+   }
+   matched = m;
+   if (m < 8)
+      return false;
+
+   // RANSAC on two points, then Horn on the inliers (bearings in each camera's own axes: a = M b)
+   float    M[9],
+            bestM[9];
+   int      bestCount = 0;
+   DWORD    seed = 12345u;
+
+   for (int t = 0; t < cPointRansac; t++)
+   {
+      seed = seed*1664525u + 1013904223u;
+
+      int p = (int)((seed >> 8)%(DWORD)m);
+
+      seed = seed*1664525u + 1013904223u;
+
+      int q = (int)((seed >> 8)%(DWORD)m);
+
+      if (p == q)
+         continue;
+      memset(use(), 0, (size_t)m);
+      use[p] = 1;
+      use[q] = 1;
+      inspectHorn(ba(), bb(), use(), m, M);
+
+      int count = 0;
+
+      for (int k = 0; k < m; k++)
+         count += inspectPointMisDeg(ba[k], M, bb[k]) <= cPointLooseDeg ? 1 : 0;
+      if (count > bestCount)
+      {
+         bestCount = count;
+         memcpy(bestM, M, sizeof(M));
+      }
+   }
+   if (bestCount < 8)
+      return false;
+   for (int pass = 0; pass < 2; pass++)
+   {
+      for (int k = 0; k < m; k++)
+         best[k] = inspectPointMisDeg(ba[k], bestM, bb[k]) <= cPointLooseDeg ? 1 : 0;
+      inspectHorn(ba(), bb(), best(), m, bestM);
+   }
+
+   // how well a pure turn explains the loose inliers (median), then the two-view model with the baseline
+   TAlloc<float> err((size_t)m);
+   int           loose = 0;
+
+   for (int k = 0; k < m; k++)
+      if (best[k])
+         err[loose++] = inspectPointMisDeg(ba[k], bestM, bb[k]);
+   rotMedDeg = inspectQuantile(err(), loose, 0.5f);
+   if (outN) // the matched bearings that fit a loose turn: the parallax still in, for the centers' fit
+   {
+      *outN = 0;
+      for (int k = 0; k < m && *outN < outCap; k++)
+         if (best[k])
+         {
+            outA[*outN] = ba[k];
+            outB[*outN] = bb[k];
+            (*outN)++;
+         }
+   }
+   inspectPairTurn(a, b, bestM, pureDeg); // the pure turn's own answer, before the baseline takes a share
+
+   /* the body's circle (user, 2026-09-30: the operator turns about the trunk, the arm a little out): the gyroscope's
+      turn as it is, each center ahead of the trunk's axis along its own flat forward - the baseline is the chord
+      between them (its length, the radius, does not change the epipolar planes). Its median misfit on the same
+      points, and the gyroscope's turn alone */
+   {
+      float Mg[9],
+            chord[3],
+            fa[3] = { -a.rot[6], 0.f, -a.rot[8] },
+            fb[3] = { -b.rot[6], 0.f, -b.rot[8] },
+            la = sqrtf(fa[0]*fa[0] + fa[2]*fa[2]),
+            lb = sqrtf(fb[0]*fb[0] + fb[2]*fb[2]),
+            w[3],
+            wl = 0.f;
+      int   used = 0;
+
+      for (int r = 0; r < 3; r++) // M = R_a^T R_b (row-major)
+         for (int c = 0; c < 3; c++)
+            Mg[3*r + c] = a.rot[3*r]*b.rot[3*c] + a.rot[3*r + 1]*b.rot[3*c + 1] + a.rot[3*r + 2]*b.rot[3*c + 2];
+      for (int k = 0; k < 3; k++)
+         w[k] = fb[k]/(lb > 1e-6f ? lb : 1.f) - fa[k]/(la > 1e-6f ? la : 1.f);
+      for (int k = 0; k < 3; k++) // into A's axes: R_a^T w
+         chord[k] = a.rot[3*k]*w[0] + a.rot[3*k + 1]*w[1] + a.rot[3*k + 2]*w[2];
+      wl = sqrtf(chord[0]*chord[0] + chord[1]*chord[1] + chord[2]*chord[2]);
+      for (int k = 0; k < 3; k++)
+         chord[k] /= wl > 1e-6f ? wl : 1.f;
+      for (int k = 0; k < m; k++)
+         if (best[k])
+            err[used++] = inspectPointMisDeg(ba[k], Mg, bb[k]);
+      gyroMedDeg[0] = inspectQuantile(err(), used, 0.5f);
+      used = 0;
+      for (int k = 0; k < m; k++)
+         if (best[k])
+            err[used++] = fabsf(inspectPointEpiDeg(ba[k], Mg, chord, bb[k]));
+      gyroMedDeg[1] = inspectQuantile(err(), used, 0.5f);
+   }
+   epiMedDeg = inspectPointEpipolar(ba(), bb(), best(), m, bestM, baseDir);
+   for (int k = 0; k < m; k++)
+   {
+      float d = fabsf(inspectPointEpiDeg(ba[k], bestM, baseDir, bb[k]));
+
+      if (d <= cPointInlierDeg)
+      {
+         misDeg += d*d;
+         inliers++;
+      }
+   }
+   misDeg = inliers ? sqrtf(misDeg/(float)inliers) : 0.f;
+
+   inspectPairTurn(a, b, bestM, wDeg);
+   return true;
+}
+
+//--------------------------------------------------------------------------------
+// Angle between two row-major rotations, degrees
+static float inspectRowAngleDeg(const float *a, const float *b)
+{
+   float tr = 0.f;
+
+   for (int k = 0; k < 9; k++)
+      tr += a[k]*b[k];
+   return acosf(fmaxf(-1.f, fminf(1.f, 0.5f*(tr - 1.f))))*57.2957795f;
+}
+
+//--------------------------------------------------------------------------------
+// out = C E(w) (row-major), w in degrees about the second frame's own axes
+static void inspectMatFromTurn(const float *C, const float *wDeg, float *out)
+{
+   float w[3] = { wDeg[0]*0.01745329f, wDeg[1]*0.01745329f, wDeg[2]*0.01745329f },
+         e[9];
+
+   inspectPanoExp(w, e);
+   for (int r = 0; r < 3; r++)
+      for (int c = 0; c < 3; c++)
+         out[3*r + c] = C[3*r]*e[c] + C[3*r + 1]*e[3 + c] + C[3*r + 2]*e[6 + c];
+}
+
+/*--------------------------------------------------------------------------------
+   A frame's vanishing triad in camera axes, row-major with the directions as columns: the measured
+   vertical (toward the world's up by the frame's rotation), a measured room axis made square to it,
+   their cross. pick NULL: axis A if measured, else B; else 0..3 = +A, -A, +B, -B (false when not measured)
+  --------------------------------------------------------------------------------*/
+static bool inspectVanishTriad(const TVanishResult &vr, const float *rot, const int *pick, float *T)
+{
+   int   which = pick ? *pick : ((vr.flags & vfAxisA) ? 0 : 2),
+         dir = which < 2 ? 1 : 2;
+   float sign = which%2 ? -1.f : 1.f;
+
+   if (!(vr.flags & (dir == 1 ? vfAxisA : vfAxisB)))
+      return false;
+
+   TVec3 v = vr.dirCam[0],
+         h = vr.dirCam[dir];
+   float up = v.x*rot[1] + v.y*rot[4] + v.z*rot[7], // the vertical against the world's up seen in camera axes
+         l = sqrtf(v.x*v.x + v.y*v.y + v.z*v.z);
+
+   if (l < 1e-6f)
+      return false;
+   v.x /= up < 0.f ? -l : l;
+   v.y /= up < 0.f ? -l : l;
+   v.z /= up < 0.f ? -l : l;
+
+   float d = h.x*v.x + h.y*v.y + h.z*v.z;
+
+   h.x = sign*(h.x - d*v.x);
+   h.y = sign*(h.y - d*v.y);
+   h.z = sign*(h.z - d*v.z);
+   l = sqrtf(h.x*h.x + h.y*h.y + h.z*h.z);
+   if (l < 1e-6f)
+      return false;
+   h.x /= l;
+   h.y /= l;
+   h.z /= l;
+
+   TVec3 c = { v.y*h.z - v.z*h.y, v.z*h.x - v.x*h.z, v.x*h.y - v.y*h.x };
+
+   T[0] = v.x;
+   T[3] = v.y;
+   T[6] = v.z;
+   T[1] = h.x;
+   T[4] = h.y;
+   T[7] = h.z;
+   T[2] = c.x;
+   T[5] = c.y;
+   T[8] = c.z;
+   return true;
+}
+
+//--------------------------------------------------------------------------------
+// A rotation turned about its own camera axes by w degrees: out = in E(w) (TMat4 layout 3x3)
+static void inspectTurnInCamera(const float *in, const float *wDeg, float *out)
+{
+   float w[3] = { wDeg[0]*0.01745329f, wDeg[1]*0.01745329f, wDeg[2]*0.01745329f },
+         e[9];
+
+   inspectPanoExp(w, e);
+   for (int c = 0; c < 3; c++)
+      for (int r = 0; r < 3; r++)
+         out[3*c + r] = in[r]*e[c] + in[3 + r]*e[3 + c] + in[6 + r]*e[6 + c];
+}
+
+//--------------------------------------------------------------------------------
+// A rotation turned by a small world turn w (left): out = exp(w) in (TMat4 layout 3x3)
+static void inspectTurnWorld(const float *in, const float *w, float *out)
+{
+   float e[9];
+
+   inspectPanoExp(w, e);
+   for (int c = 0; c < 3; c++)
+   {
+      out[3*c] = e[0]*in[3*c] + e[1]*in[3*c + 1] + e[2]*in[3*c + 2];
+      out[3*c + 1] = e[3]*in[3*c] + e[4]*in[3*c + 1] + e[5]*in[3*c + 2];
+      out[3*c + 2] = e[6]*in[3*c] + e[7]*in[3*c + 1] + e[8]*in[3*c + 2];
+   }
+}
+
+/*--------------------------------------------------------------------------------
+   The rotations by the lines (user, 2026-09-30: "the ceiling's and floor's horizontals and the
+   verticals of cabinets, doors and windows must always be the needle of your balance; no rectification
+   is valid if the ceiling/floor is not horizontal or they are not vertical"). Vanishing points lie at
+   infinity: the body's sway moves none of them, so they fix each frame's turn where the matched points
+   (parallax) cannot. Least squares on small world turns w_i of every center-spin frame:
+   - its measured vertical, carried to the world, onto the world's up (vector residual, J = [e]x);
+   - each measured room axis, laid flat, onto the room's axes (heading alpha + 90k, alpha the frames'
+     circular mean mod 90): a heading residual, J = (0, 1, 0); an axis beyond cVpAxisGateDeg is not the
+     room's (a diagonal tile floor, a piece of furniture) and stays out;
+   - the gyroscope between frames close in time (cVpLinkSec): their relative turn kept as it measured
+     it, w_b - w_a = R_b log((R_a^T R_b)^T G_ab);
+   each residual in degrees over its sigma, Huber on the lines; relinearized cVpRounds times.
+  --------------------------------------------------------------------------------*/
+static float inspectLineWeight(DWORD support);
+
+static const float cVpSigmaDeg = 1.f,      // a measured vertical or axis
+                   cVpLinkSigmaDeg = 0.7f, // the gyroscope between two frames seconds apart
+                   cVpHuber = 2.f,         // in sigmas
+                   cVpAxisGateDeg = 8.f,
+                   cVpLinkSec = 10.f;
+
+enum {
+   cVpRounds = 4
+};
+
+//--------------------------------------------------------------------------------
+// Adds one residual block r (m rows) with Jacobian rows J (m x 3 per unknown frame) to the normal equations
+static void inspectVpAdd(float *H, float *g, int n, const int *at, int blocks, const float *J, const float *r, int m, float w)
+{
+   for (int row = 0; row < m; row++)
+      for (int p = 0; p < blocks; p++)
+         for (int a = 0; a < 3; a++)
+         {
+            float jp = J[(row*blocks + p)*3 + a];
+
+            if (jp == 0.f)
+               continue;
+            g[at[p] + a] -= w*jp*r[row];
+            for (int q = 0; q < blocks; q++)
+               for (int b = 0; b < 3; b++)
+                  H[(size_t)(at[p] + a)*n + at[q] + b] += w*jp*J[(row*blocks + q)*3 + b];
+         }
+}
+
+//--------------------------------------------------------------------------------
+static void inspectPanoVanishSolve(DWORD room)
+{
+   if (!inspectFrameVr || inspectPanoCount < 2)
+      return;
+
+   const int n = inspectPanoCount*3;
+   float     sc = 0.f,
+             ss = 0.f;
+
+   // the room's axis: the circular mean of every frame's axis heading, mod 90 (x4 on the circle)
+   for (int i = 0; i < inspectPanoCount; i++)
+   {
+      const TVanishResult &vr = inspectFrameVr[inspectPano[i].index];
+
+      if ((vr.flags & (vfAxisA | vfAxisB)) && !isnan(vr.roomAxisDeg))
+      {
+         sc += cosf(4.f*vr.roomAxisDeg*0.01745329f);
+         ss += sinf(4.f*vr.roomAxisDeg*0.01745329f);
+      }
+   }
+
+   float alpha = atan2f(ss, sc)/4.f; // radians
+
+   inspectVpAlpha = alpha;
+
+   // capture order: the gyroscope links neighbors in time (the log is in processing order)
+   TAlloc<int> order((size_t)inspectPanoCount);
+
+   for (int i = 0; i < inspectPanoCount; i++)
+      order[i] = i;
+   for (int i = 1; i < inspectPanoCount; i++)
+   {
+      int x = order[i],
+          j = i - 1;
+
+      while (j >= 0 && inspectPano[order[j]].stamp > inspectPano[x].stamp)
+      {
+         order[j + 1] = order[j];
+         j--;
+      }
+      order[j + 1] = x;
+   }
+   for (int round = 0; round < cVpRounds; round++)
+   {
+      TAlloc<float> H((size_t)n*n),
+                    g((size_t)n);
+      float         vSq = 0.f,
+                    aSq = 0.f,
+                    lSq = 0.f,
+                    levelSq = 0.f;
+      int           vN = 0,
+                    aN = 0,
+                    lN = 0,
+                    gated = 0;
+      const float   s2 = 1.f/(cVpSigmaDeg*0.01745329f*cVpSigmaDeg*0.01745329f),
+                    l2 = 1.f/(cVpLinkSigmaDeg*0.01745329f*cVpLinkSigmaDeg*0.01745329f),
+                    knee = cVpHuber*cVpSigmaDeg*0.01745329f;
+
+      memset(H(), 0, sizeof(float)*(size_t)n*n);
+      memset(g(), 0, sizeof(float)*(size_t)n);
+      for (int i = 0; i < inspectPanoCount; i++)
+      {
+         const TPanoFrame    &p = inspectPano[i];
+         const TVanishResult &vr = inspectFrameVr[p.index];
+         int                  at[1] = { 3*i };
+
+         if (vr.flags & vfVertical)
+         {
+            TVec3 v = vr.dirCam[0];
+            TVec3 e = { p.rot[0]*v.x + p.rot[3]*v.y + p.rot[6]*v.z, p.rot[1]*v.x + p.rot[4]*v.y + p.rot[7]*v.z,
+                        p.rot[2]*v.x + p.rot[5]*v.y + p.rot[8]*v.z };
+            float l = sqrtf(e.x*e.x + e.y*e.y + e.z*e.z),
+                  sgn = e.y < 0.f ? -1.f : 1.f;
+
+            e.x *= sgn/l;
+            e.y *= sgn/l;
+            e.z *= sgn/l;
+
+            // r = up - e - w x e = (up - e) + [e]x w
+            float r[3] = { -e.x, 1.f - e.y, -e.z },
+                  J[9] = { 0.f, -e.z, e.y, e.z, 0.f, -e.x, -e.y, e.x, 0.f },
+                  mag = sqrtf(r[0]*r[0] + r[1]*r[1] + r[2]*r[2]),
+                  w = s2*(mag <= knee ? 1.f : knee/mag);
+
+            inspectVpAdd(H(), g(), n, at, 1, J, r, 3, w*inspectLineWeight(vr.support[0]));
+            vSq += mag*mag;
+            vN++;
+         }
+         for (int d = 1; d <= 2; d++)
+         {
+            if (!(vr.flags & (d == 1 ? vfAxisA : vfAxisB)))
+               continue;
+
+            TVec3 h = vr.dirCam[d];
+            float ex = p.rot[0]*h.x + p.rot[3]*h.y + p.rot[6]*h.z,
+                  ey = p.rot[1]*h.x + p.rot[4]*h.y + p.rot[7]*h.z,
+                  ez = p.rot[2]*h.x + p.rot[5]*h.y + p.rot[8]*h.z,
+                  hl = sqrtf(ex*ex + ey*ey + ez*ez),
+                  phi = atan2f(ex, -ez),
+                  off = phi - alpha;
+
+            // the nearest room axis (mod 90): a line of the room either way along it
+            off = off - 1.5707963f*floorf(off/1.5707963f + 0.5f);
+            if (fabsf(off)*57.2957795f > cVpAxisGateDeg)
+            {
+               gated++;
+               continue;
+            }
+
+            /* two rows (user, 2026-09-30: the canonical horizontals are an absolute compass, and a plumb check): its
+               heading onto the room's axis, J = (0, 1, 0); its level - a horizontal line has no height to climb - the
+               world y of the unit direction to 0, J = (e.z, 0, -e.x) */
+            float ux = ex/hl,
+                  uy = ey/hl,
+                  uz = ez/hl,
+                  r[2] = { -off, -uy },
+                  J[6] = { 0.f, 1.f, 0.f, uz, 0.f, -ux },
+                  mag = sqrtf(off*off + uy*uy),
+                  w = s2*(mag <= knee ? 1.f : knee/mag);
+
+            inspectVpAdd(H(), g(), n, at, 1, J, r, 2, w*inspectLineWeight(vr.support[d]));
+            aSq += off*off;
+            levelSq += uy*uy;
+            aN++;
+         }
+      }
+      for (int k = 0; k + 1 < inspectPanoCount; k++) // the gyroscope between neighbors in time
+      {
+         const TPanoFrame &a = inspectPano[order[k]],
+                          &b = inspectPano[order[k + 1]];
+
+         if ((float)(b.stamp - a.stamp)*1e-9f > cVpLinkSec)
+            continue;
+
+         // C = R_a^T R_b now, G = the gyroscope's; B's turn in its own axes w = log(C^T G), in the world R_b w
+         float C[9],
+               G[9],
+               E[9];
+
+         for (int r = 0; r < 3; r++)
+            for (int c = 0; c < 3; c++)
+            {
+               C[3*r + c] = a.rot[3*r]*b.rot[3*c] + a.rot[3*r + 1]*b.rot[3*c + 1] + a.rot[3*r + 2]*b.rot[3*c + 2];
+               G[3*r + c] = a.gyro[3*r]*b.gyro[3*c] + a.gyro[3*r + 1]*b.gyro[3*c + 1] + a.gyro[3*r + 2]*b.gyro[3*c + 2];
+            }
+         for (int r = 0; r < 3; r++)
+            for (int c = 0; c < 3; c++)
+               E[3*r + c] = C[r]*G[c] + C[3 + r]*G[3 + c] + C[6 + r]*G[6 + c];
+
+         float ang = acosf(fmaxf(-1.f, fminf(1.f, 0.5f*(E[0] + E[4] + E[8] - 1.f)))),
+               kk = ang > 1e-6f ? ang/(2.f*sinf(ang)) : 0.5f,
+               wb[3] = { kk*(E[7] - E[5]), kk*(E[2] - E[6]), kk*(E[3] - E[1]) },
+               ww[3] = { b.rot[0]*wb[0] + b.rot[3]*wb[1] + b.rot[6]*wb[2], b.rot[1]*wb[0] + b.rot[4]*wb[1] + b.rot[7]*wb[2],
+                         b.rot[2]*wb[0] + b.rot[5]*wb[1] + b.rot[8]*wb[2] },
+               // r = ww - (w_b - w_a): J_a = +I, J_b = -I
+               J[18] = { 1.f, 0.f, 0.f, -1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, -1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, -1.f };
+         int   at[2] = { 3*order[k], 3*order[k + 1] };
+
+         inspectVpAdd(H(), g(), n, at, 2, J, ww, 3, l2);
+         lSq += ww[0]*ww[0] + ww[1]*ww[1] + ww[2]*ww[2];
+         lN++;
+      }
+
+      float diag = 0.f;
+
+      for (int k = 0; k < n; k++)
+         diag += H[(size_t)k*n + k];
+      diag = diag/(float)n;
+      for (int k = 0; k < n; k++)
+         H[(size_t)k*n + k] += 1e-6f*diag + 1e-9f;
+      printf("  panorama room %lu: lines round %d: verticals %d RMS %.2f, room axes %d RMS %.2f (level %.2f; %d off the axes), gyroscope"
+             " links %d RMS %.2f degrees; room axis %.2f\n", (unsigned long)room, round + 1, vN,
+             vN ? sqrtf(vSq/(float)vN)*57.2957795f : 0.f, aN, aN ? sqrtf(aSq/(float)aN)*57.2957795f : 0.f,
+             aN ? sqrtf(levelSq/(float)aN)*57.2957795f : 0.f, gated, lN,
+             lN ? sqrtf(lSq/(float)lN)*57.2957795f : 0.f, alpha*57.2957795f);
+      if (!inspectPanoSolve(H(), g(), n))
+         break;
+      for (int i = 0; i < inspectPanoCount; i++)
+      {
+         TPanoFrame &a = inspectPano[i];
+         float       e[9],
+                     old[9];
+
+         inspectPanoExp(&g[3*i], e);
+         memcpy(old, a.rot, sizeof(old));
+         for (int c = 0; c < 3; c++)
+         {
+            a.rot[3*c] = e[0]*old[3*c] + e[1]*old[3*c + 1] + e[2]*old[3*c + 2];
+            a.rot[3*c + 1] = e[3]*old[3*c] + e[4]*old[3*c + 1] + e[5]*old[3*c + 2];
+            a.rot[3*c + 2] = e[6]*old[3*c] + e[7]*old[3*c + 1] + e[8]*old[3*c + 2];
+         }
+      }
+   }
+
+   /* the gyroscope's fluctuation (user, 2026-09-30: it sets the search window of the least squares): each frame's
+      correction by the lines, in the world (log of R R_gyro^T); its heading part split into a slow drift (a line over
+      the capture time) and what is left shot by shot, its tilt part as it is */
+   float st = 0.f,
+         sh = 0.f,
+         stt = 0.f,
+         sth = 0.f,
+         tiltSq = 0.f;
+   QWORD t0 = inspectPano[order[0]].stamp; // the first shot: times in seconds from it
+   TAlloc<float> hd((size_t)inspectPanoCount),
+                 tm((size_t)inspectPanoCount);
+
+   for (int i = 0; i < inspectPanoCount; i++)
+   {
+      const TPanoFrame &p = inspectPano[i];
+      float             D[9];
+
+      for (int r = 0; r < 3; r++) // R R_gyro^T, row-major
+         for (int c = 0; c < 3; c++)
+            D[3*r + c] = p.rot[r]*p.gyro[c] + p.rot[3 + r]*p.gyro[3 + c] + p.rot[6 + r]*p.gyro[6 + c];
+
+      float ang = acosf(fmaxf(-1.f, fminf(1.f, 0.5f*(D[0] + D[4] + D[8] - 1.f)))),
+            kk = ang > 1e-6f ? ang/(2.f*sinf(ang)) : 0.5f,
+            wx = kk*(D[7] - D[5])*57.2957795f,
+            wy = kk*(D[2] - D[6])*57.2957795f,
+            wz = kk*(D[3] - D[1])*57.2957795f;
+
+      hd[i] = wy;
+      tm[i] = (float)((p.stamp - t0)/1000000u)*1e-3f;
+      st += tm[i];
+      sh += hd[i];
+      stt += tm[i]*tm[i];
+      sth += tm[i]*hd[i];
+      tiltSq += wx*wx + wz*wz;
+   }
+
+   float nf = (float)inspectPanoCount,
+         slope = (nf*sth - st*sh)/fmaxf(1e-6f, nf*stt - st*st),
+         icpt = (sh - slope*st)/nf,
+         left = 0.f;
+
+   for (int i = 0; i < inspectPanoCount; i++)
+   {
+      float d = hd[i] - (icpt + slope*tm[i]);
+
+      left += d*d;
+   }
+   printf("  panorama room %lu: the gyroscope against the lines: heading drift %.2f degrees/min over %.0f s, shot by shot"
+          " %.2f degrees (sigma) beyond it; tilt %.2f degrees (RMS) - a search window of ~3 sigma\n", (unsigned long)room,
+          60.f*slope, tm[order[inspectPanoCount - 1]], sqrtf(left/nf), sqrtf(tiltSq/nf));
+}
+
+/*--------------------------------------------------------------------------------
+   The centers on the body's circle (user, 2026-09-30: the operator turns about the trunk with the
+   arm a little out; stage 2, the turns already held by the lines). Each center-spin frame's camera
+   sits r ahead of the trunk's axis along its own flat forward and y_b above the pivot for its band
+   (the wrist lifts the phone differently to the ceiling, the horizon and the floor): 4 unknowns for
+   the whole spin. The matched points of every neighbor pair are the observations: A's bearing from
+   A's center meets the room's box, that point seen from B's center must fall on B's bearing; the
+   misfit (radians) weighed by Huber (furniture off the box's planes). Gauss-Newton, numeric Jacobian.
+   The centers land in each frame's shift.
+  --------------------------------------------------------------------------------*/
+enum {
+   cCircleMaxObs = 262144,
+   cCircleIters = 12,
+   cCircleParams = 1 + inspectBodyBands // r, then y per band
+};
+
+static const float cCircleHuber = 0.005f; // radians (~0.3 degree)
+
+struct TCircleObs {
+   int   a,
+         b;
+   TVec3 da, // A's bearing, A's camera axes
+         db; // its match, B's camera axes
+};
+
+//--------------------------------------------------------------------------------
+// A frame's center under the circle's parameters (world)
+static TVec3 inspectCircleCenter(const TPanoFrame &p, const float *th)
+{
+   /* the sphere (user, 2026-09-30: the eyes turn about the skull, steady; the camera turns, rises and falls with the
+      scene sought - it draws a sphere): the camera r ahead of a steady center along its whole aim, tilt included;
+      --circle keeps the aim flat (the trunk's axis only) */
+   TVec3 f = inspectCircleFlat ? inspectHorizontalForward(p.rot) : TVec3{ -p.rot[6], -p.rot[7], -p.rot[8] },
+         c = { th[0]*f.x, th[0]*f.y + th[1 + inspectBodyBandOf(p)], th[0]*f.z };
+
+   return c;
+}
+
+//--------------------------------------------------------------------------------
+// One observation's misfit (3 components, ~radians); false when A's ray leaves the box or B looks away
+static bool inspectCircleResidual(const TCircleObs &o, const float *th, float *r)
+{
+   const TPanoFrame &a = inspectPano[o.a],
+                    &b = inspectPano[o.b];
+   TVec3             ca = inspectCircleCenter(a, th),
+                     cb = inspectCircleCenter(b, th),
+                     d = { a.rot[0]*o.da.x + a.rot[3]*o.da.y + a.rot[6]*o.da.z, a.rot[1]*o.da.x + a.rot[4]*o.da.y + a.rot[7]*o.da.z,
+                           a.rot[2]*o.da.x + a.rot[5]*o.da.y + a.rot[8]*o.da.z };
+   float             t = 0.f;
+   int               plane = -1;
+
+   if (!inspectBoxHit(ca, d, t, plane))
+      return false;
+
+   TVec3 q = { ca.x + t*d.x - cb.x, ca.y + t*d.y - cb.y, ca.z + t*d.z - cb.z },
+         qc = { b.rot[0]*q.x + b.rot[1]*q.y + b.rot[2]*q.z, b.rot[3]*q.x + b.rot[4]*q.y + b.rot[5]*q.z,
+                b.rot[6]*q.x + b.rot[7]*q.y + b.rot[8]*q.z };
+   float l = sqrtf(qc.x*qc.x + qc.y*qc.y + qc.z*qc.z);
+
+   if (l < 1e-6f || qc.z > 0.f)
+      return false;
+   r[0] = qc.x/l - o.db.x;
+   r[1] = qc.y/l - o.db.y;
+   r[2] = qc.z/l - o.db.z;
+   return true;
+}
+
+/*--------------------------------------------------------------------------------
+   The joint fit (user, 2026-09-30: the frames correcting one another - the lines, the gyroscope and
+   the points together, every freedom orchestrated). Unknowns per center-spin frame: its turn w_i (3)
+   and its center c_i (3, inside the small sphere the arm sweeps: the body circle's point plus a sway).
+   Residuals, each over its sigma:
+   - every matched point: B's ray off the epipolar plane of A's ray and the baseline (depth-free,
+     cJointEpiSigmaDeg - the points are that precise);
+   - the lines, as in inspectPanoVanishSolve (vertical onto up; room axes: heading mod 90 and level);
+   - the gyroscope between neighbors in time;
+   - each center's sway from its point on the circle (cJointSwayM; it also holds the free translation).
+   Gauss-Newton on the dense normal equations (6 per frame), numeric Jacobians for the points, Huber.
+  --------------------------------------------------------------------------------*/
+static const float cJointEpiSigmaDeg = 0.15f,
+                   cJointEpiHuberDeg = 0.2f,
+                   cJointSwayM = 0.03f,
+                   cJointMinBaseM = 0.01f; // a pair closer than this (a tilt of the wrist): no epipolar plane to trust
+
+enum {
+   cJointRounds = 6
+};
+
+//--------------------------------------------------------------------------------
+// A point's epipolar misfit (radians, signed) for frame rotations ra, rb and centers ca, cb; false without a baseline
+static bool inspectJointEpi(const TCircleObs &o, const float *ra, const float *rb, const TVec3 &ca, const TVec3 &cb, float &r)
+{
+   TVec3 da = { ra[0]*o.da.x + ra[3]*o.da.y + ra[6]*o.da.z, ra[1]*o.da.x + ra[4]*o.da.y + ra[7]*o.da.z,
+                ra[2]*o.da.x + ra[5]*o.da.y + ra[8]*o.da.z },
+         db = { rb[0]*o.db.x + rb[3]*o.db.y + rb[6]*o.db.z, rb[1]*o.db.x + rb[4]*o.db.y + rb[7]*o.db.z,
+                rb[2]*o.db.x + rb[5]*o.db.y + rb[8]*o.db.z },
+         B = { cb.x - ca.x, cb.y - ca.y, cb.z - ca.z },
+         n = { B.y*da.z - B.z*da.y, B.z*da.x - B.x*da.z, B.x*da.y - B.y*da.x };
+   float bl = sqrtf(B.x*B.x + B.y*B.y + B.z*B.z),
+         nl = sqrtf(n.x*n.x + n.y*n.y + n.z*n.z);
+
+   if (bl < cJointMinBaseM || nl < 1e-9f)
+      return false;
+   r = asinf(fmaxf(-1.f, fminf(1.f, (db.x*n.x + db.y*n.y + db.z*n.z)/nl)));
+   return true;
+}
+
+//--------------------------------------------------------------------------------
+// A line direction's weight by its support (user, 2026-09-30: the lines are the needle): sigma ~ sqrt(1000/support)
+static float inspectLineWeight(DWORD support)
+{
+   float s = sqrtf(1000.f/(float)(support > 1u ? support : 1u));
+
+   s = fmaxf(0.3f, fminf(2.f, s));
+   return 1.f/(s*s);
+}
+
+//--------------------------------------------------------------------------------
+// Each frame's line misfit after the fit: its vertical off the world's up, its room axis off level (degrees)
+static void inspectLineReport(DWORD room)
+{
+   int   over = 0;
+   float worst = 0.f;
+
+   for (int i = 0; i < inspectPanoCount && inspectFrameVr; i++)
+   {
+      const TPanoFrame    &p = inspectPano[i];
+      const TVanishResult &vr = inspectFrameVr[p.index];
+
+      if (!(vr.flags & vfVertical))
+         continue;
+
+      TVec3 v = vr.dirCam[0];
+      float ey = p.rot[1]*v.x + p.rot[4]*v.y + p.rot[7]*v.z,
+            l = sqrtf(v.x*v.x + v.y*v.y + v.z*v.z),
+            off = acosf(fminf(1.f, fabsf(ey)/l))*57.2957795f;
+
+      worst = fmaxf(worst, off);
+      if (off > 1.f || p.index == inspectPairA)
+      {
+         printf("  faces room %lu: frame %d: its vertical (%lu edges) %.2f degrees off the world's up after the fit\n",
+                (unsigned long)room, p.index, (unsigned long)vr.support[0], off);
+         over += off > 1.f ? 1 : 0;
+      }
+   }
+   printf("  faces room %lu: verticals after the fit: %d beyond 1 degree, worst %.2f\n", (unsigned long)room, over, worst);
+
+   // the room axes: each measured horizontal's heading after the fit against the set's circular mean (mod 90)
+   float sc = 0.f,
+         ss = 0.f;
+
+   for (int pass = 0; pass < 2; pass++)
+   {
+      float mean = atan2f(ss, sc)/4.f;
+      int   axisOver = 0;
+
+      for (int i = 0; i < inspectPanoCount && inspectFrameVr; i++)
+      {
+         const TPanoFrame    &p = inspectPano[i];
+         const TVanishResult &vr = inspectFrameVr[p.index];
+
+         for (int d = 1; d <= 2; d++)
+         {
+            if (!(vr.flags & (d == 1 ? vfAxisA : vfAxisB)))
+               continue;
+
+            TVec3 h = vr.dirCam[d];
+            float ex = p.rot[0]*h.x + p.rot[3]*h.y + p.rot[6]*h.z,
+                  ez = p.rot[2]*h.x + p.rot[5]*h.y + p.rot[8]*h.z,
+                  phi = atan2f(ex, -ez);
+
+            if (pass == 0)
+            {
+               sc += cosf(4.f*phi);
+               ss += sinf(4.f*phi);
+               continue;
+            }
+
+            float off = phi - mean;
+
+            off = (off - 1.5707963f*floorf(off/1.5707963f + 0.5f))*57.2957795f;
+            if (p.index == inspectPairA || fabsf(off) > 3.f)
+            {
+               printf("  faces room %lu: frame %d: its room axis %c (%lu edges) %+.2f degrees off the room's after the fit\n",
+                      (unsigned long)room, p.index, d == 1 ? 'A' : 'B', (unsigned long)vr.support[d], off);
+               axisOver += fabsf(off) > 3.f ? 1 : 0;
+            }
+         }
+      }
+      if (pass == 1)
+         printf("  faces room %lu: room axes after the fit: %d beyond 3 degrees\n", (unsigned long)room, axisOver);
+   }
+}
+
+//--------------------------------------------------------------------------------
+static void inspectPanoJoint(DWORD room, const TCircleObs *obs, int count, const float *th)
+{
+   const int     n = inspectPanoCount*6;
+   const float   eps = 1e-4f,
+                 epi2 = 1.f/(cJointEpiSigmaDeg*0.01745329f*cJointEpiSigmaDeg*0.01745329f),
+                 epiKnee = cJointEpiHuberDeg*0.01745329f,
+                 sway2 = 1.f/(cJointSwayM*cJointSwayM);
+   TAlloc<float> H((size_t)n*n),
+                 g((size_t)n),
+                 mags((size_t)count + 1u);
+
+   for (int round = 0; round < cJointRounds; round++)
+   {
+      int used = 0;
+
+      memset(H(), 0, sizeof(float)*(size_t)n*n);
+      memset(g(), 0, sizeof(float)*(size_t)n);
+
+      // the points: 12 unknowns each (A's and B's turn and center)
+      for (int k = 0; k < count; k++)
+      {
+         const TCircleObs &o = obs[k];
+         const TPanoFrame &a = inspectPano[o.a],
+                          &b = inspectPano[o.b];
+         TVec3             ca = { a.shift[0], a.shift[1], a.shift[2] },
+                           cb = { b.shift[0], b.shift[1], b.shift[2] };
+         float             r0 = 0.f,
+                           J[12];
+         int               at[12];
+         bool              ok = inspectJointEpi(o, a.rot, b.rot, ca, cb, r0);
+
+         for (int q = 0; q < 12 && ok; q++)
+         {
+            float w[3] = { 0.f, 0.f, 0.f },
+                  ra[9],
+                  rb[9],
+                  rq = 0.f;
+            TVec3 cq = q < 6 ? ca : cb;
+
+            memcpy(ra, a.rot, sizeof(ra));
+            memcpy(rb, b.rot, sizeof(rb));
+            if (q%6 < 3)
+            {
+               w[q%3] = eps;
+               inspectTurnWorld(q < 6 ? a.rot : b.rot, w, q < 6 ? ra : rb);
+            }
+            else
+            {
+               float *c = &cq.x;
+
+               c[q%3] += eps;
+            }
+            ok = inspectJointEpi(o, ra, rb, q < 6 ? cq : ca, q < 6 ? cb : cq, rq);
+            J[q] = (rq - r0)/eps;
+            at[q] = 6*(q < 6 ? o.a : o.b) + (q%6 < 3 ? q%3 : 3 + q%3);
+         }
+         if (!ok)
+            continue;
+
+         float mag = fabsf(r0),
+               wt = epi2*(mag <= epiKnee ? 1.f : epiKnee/mag);
+
+         mags[used++] = mag;
+         for (int p = 0; p < 12; p++)
+         {
+            g[at[p]] -= wt*J[p]*r0;
+            for (int q = 0; q < 12; q++)
+               H[(size_t)at[p]*n + at[q]] += wt*J[p]*J[q];
+         }
+      }
+
+      // the lines and the gyroscope: the rotation part (every sixth block's first three)
+      const float s2 = 1.f/(cVpSigmaDeg*0.01745329f*cVpSigmaDeg*0.01745329f),
+                  l2 = 1.f/(cVpLinkSigmaDeg*0.01745329f*cVpLinkSigmaDeg*0.01745329f),
+                  knee = cVpHuber*cVpSigmaDeg*0.01745329f;
+      float       sc = 0.f,
+                  ss = 0.f;
+
+      for (int i = 0; i < inspectPanoCount; i++)
+      {
+         const TVanishResult &vr = inspectFrameVr[inspectPano[i].index];
+
+         if ((vr.flags & (vfAxisA | vfAxisB)) && !isnan(vr.roomAxisDeg))
+         {
+            sc += cosf(4.f*vr.roomAxisDeg*0.01745329f);
+            ss += sinf(4.f*vr.roomAxisDeg*0.01745329f);
+         }
+      }
+
+      float alpha = atan2f(ss, sc)/4.f;
+
+      for (int i = 0; i < inspectPanoCount && inspectFrameVr; i++)
+      {
+         const TPanoFrame    &p = inspectPano[i];
+         const TVanishResult &vr = inspectFrameVr[p.index];
+         int                  at[1] = { 6*i };
+
+         if (vr.flags & vfVertical)
+         {
+            TVec3 v = vr.dirCam[0],
+                  e = { p.rot[0]*v.x + p.rot[3]*v.y + p.rot[6]*v.z, p.rot[1]*v.x + p.rot[4]*v.y + p.rot[7]*v.z,
+                        p.rot[2]*v.x + p.rot[5]*v.y + p.rot[8]*v.z };
+            float l = sqrtf(e.x*e.x + e.y*e.y + e.z*e.z),
+                  sgn = e.y < 0.f ? -1.f : 1.f;
+
+            e.x *= sgn/l;
+            e.y *= sgn/l;
+            e.z *= sgn/l;
+
+            float r[3] = { -e.x, 1.f - e.y, -e.z },
+                  J[9] = { 0.f, -e.z, e.y, e.z, 0.f, -e.x, -e.y, e.x, 0.f },
+                  mag = sqrtf(r[0]*r[0] + r[1]*r[1] + r[2]*r[2]);
+
+            inspectVpAdd(H(), g(), n, at, 1, J, r, 3, s2*inspectLineWeight(vr.support[0])*(mag <= knee ? 1.f : knee/mag));
+         }
+         for (int d = 1; d <= 2; d++)
+         {
+            if (!(vr.flags & (d == 1 ? vfAxisA : vfAxisB)))
+               continue;
+
+            TVec3 h = vr.dirCam[d];
+            float ex = p.rot[0]*h.x + p.rot[3]*h.y + p.rot[6]*h.z,
+                  ey = p.rot[1]*h.x + p.rot[4]*h.y + p.rot[7]*h.z,
+                  ez = p.rot[2]*h.x + p.rot[5]*h.y + p.rot[8]*h.z,
+                  hl = sqrtf(ex*ex + ey*ey + ez*ez),
+                  off = atan2f(ex, -ez) - alpha;
+
+            off = off - 1.5707963f*floorf(off/1.5707963f + 0.5f);
+            if (fabsf(off)*57.2957795f > cVpAxisGateDeg)
+               continue;
+
+            float r[2] = { -off, -ey/hl },
+                  J[6] = { 0.f, 1.f, 0.f, ez/hl, 0.f, -ex/hl },
+                  mag = sqrtf(r[0]*r[0] + r[1]*r[1]);
+
+            inspectVpAdd(H(), g(), n, at, 1, J, r, 2, s2*inspectLineWeight(vr.support[d])*(mag <= knee ? 1.f : knee/mag));
+         }
+
+         // the sway: the center off its point on the circle, J = I on the center block
+         TVec3 circ = inspectCircleCenter(p, th);
+         float r[3] = { circ.x - p.shift[0], circ.y - p.shift[1], circ.z - p.shift[2] },
+               J[9] = { 1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f };
+         int   atc[1] = { 6*i + 3 };
+
+         for (int k = 0; k < 3; k++)
+            r[k] = -r[k]; // r(dc) = (c + dc) - circ
+         inspectVpAdd(H(), g(), n, atc, 1, J, r, 3, sway2);
+      }
+      for (int i = 0; i < inspectPanoCount; i++) // the gyroscope: consecutive in time
+         for (int j = 0; j < inspectPanoCount; j++)
+         {
+            const TPanoFrame &a = inspectPano[i],
+                             &b = inspectPano[j];
+
+            if (b.stamp <= a.stamp || (float)(b.stamp - a.stamp)*1e-9f > cVpLinkSec)
+               continue;
+
+            bool next = true; // b is a's successor: no frame in between
+
+            for (int k = 0; k < inspectPanoCount && next; k++)
+               next = !(inspectPano[k].stamp > a.stamp && inspectPano[k].stamp < b.stamp);
+            if (!next)
+               continue;
+
+            float C[9],
+                  G[9],
+                  E[9];
+
+            for (int r = 0; r < 3; r++)
+               for (int c = 0; c < 3; c++)
+               {
+                  C[3*r + c] = a.rot[3*r]*b.rot[3*c] + a.rot[3*r + 1]*b.rot[3*c + 1] + a.rot[3*r + 2]*b.rot[3*c + 2];
+                  G[3*r + c] = a.gyro[3*r]*b.gyro[3*c] + a.gyro[3*r + 1]*b.gyro[3*c + 1] + a.gyro[3*r + 2]*b.gyro[3*c + 2];
+               }
+            for (int r = 0; r < 3; r++)
+               for (int c = 0; c < 3; c++)
+                  E[3*r + c] = C[r]*G[c] + C[3 + r]*G[3 + c] + C[6 + r]*G[6 + c];
+
+            float ang = acosf(fmaxf(-1.f, fminf(1.f, 0.5f*(E[0] + E[4] + E[8] - 1.f)))),
+                  kk = ang > 1e-6f ? ang/(2.f*sinf(ang)) : 0.5f,
+                  wb[3] = { kk*(E[7] - E[5]), kk*(E[2] - E[6]), kk*(E[3] - E[1]) },
+                  ww[3] = { b.rot[0]*wb[0] + b.rot[3]*wb[1] + b.rot[6]*wb[2], b.rot[1]*wb[0] + b.rot[4]*wb[1] + b.rot[7]*wb[2],
+                            b.rot[2]*wb[0] + b.rot[5]*wb[1] + b.rot[8]*wb[2] },
+                  J[18] = { 1.f, 0.f, 0.f, -1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, -1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, -1.f };
+            int   at[2] = { 6*i, 6*j };
+
+            inspectVpAdd(H(), g(), n, at, 2, J, ww, 3, l2);
+         }
+
+      float med = inspectQuantile(mags(), used, 0.5f)*57.2957795f,
+            diag = 0.f;
+
+      for (int k = 0; k < n; k++)
+         diag += H[(size_t)k*n + k];
+      diag /= (float)n;
+      for (int k = 0; k < n; k++)
+         H[(size_t)k*n + k] += 1e-6f*diag + 1e-9f;
+      printf("  faces room %lu: joint round %d: %d points, epipolar misfit median %.3f degrees\n", (unsigned long)room,
+             round + 1, used, med);
+      if (!inspectPanoSolve(H(), g(), n))
+         break;
+
+      float turn = 0.f,
+            move = 0.f;
+
+      for (int i = 0; i < inspectPanoCount; i++)
+      {
+         TPanoFrame &p = inspectPano[i];
+         float       rot[9],
+                     w[3] = { fmaxf(-0.05f, fminf(0.05f, g[6*i])), fmaxf(-0.05f, fminf(0.05f, g[6*i + 1])),
+                              fmaxf(-0.05f, fminf(0.05f, g[6*i + 2])) };
+
+         inspectTurnWorld(p.rot, w, rot);
+         memcpy(p.rot, rot, sizeof(rot));
+         for (int k = 0; k < 3; k++)
+            p.shift[k] += fmaxf(-0.05f, fminf(0.05f, g[6*i + 3 + k])); // at most 5 cm a round
+         turn += sqrtf(w[0]*w[0] + w[1]*w[1] + w[2]*w[2])*57.2957795f;
+         move += sqrtf(g[6*i + 3]*g[6*i + 3] + g[6*i + 4]*g[6*i + 4] + g[6*i + 5]*g[6*i + 5]);
+      }
+      printf("  faces room %lu: joint round %d: frames turned %.3f degrees, moved %.3f m on average\n", (unsigned long)room,
+             round + 1, turn/(float)inspectPanoCount, move/(float)inspectPanoCount);
+   }
+
+   float swaySum = 0.f;
+
+   for (int i = 0; i < inspectPanoCount; i++)
+   {
+      TVec3 circ = inspectCircleCenter(inspectPano[i], th);
+      float dx = inspectPano[i].shift[0] - circ.x,
+            dy = inspectPano[i].shift[1] - circ.y,
+            dz = inspectPano[i].shift[2] - circ.z;
+
+      swaySum += sqrtf(dx*dx + dy*dy + dz*dz);
+   }
+   printf("  faces room %lu: joint: the centers sway %.3f m from the body circle on average\n", (unsigned long)room,
+          swaySum/(float)inspectPanoCount);
+   for (int i = 0; i < inspectPanoCount; i++)
+      if (inspectPanoHas[inspectPano[i].index])
+         memcpy(inspectPanoRot[inspectPano[i].index], inspectPano[i].rot, sizeof(inspectPano[i].rot));
+   inspectLineReport(room);
+}
+
+//--------------------------------------------------------------------------------
+static void inspectPanoCircleSolve(DWORD room)
+{
+   TAlloc<float>      cornerXY((size_t)inspectPanoCount*cPointCorners*2u);
+   TAlloc<int>        cornerN((size_t)inspectPanoCount);
+   TAlloc<TCircleObs> obs((size_t)cCircleMaxObs);
+   TAlloc<TVec3>      ba((size_t)cPointCorners),
+                      bb((size_t)cPointCorners);
+   int                count = 0,
+                      pairs = 0;
+
+   for (int i = 0; i < inspectPanoCount; i++)
+      cornerN[i] = inspectPointCorners(inspectPano[i], &cornerXY[(size_t)i*cPointCorners*2u]);
+   for (int i = 0; i < inspectPanoCount; i++)
+      for (int j = i + 1; j < inspectPanoCount && count < cCircleMaxObs; j++)
+      {
+         const TPanoFrame &a = inspectPano[i],
+                          &b = inspectPano[j];
+
+         if (a.rot[6]*b.rot[6] + a.rot[7]*b.rot[7] + a.rot[8]*b.rot[8] < cPairCos)
+            continue;
+
+         float w[3],
+               mis,
+               rotMed,
+               epiMed,
+               base[3],
+               pure[3],
+               gyroMed[2];
+         int   fit = 0,
+               matched = 0,
+               got = 0;
+
+         if (!inspectPointPair(a, b, &cornerXY[(size_t)i*cPointCorners*2u], cornerN[i], w, fit, mis, matched, rotMed, epiMed,
+                               base, pure, gyroMed, ba(), bb(), &got, cPointCorners))
+            continue;
+         for (int k = 0; k < got && count < cCircleMaxObs; k++)
+         {
+            obs[count].a = i;
+            obs[count].b = j;
+            obs[count].da = ba[k];
+            obs[count].db = bb[k];
+            count++;
+         }
+         pairs++;
+      }
+
+   float th[cCircleParams] = {},
+         first = 0.f,
+         last = 0.f;
+
+   for (int it = 0; it < cCircleIters; it++)
+   {
+      float H[cCircleParams*cCircleParams] = {},
+            g[cCircleParams] = {};
+      TAlloc<float> mags((size_t)count);
+      int           used = 0;
+
+      for (int k = 0; k < count; k++)
+      {
+         float r0[3],
+               J[3*cCircleParams];
+
+         if (!inspectCircleResidual(obs[k], th, r0))
+            continue;
+
+         bool ok = true;
+
+         for (int q = 0; q < cCircleParams && ok; q++)
+         {
+            float tq[cCircleParams],
+                  rq[3];
+
+            memcpy(tq, th, sizeof(tq));
+            tq[q] += 1e-3f;
+            ok = inspectCircleResidual(obs[k], tq, rq);
+            for (int c = 0; c < 3 && ok; c++)
+               J[c*cCircleParams + q] = (rq[c] - r0[c])/1e-3f;
+         }
+         if (!ok)
+            continue;
+
+         float mag = sqrtf(r0[0]*r0[0] + r0[1]*r0[1] + r0[2]*r0[2]),
+               wt = mag <= cCircleHuber ? 1.f : cCircleHuber/mag;
+
+         mags[used++] = mag;
+         for (int c = 0; c < 3; c++)
+            for (int p = 0; p < cCircleParams; p++)
+            {
+               g[p] -= wt*J[c*cCircleParams + p]*r0[c];
+               for (int q = 0; q < cCircleParams; q++)
+                  H[p*cCircleParams + q] += wt*J[c*cCircleParams + p]*J[c*cCircleParams + q];
+            }
+      }
+
+      float med = inspectQuantile(mags(), used, 0.5f)*57.2957795f;
+
+      if (it == 0)
+         first = med;
+      last = med;
+      for (int p = 0; p < cCircleParams; p++)
+      {
+         H[p*cCircleParams + p] += 1e-6f*H[p*cCircleParams + p] + 1e-9f;
+         if (p > 0 && !inspectCircleHeights) // the band heights held at the pivot: free, they traded with the box's height
+         {
+            for (int q = 0; q < cCircleParams; q++)
+               H[p*cCircleParams + q] = H[q*cCircleParams + p] = 0.f;
+            H[p*cCircleParams + p] = 1.f;
+            g[p] = 0.f;
+         }
+      }
+      if (!used || !inspectPanoSolve(H, g, cCircleParams))
+         break;
+      for (int p = 0; p < cCircleParams; p++)
+         th[p] += fmaxf(-0.1f, fminf(0.1f, g[p])); // at most 10 cm a step
+   }
+   printf("  faces room %lu: body circle from %d points of %d pairs: median misfit %.3f -> %.3f degrees; the phone %.3f m"
+          " ahead of the trunk's axis, %.3f / %.3f / %.3f m above the pivot (floor / horizon / ceiling band)\n",
+          (unsigned long)room, count, pairs, first, last, th[0], th[1], th[2], th[3]);
+   for (int i = 0; i < inspectPanoCount; i++)
+   {
+      TVec3 c = inspectCircleCenter(inspectPano[i], th);
+
+      inspectPano[i].shift[0] = c.x;
+      inspectPano[i].shift[1] = c.y;
+      inspectPano[i].shift[2] = c.z;
+   }
+   inspectPanoJoint(room, obs(), count, th);
+}
+
+/*--------------------------------------------------------------------------------
+   The wide basin (user, 2026-09-30: coarse first, the fit gradually refined down to 1x). The photometric
+   Gauss-Newton sees only what lies within a pixel or two of its level, and the gyroscope misses by
+   degrees (19 -> 20: 2.7). Each pair of neighbors (forwards within cPairCos) is searched by brute force,
+   coarse to fine (1/64 +-6 by 1 degree, 1/32 +-1 by 0.25, 1/16 +-0.25 by 0.0625): its relative turn w,
+   about B's own axes. All pairs then pull the frames together by least squares on small world turns:
+   w_b - w_a = R_b w (the turn B asks for, in the world), each pair weighed by its pixels and by Huber
+   on its misfit, a weak pull toward the gyroscope holding the set. Measured and solved cPairRounds times.
+  --------------------------------------------------------------------------------*/
+static void inspectPanoPairs(DWORD room)
+{
+   const int     n = inspectPanoCount*3;
+   TAlloc<float> cornerXY((size_t)inspectPanoCount*cPointCorners*2u);
+   TAlloc<int>   cornerN((size_t)inspectPanoCount);
+   int           cornerSum = 0;
+
+   for (int i = 0; i < inspectPanoCount; i++) // corners depend on the picture only: found once
+   {
+      cornerN[i] = inspectPointCorners(inspectPano[i], &cornerXY[(size_t)i*cPointCorners*2u]);
+      cornerSum += cornerN[i];
+   }
+   printf("  panorama room %lu: %d corners per frame on average\n", (unsigned long)room,
+          inspectPanoCount ? cornerSum/inspectPanoCount : 0);
+
+   for (int round = 0; round < cPairRounds; round++)
+   {
+      TAlloc<float> H((size_t)n*n),
+                    g((size_t)n),
+                    pw((size_t)inspectPanoCount*inspectPanoCount*4u); // per pair: world turn asked for, weight
+      int           pairs = 0,
+                    tried = 0,
+                    matchSum = 0,
+                    medPairs = 0,
+                    inlierSum = 0;
+      float         sumTurn = 0.f,
+                    misSum = 0.f,
+                    rotMedSum = 0.f,
+                    epiMedSum = 0.f;
+
+      memset(pw(), 0, sizeof(float)*(size_t)inspectPanoCount*inspectPanoCount*4u);
+      for (int i = 0; i < inspectPanoCount; i++)
+         for (int j = i + 1; j < inspectPanoCount; j++)
+         {
+            const TPanoFrame &a = inspectPano[i],
+                             &b = inspectPano[j];
+
+            if (a.rot[6]*b.rot[6] + a.rot[7]*b.rot[7] + a.rot[8]*b.rot[8] < cPairCos)
+               continue;
+
+            float total[3] = { 0.f, 0.f, 0.f },
+                  mis = 0.f;
+            int   count = 0,
+                  matched = 0;
+
+            float rotMed = 0.f,
+                  epiMed = 0.f,
+                  base[3],
+                  pure[3],
+                  gyroMed[2];
+            bool  met = inspectPointPair(a, b, &cornerXY[(size_t)i*cPointCorners*2u], cornerN[i], total, count, mis, matched,
+                                         rotMed, epiMed, base, pure, gyroMed);
+
+            tried++;
+            matchSum += matched;
+            if (met && round == 0 && inspectPairDebug)
+            {
+               TVec3 bw = { a.rot[0]*base[0] + a.rot[3]*base[1] + a.rot[6]*base[2],
+                            a.rot[1]*base[0] + a.rot[4]*base[1] + a.rot[7]*base[2],
+                            a.rot[2]*base[0] + a.rot[5]*base[1] + a.rot[8]*base[2] };
+
+               float gap = (float)(a.stamp > b.stamp ? a.stamp - b.stamp : b.stamp - a.stamp)*1e-9f,
+                     turn = sqrtf(total[0]*total[0] + total[1]*total[1] + total[2]*total[2]),
+                     pureTurn = sqrtf(pure[0]*pure[0] + pure[1]*pure[1] + pure[2]*pure[2]),
+                     rel[9],
+                     relW[3] = { 0.f, 0.f, 0.f };
+
+               // the gyroscope's turn from B to A in B's axes (Q = R_b^T R_a): the pure turn's part along it and across it
+               for (int r = 0; r < 3; r++)
+                  for (int c = 0; c < 3; c++)
+                     rel[3*r + c] = b.rot[3*r]*a.rot[3*c] + b.rot[3*r + 1]*a.rot[3*c + 1] + b.rot[3*r + 2]*a.rot[3*c + 2];
+
+               float relAng = acosf(fmaxf(-1.f, fminf(1.f, 0.5f*(rel[0] + rel[4] + rel[8] - 1.f)))),
+                     relK = relAng > 1e-6f ? relAng/(2.f*sinf(relAng)) : 0.5f;
+
+               relW[0] = relK*(rel[7] - rel[5]);
+               relW[1] = relK*(rel[2] - rel[6]);
+               relW[2] = relK*(rel[3] - rel[1]);
+
+               float relL = sqrtf(relW[0]*relW[0] + relW[1]*relW[1] + relW[2]*relW[2]),
+                     along = relL > 1e-6f ? (pure[0]*relW[0] + pure[1]*relW[1] + pure[2]*relW[2])/relL : 0.f,
+                     across = sqrtf(fmaxf(0.f, pureTurn*pureTurn - along*along));
+
+               /* the vanishing points (user, 2026-09-30: the ceiling's and floor's horizontals and the verticals of
+                  cabinets, doors and windows are the balance's needle): at infinity, the body's sway moves none of
+                  them. Each frame's triad - its measured vertical, a measured room axis made square to it, their
+                  cross - in camera axes; the pair's turn M = T_a T_b^T, the axis label and signs of B taken as the
+                  gyroscope's nearest (mod 90) */
+               const TVanishResult *va = inspectFrameVr ? &inspectFrameVr[a.index] : NULL,
+                                   *vb = inspectFrameVr ? &inspectFrameVr[b.index] : NULL;
+               float                vpGyro = NAN,
+                                    vpPure = NAN,
+                                    vpTwo = NAN;
+
+               if (va && vb && (va->flags & vfVertical) && (vb->flags & vfVertical) && (va->flags & (vfAxisA | vfAxisB))
+                   && (vb->flags & (vfAxisA | vfAxisB)))
+               {
+                  float Ta[9],
+                        Mg[9],
+                        Mp[9],
+                        Mt[9];
+
+                  inspectVanishTriad(*va, a.rot, NULL, Ta);
+                  for (int r = 0; r < 3; r++)
+                     for (int c = 0; c < 3; c++)
+                        Mg[3*r + c] = a.rot[3*r]*b.rot[3*c] + a.rot[3*r + 1]*b.rot[3*c + 1] + a.rot[3*r + 2]*b.rot[3*c + 2];
+                  inspectMatFromTurn(Mg, pure, Mp);
+                  inspectMatFromTurn(Mg, total, Mt);
+
+                  float best = 1e9f,
+                        Mv[9];
+
+                  for (int h = 0; h < 4; h++) // B's horizontal: +-A or +-B, whichever the gyroscope's turn says
+                  {
+                     float Tb[9],
+                           M[9];
+
+                     if (!inspectVanishTriad(*vb, b.rot, &h, Tb))
+                        continue;
+                     for (int r = 0; r < 3; r++)
+                        for (int c = 0; c < 3; c++)
+                           M[3*r + c] = Ta[3*r]*Tb[3*c] + Ta[3*r + 1]*Tb[3*c + 1] + Ta[3*r + 2]*Tb[3*c + 2];
+
+                     float d = inspectRowAngleDeg(M, Mg);
+
+                     if (d < best)
+                     {
+                        best = d;
+                        memcpy(Mv, M, sizeof(Mv));
+                     }
+                  }
+                  if (best < 45.f)
+                  {
+                     vpGyro = best;
+                     vpPure = inspectRowAngleDeg(Mv, Mp);
+                     vpTwo = inspectRowAngleDeg(Mv, Mt);
+                  }
+               }
+               printf("    pair %d-%d vanishing turn off: the gyroscope %.2f, the points' pure turn %.2f, the two-view model %.2f"
+                      " degrees\n", a.index, b.index, vpGyro, vpPure, vpTwo);
+               printf("    pair %d-%d gyro turn %.2f degrees: the pictures' pure turn off it %.2f along, %.2f across; points off"
+                      " the gyroscope alone %.3f, off the gyroscope on the body's circle %.3f\n", a.index, b.index,
+                      relAng*57.2957795f, along, across, gyroMed[0], gyroMed[1]);
+
+               printf("    pair %d-%d (bands %u %u): %d matched, %d fit; median off a pure turn %.3f, off the two-view model"
+                      " %.3f degrees; baseline (world) %.2f %.2f %.2f; %.1f s apart, the pictures turn %.2f degrees off"
+                      " the gyroscope (a pure turn: %.2f)\n", a.index, b.index, (unsigned)inspectBand[a.index], (unsigned)inspectBand[b.index],
+                      matched, count, rotMed, epiMed, bw.x, bw.y, bw.z, gap, turn, pureTurn);
+            }
+            if (met)
+            {
+               rotMedSum += rotMed;
+               epiMedSum += epiMed;
+               medPairs++;
+            }
+            if (!met || count < cPairMinInliers)
+            {
+               if (round == 0 && inspectPairDebug)
+                  printf("    pair %d-%d (bands %u %u): %d matched, %d inliers\n", a.index, b.index,
+                         (unsigned)inspectBand[a.index], (unsigned)inspectBand[b.index], matched, count);
+               continue;
+            }
+            misSum += mis;
+            inlierSum += count;
+
+            // the turn in B's axes carried to the world: R_b w
+            float  wr[3] = { total[0]*0.01745329f, total[1]*0.01745329f, total[2]*0.01745329f },
+                  *q = &pw[((size_t)i*inspectPanoCount + j)*4u];
+
+            q[0] = b.rot[0]*wr[0] + b.rot[3]*wr[1] + b.rot[6]*wr[2];
+            q[1] = b.rot[1]*wr[0] + b.rot[4]*wr[1] + b.rot[7]*wr[2];
+            q[2] = b.rot[2]*wr[0] + b.rot[5]*wr[1] + b.rot[8]*wr[2];
+            q[3] = (float)count/1000.f;
+            sumTurn += sqrtf(wr[0]*wr[0] + wr[1]*wr[1] + wr[2]*wr[2])*57.2957795f;
+            pairs++;
+         }
+
+      // least squares, reweighed: Huber on each pair's misfit (degrees) against the current solution
+      TAlloc<float> sol((size_t)n);
+
+      memset(sol(), 0, sizeof(float)*(size_t)n);
+      for (int it = 0; it < cPairIters; it++)
+      {
+         float diag = 0.f;
+
+         memset(H(), 0, sizeof(float)*(size_t)n*n);
+         memset(g(), 0, sizeof(float)*(size_t)n);
+         for (int i = 0; i < inspectPanoCount; i++)
+            for (int j = i + 1; j < inspectPanoCount; j++)
+            {
+               const float *q = &pw[((size_t)i*inspectPanoCount + j)*4u];
+
+               if (q[3] <= 0.f)
+                  continue;
+
+               float mis = 0.f;
+
+               for (int k = 0; k < 3; k++)
+               {
+                  float d = sol[3*j + k] - sol[3*i + k] - q[k];
+
+                  mis += d*d;
+               }
+               mis = sqrtf(mis)*57.2957795f;
+
+               float wt = q[3]*(mis <= cPairHuberDeg ? 1.f : cPairHuberDeg/mis);
+
+               for (int k = 0; k < 3; k++)
+               {
+                  H[(size_t)(3*i + k)*n + 3*i + k] += wt;
+                  H[(size_t)(3*j + k)*n + 3*j + k] += wt;
+                  H[(size_t)(3*i + k)*n + 3*j + k] -= wt;
+                  H[(size_t)(3*j + k)*n + 3*i + k] -= wt;
+                  g[3*j + k] += wt*q[k];
+                  g[3*i + k] -= wt*q[k];
+               }
+            }
+         for (int k = 0; k < n; k++)
+            diag += H[(size_t)k*n + k];
+         diag = n ? diag/(float)n : 1.f;
+         for (int k = 0; k < n; k++)
+            H[(size_t)k*n + k] += cPairGyroPull*diag + 1e-9f;
+         if (!inspectPanoSolve(H(), g(), n))
+            break;
+         memcpy(sol(), g(), sizeof(float)*(size_t)n);
+      }
+
+      // the misfit left, then the turns applied (left, in the world, as the Gauss-Newton does)
+      float left = 0.f,
+            moved = 0.f,
+            worst = 0.f;
+      int   fits = 0;
+
+      for (int i = 0; i < inspectPanoCount; i++)
+         for (int j = i + 1; j < inspectPanoCount; j++)
+         {
+            const float *q = &pw[((size_t)i*inspectPanoCount + j)*4u];
+
+            if (q[3] <= 0.f)
+               continue;
+
+            float mis = 0.f;
+
+            for (int k = 0; k < 3; k++)
+            {
+               float d = sol[3*j + k] - sol[3*i + k] - q[k];
+
+               mis += d*d;
+            }
+            left += sqrtf(mis)*57.2957795f;
+            fits++;
+         }
+      for (int i = 0; i < inspectPanoCount; i++)
+      {
+         TPanoFrame &a = inspectPano[i];
+         float       e[9],
+                     old[9],
+                     t = sqrtf(sol[3*i]*sol[3*i] + sol[3*i + 1]*sol[3*i + 1] + sol[3*i + 2]*sol[3*i + 2])*57.2957795f;
+
+         inspectPanoExp(&sol[3*i], e);
+         memcpy(old, a.rot, sizeof(old));
+         for (int c = 0; c < 3; c++)
+         {
+            a.rot[3*c] = e[0]*old[3*c] + e[1]*old[3*c + 1] + e[2]*old[3*c + 2];
+            a.rot[3*c + 1] = e[3]*old[3*c] + e[4]*old[3*c + 1] + e[5]*old[3*c + 2];
+            a.rot[3*c + 2] = e[6]*old[3*c] + e[7]*old[3*c + 1] + e[8]*old[3*c + 2];
+         }
+         moved += t;
+         worst = fmaxf(worst, t);
+      }
+      printf("  panorama room %lu: pairs round %d: %d pairs by their points (%d inliers each, their own misfit %.3f"
+             " degrees), turn asked %.2f degrees on average, misfit left %.3f; frames turned %.2f on average, worst %.2f"
+             " degrees; %d pairs tried, %d points matched each\n", (unsigned long)room, round + 1, pairs,
+             pairs ? inlierSum/pairs : 0, pairs ? misSum/(float)pairs : 0.f, pairs ? sumTurn/(float)pairs : 0.f,
+             fits ? left/(float)fits : 0.f, inspectPanoCount ? moved/(float)inspectPanoCount : 0.f, worst, tried,
+             tried ? matchSum/tried : 0);
+      printf("  panorama room %lu: pairs round %d: median misfit of the points, a pure turn %.3f degrees, the two-view"
+             " model (turn + baseline) %.3f degrees (%d pairs)\n", (unsigned long)room, round + 1,
+             medPairs ? rotMedSum/(float)medPairs : 0.f, medPairs ? epiMedSum/(float)medPairs : 0.f, medPairs);
+   }
+}
+
+/*--------------------------------------------------------------------------------
+   What every frame shows at the same pixel is the camera's, not the room's (vignetting, the lens's
+   shading, the exposure's own falloff): at a coarse level it outweighs the scene and pulls the
+   neighbors toward no turn at all. Each level's mean over all frames (same size) is that fixed
+   pattern; it is taken out, the level renormalized and its edge threshold measured again.
+  --------------------------------------------------------------------------------*/
+static void inspectPanoFixedPattern(DWORD room)
+{
+   if (!inspectPanoFixedOn)
+      return;
+   for (int l = 0; l < inspectPanoLevels; l++)
+   {
+      int  w = inspectPano[0].w[l],
+           h = inspectPano[0].h[l],
+           used = 0;
+      bool same = true;
+
+      for (int i = 1; i < inspectPanoCount; i++)
+         same = same && inspectPano[i].w[l] == w && inspectPano[i].h[l] == h;
+      if (!same)
+         continue;
+
+      TAlloc<float> mean((size_t)w*h);
+      float         sq = 0.f;
+
+      memset(mean(), 0, sizeof(float)*(size_t)w*h);
+      for (int i = 0; i < inspectPanoCount; i++)
+      {
+         const float *hp = inspectPano[i].hp[l]();
+
+         for (size_t k = 0; k < (size_t)w*h; k++)
+            mean[k] += hp[k];
+         used++;
+      }
+      for (size_t k = 0; k < (size_t)w*h; k++)
+      {
+         mean[k] /= (float)used;
+         sq += mean[k]*mean[k];
+      }
+      for (int i = 0; i < inspectPanoCount; i++)
+      {
+         TPanoFrame &p = inspectPano[i];
+         float      *hp = p.hp[l]();
+         float       s = 0.f,
+                     gsum = 0.f;
+
+         for (size_t k = 0; k < (size_t)w*h; k++)
+         {
+            hp[k] -= mean[k];
+            s += hp[k]*hp[k];
+         }
+
+         float sd = sqrtf(fmaxf(s/(float)(w*h), 1e-6f));
+
+         for (size_t k = 0; k < (size_t)w*h; k++)
+            hp[k] /= sd;
+         for (int y = 1; y + 1 < h; y++)
+            for (int x = 1; x + 1 < w; x++)
+               gsum += fabsf(hp[(size_t)y*w + x + 1] - hp[(size_t)y*w + x - 1]) + fabsf(hp[(size_t)(y + 1)*w + x] - hp[(size_t)(y - 1)*w + x]);
+         p.edge[l] = gsum/(float)((w - 2)*(h - 2));
+      }
+      printf("  panorama room %lu: level 1/%d, the camera's fixed pattern (mean of %d frames) RMS %.3f of a frame's, taken out\n",
+             (unsigned long)room, inspectPanoShrink << l, used, sqrtf(sq/(float)(w*h)));
+   }
 }
 
 //--------------------------------------------------------------------------------
@@ -3929,14 +8050,36 @@ static bool inspectPanoRegister(LPCSTR sessionDir, DWORD room, const DWORD *fram
    for (int i = 0; i < inspectPanoCount; i++)
       for (int l = 0; l < inspectPanoLevels; l++)
          inspectPano[i].hp[l] = NULL;
+   for (int i = 0; i < inspectPanoCount; i++)
+      for (int l = 0; l < 3; l++)
+         inspectPano[i].gray[l] = NULL;
    inspectPanoCount = 0;
    memset(inspectPanoHas, 0, sizeof(inspectPanoHas));
    if (!reader.Open(sessionDir))
       return false;
+   inspectPoseCount = 0;
    while (reader.Next(v) && inspectPanoCount < inspectPanoMax)
    {
       TImageRecord img;
+      TPoseRecord  pose;
 
+      if (v.type == rtPose && inspectPoseCount < inspectPoseMax && pose.Decode(v.payload, v.length))
+      {
+         const float *pm = pose.cameraToWorld.m;
+         float       *pr = inspectPoseRot[inspectPoseCount];
+
+         pr[0] = pm[0];
+         pr[1] = pm[1];
+         pr[2] = pm[2];
+         pr[3] = pm[4];
+         pr[4] = pm[5];
+         pr[5] = pm[6];
+         pr[6] = pm[8];
+         pr[7] = pm[9];
+         pr[8] = pm[10];
+         inspectPoseNs[inspectPoseCount++] = v.stampNs;
+         continue;
+      }
       if (v.type != rtImage || !img.Decode(v.payload, v.length))
          continue;
 
@@ -3957,6 +8100,7 @@ static bool inspectPanoRegister(LPCSTR sessionDir, DWORD room, const DWORD *fram
       float        r[9] = { m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10] };
 
       p.index = f;
+      p.stamp = v.stampNs;
       p.fx = img.intr.fx*inspectFocalScale;
       p.fy = img.intr.fy*inspectFocalScale;
       p.cx = img.intr.cx;
@@ -3965,11 +8109,30 @@ static bool inspectPanoRegister(LPCSTR sessionDir, DWORD room, const DWORD *fram
       memcpy(p.gyro, r, sizeof(r));
       p.shift[0] = p.shift[1] = p.shift[2] = 0.f;
       inspectPanoPyramid(bgr(), img.width, img.height, p);
+      inspectPointGrays(bgr(), img.width, img.height, p);
    }
    if (inspectPanoCount < 2)
       return false;
-   inspectPanoPlumb(room); // the plumb first: the registration then only restores the neighbors' agreement
-   inspectPanoGN(room, inspectPanoLevels - 1);
+   inspectPanoFixedPattern(room);
+   if (inspectDtScan)
+      inspectPanoDtScan(room);
+   if (inspectPoseDtSec != 0.f) // every frame takes the gyroscope's attitude that far from its picture's stamp
+      for (int i = 0; i < inspectPanoCount; i++)
+         if (inspectPoseAt(inspectPano[i].stamp, inspectPoseDtSec, inspectPano[i].rot))
+            memcpy(inspectPano[i].gyro, inspectPano[i].rot, sizeof(inspectPano[i].rot));
+   if (inspectVpSolveOn)
+      inspectPanoVanishSolve(room);
+   else
+      inspectPanoPlumb(room); // the plumb first: the registration then only restores the neighbors' agreement
+   if (inspectPairsOn) // the wide basin first; the Gauss-Newton then only from 1/16, within its pixel
+   {
+      inspectPanoPairs(room);
+      inspectPanoGN(room, 1);
+   }
+   else
+      inspectPanoGN(room, inspectPanoTop >= 0 && inspectPanoTop < inspectPanoLevels ? inspectPanoTop : inspectPanoLevels - 1);
+   if (inspectPairA >= 0)
+      inspectPairScan(room);
 
    float worst = 0.f,
          mean = 0.f;
@@ -4000,7 +8163,7 @@ static bool inspectPanoRegister(LPCSTR sessionDir, DWORD room, const DWORD *fram
    FILE *csv = inspectFrameVr ? fopen(path, "wb") : NULL;
 
    if (csv)
-      fprintf(csv, "frame,band,pitch,tiltGyroDeg,tiltRegisteredDeg,heading,upWorldX,upWorldZ,camVx,camVy,camVz,camGx,camGy,camGz\r\n");
+      fprintf(csv, "frame,band,pitch,tiltGyroDeg,tiltRegisteredDeg,heading,upWorldX,upWorldZ,camVx,camVy,camVz,camGx,camGy,camGz,gyroGx,gyroGy,gyroGz\r\n");
    for (int i = 0; csv && i < inspectPanoCount; i++)
    {
       const TPanoFrame    &p = inspectPano[i];
@@ -4039,8 +8202,9 @@ static bool inspectPanoRegister(LPCSTR sessionDir, DWORD room, const DWORD *fram
 
       TVec3 fwd = { -p.rot[6], -p.rot[7], -p.rot[8] };
 
-      fprintf(csv, "%d,%u,%.2f,%.3f,%.3f,%.2f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f\r\n", p.index, (unsigned)inspectBand[p.index],
-              asinf(-p.rot[7])*57.2957795f, t[0], t[1], geomHeadingDeg(fwd), w.x, w.z, v.x, v.y, v.z, p.rot[1], p.rot[4], p.rot[7]);
+      fprintf(csv, "%d,%u,%.2f,%.3f,%.3f,%.2f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f\r\n", p.index,
+              (unsigned)inspectBand[p.index], asinf(-p.rot[7])*57.2957795f, t[0], t[1], geomHeadingDeg(fwd), w.x, w.z, v.x, v.y,
+              v.z, p.rot[1], p.rot[4], p.rot[7], p.gyro[1], p.gyro[4], p.gyro[7]);
       sumG += t[0];
       sumR += t[1];
       maxR = fmaxf(maxR, t[1]);
@@ -5024,6 +9188,7 @@ static void inspectFaceSplat(const TImageRecord &img, LPCBYTE bgr, const float *
   --------------------------------------------------------------------------------*/
 static const float cCreaseMarginM = 0.25f,  // measure canvases reach this far around the wall
                    cCreaseBandM = 0.5f,     // the crease is sought this far below the assumed ceiling (and the margin above)
+                   cCreaseMaxDropM = 0.2f,  // a line found farther below the assumed top is no crease: the wall stays
                    cCreaseEndM = 0.35f,     // the wall's ends stay out of the crease (the other wall starts there)
                    cCreaseSlope = 0.12f,    // near-horizontal: at most this slope
                    cCreaseTolPx = 2.5f,     // RANSAC inlier distance
@@ -5304,7 +9469,36 @@ static bool inspectCreaseWalls(LPCSTR sessionDir, DWORD room, TFaceCanvas *fc, i
          return false;
       }
 
-      // the crease's points onto the ceiling's plane: the wall's true line in the plan (least squares, principal axis)
+      /* the crease's points onto the ceiling's plane: the wall's true line in the plan (least squares, principal axis).
+         The rays leave from where the cameras that saw this wall stood - the mean center of the frames facing it (the
+         body's sphere puts them ~0.36 m toward the wall: from the pivot, 101732's walls came out 0.9 m too far) */
+      TVec3 nw = { m.across.z, 0.f, -m.across.x },
+            eye = { 0.f, 0.f, 0.f };
+      float eyeN = 0.f;
+
+      if (nw.x*m.origin.x + nw.z*m.origin.z < 0.f)
+      {
+         nw.x = -nw.x;
+         nw.z = -nw.z;
+      }
+      for (int f = 0; f < inspectPanoCount; f++)
+      {
+         TVec3 fh = inspectHorizontalForward(inspectPano[f].rot);
+
+         if (fh.x*nw.x + fh.z*nw.z < 0.7071f)
+            continue;
+         eye.x += inspectPano[f].shift[0];
+         eye.y += inspectPano[f].shift[1];
+         eye.z += inspectPano[f].shift[2];
+         eyeN += 1.f;
+      }
+      if (eyeN > 0.f)
+      {
+         eye.x /= eyeN;
+         eye.y /= eyeN;
+         eye.z /= eyeN;
+      }
+
       float sx = 0.f,
             sz = 0.f,
             sxx = 0.f,
@@ -5320,11 +9514,12 @@ static bool inspectCreaseWalls(LPCSTR sessionDir, DWORD room, TFaceCanvas *fc, i
          TVec3 d = { m.origin.x + ac*m.across.x + dn*m.down.x, m.origin.y + ac*m.across.y + dn*m.down.y,
                      m.origin.z + ac*m.across.z + dn*m.down.z };
 
-         if (d.y < 1e-3f)
+         if (d.y - eye.y < 1e-3f)
             continue;
 
-         float x = d.x*hc/d.y,
-               z = d.z*hc/d.y;
+         float s = (hc - eye.y)/(d.y - eye.y),
+               x = eye.x + (d.x - eye.x)*s,
+               z = eye.z + (d.z - eye.z)*s;
 
          sx += x;
          sz += z;
@@ -5350,6 +9545,22 @@ static bool inspectCreaseWalls(LPCSTR sessionDir, DWORD room, TFaceCanvas *fc, i
              (unsigned long)room, m.name, in, a, b, atanf(b)*57.2957795f,
              fabsf(a + b*0.5f*(float)(c0 + c1) - (float)mg)*1000.f/cFacePxPerM,
              a + b*0.5f*(float)(c0 + c1) < (float)mg ? "above" : "below");
+
+      /* a "crease" far below the wall's top is something under the ceiling (101732: the window wall's crease had
+         fallen off the canvas, the window's top was taken for it and the wall pushed 0.86 m): the wall stays put */
+      float drop = (a + b*0.5f*(float)(c0 + c1) - (float)mg)/cFacePxPerM;
+
+      if (drop > cCreaseMaxDropM)
+      {
+         float half = 0.5f*(float)fc[i].cols/cFacePxPerM;
+
+         printf("  faces room %lu: %s: %.0f mm below the top is no ceiling crease: the wall kept\n", (unsigned long)room,
+                m.name, drop*1000.f);
+         lineP[i][0] = fc[i].origin.x + half*fc[i].across.x;
+         lineP[i][1] = fc[i].origin.z + half*fc[i].across.z;
+         lineT[i] = atan2f(fc[i].across.z, fc[i].across.x);
+         lineW[i] = 0.f;
+      }
    }
 
    /* the room's square (user's plan: a rectangle): one heading for all walls, each wall at it or at right angles,
@@ -5365,6 +9576,38 @@ static bool inspectCreaseWalls(LPCSTR sessionDir, DWORD room, TFaceCanvas *fc, i
       c4 += lineW[i]*cosf(4.f*lineT[i]);
    }
    th0 = 0.25f*atan2f(s4, c4);
+
+   /* the lines hold the turns (--vp-solve): the square's heading is theirs - hundreds of frames' horizontals - not
+      the four creases' (101732: the creases turned the walls 4 degrees off the frames, the cabinet parallel to N came
+      out a trapezoid). A heading phi from north lies at phi - 90 in this plane's angle: the same mod 90 */
+   if (inspectVpSolveOn && inspectFrameVr)
+   {
+      float fs = 0.f,
+            fcs = 0.f;
+
+      for (int k = 0; k < inspectPanoCount; k++)
+      {
+         const TPanoFrame    &p = inspectPano[k];
+         const TVanishResult &vr = inspectFrameVr[p.index];
+
+         for (int d = 1; d <= 2; d++)
+            if (vr.flags & (d == 1 ? vfAxisA : vfAxisB))
+            {
+               TVec3 h = vr.dirCam[d];
+               float phi = atan2f(p.rot[0]*h.x + p.rot[3]*h.y + p.rot[6]*h.z, -(p.rot[2]*h.x + p.rot[5]*h.y + p.rot[8]*h.z)),
+                     w = (float)vr.support[d];
+
+               fs += w*sinf(4.f*phi);
+               fcs += w*cosf(4.f*phi);
+            }
+      }
+      if (fs != 0.f || fcs != 0.f)
+      {
+         printf("  faces room %lu: the square's heading from the lines %.2f (the creases' own %.2f) degrees\n",
+                (unsigned long)room, 0.25f*atan2f(fs, fcs)*57.2957795f, th0*57.2957795f);
+         th0 = 0.25f*atan2f(fs, fcs);
+      }
+   }
    for (int i = 0; i < walls; i++)
    {
       float q = roundf((lineT[i] - th0)/1.5707963f),
@@ -6153,6 +10396,115 @@ static void inspectLeanPlumb(LPCSTR sessionDir, DWORD room, const TFaceCanvas *f
    }
 }
 
+/*--------------------------------------------------------------------------------
+   The plan again from the solved turns (101732: the plan was found on the gyroscope's raw turns;
+   with the lines' turns its wall distances no longer met the frames - the window wall's crease fell
+   off its canvas and the window's top was taken for it). Every frame of the room is read again: a
+   center-spin frame with its solved turn, a corner station's with its own; the vanishing points and
+   their edges measured anew and fed to a fresh layout (no tilt bias: the lines already set the plumb).
+  --------------------------------------------------------------------------------*/
+static bool inspectReplan(LPCSTR sessionDir, DWORD room, const DWORD *frameInfo, int frames, float ceilingM, TLayoutPlan &plan)
+{
+   TSessionReader reader;
+   TRoomLayout    layout;
+   TRecordView    v;
+   TVanishConfig  cfg = TVanishConfig::Default();
+   TAlloc<float>  rays((size_t)cfg.maxEdges*3u);
+   TAlloc<BYTE>   labels((size_t)cfg.maxEdges);
+   TVanishEdges   edges = { rays(), labels(), (DWORD)cfg.maxEdges, 0u };
+   const TVec3    noBias = { 0.f, 0.f, 0.f };
+   int            index = 0,
+                  fed = 0;
+
+   if (!reader.Open(sessionDir))
+      return false;
+   while (reader.Next(v))
+   {
+      TImageRecord img;
+
+      if (v.type != rtImage || !img.Decode(v.payload, v.length))
+         continue;
+
+      int f = index++;
+
+      if (f >= frames || f >= inspectMaxFrames || frameInfo[f]/inspectStations != room || inspectIsSuperseded(inspectStamp[f]))
+         continue;
+
+      DWORD station = frameInfo[f]%inspectStations;
+      TMat4 pose = img.cameraToWorld;
+
+      if (station == 0u)
+      {
+         if (!inspectPanoHas[f])
+            continue;
+
+         const float *r = inspectPanoRot[f];
+
+         pose.m[0] = r[0];
+         pose.m[1] = r[1];
+         pose.m[2] = r[2];
+         pose.m[4] = r[3];
+         pose.m[5] = r[4];
+         pose.m[6] = r[5];
+         pose.m[8] = r[6];
+         pose.m[9] = r[7];
+         pose.m[10] = r[8];
+      }
+
+      TAlloc<BYTE>  luma((size_t)img.width*img.height);
+      TVanishResult vr = {};
+
+      vr.roomAxisDeg = NAN;
+      edges.count = 0u;
+      if (!inspectDecode(img.pixels, img.pixelBytes, img.width, img.height, false, luma)
+          || !vanishDetect(luma(), (int)img.width, (int)img.height, (int)img.width, img.intr, pose, cfg, vr, &edges))
+         continue;
+      layout.AddFrame(pose, vr, edges, noBias, (int)station);
+      fed++;
+   }
+
+   bool ok = layout.Solve(layout.AnchorDeg(), ceilingM, plan);
+
+   printf("  replan room %lu: %d frames with the solved turns: %s, %u corners, axis %.2f, camera %.2f m, ceiling %.2f m\n",
+          (unsigned long)room, fed, ok && plan.valid ? "a plan" : "no plan", (unsigned)plan.vertexCount, plan.axisDeg,
+          plan.cameraHeightM, plan.ceilingM);
+   for (int i = 0; ok && i < (int)plan.vertexCount; i++)
+      printf("  replan room %lu: corner %d at u %.3f w %.3f\n", (unsigned long)room, i, plan.verts[i].u, plan.verts[i].w);
+   return ok && plan.valid;
+}
+
+//--------------------------------------------------------------------------------
+// The room's box from the faces (outward normals) and the plan's floor and ceiling (see inspectBoxHit)
+static void inspectBuildBox(const TFaceCanvas *fc, int walls, float cam, float ceil)
+{
+   inspectBoxCount = 0;
+   for (int i = 0; i < walls && inspectBoxCount < inspectBoxMax - 2; i++)
+   {
+      float *bn = inspectBoxN[inspectBoxCount],
+            bl;
+
+      bn[0] = fc[i].across.z;
+      bn[1] = 0.f;
+      bn[2] = -fc[i].across.x;
+      bl = bn[0]*fc[i].origin.x + bn[2]*fc[i].origin.z;
+      if (bl < 0.f)
+      {
+         bn[0] = -bn[0];
+         bn[2] = -bn[2];
+         bl = -bl;
+      }
+      inspectBoxD[inspectBoxCount++] = bl;
+   }
+   inspectBoxN[inspectBoxCount][0] = 0.f; // the floor
+   inspectBoxN[inspectBoxCount][1] = -1.f;
+   inspectBoxN[inspectBoxCount][2] = 0.f;
+   inspectBoxD[inspectBoxCount++] = cam;
+   inspectBoxN[inspectBoxCount][0] = 0.f; // the ceiling
+   inspectBoxN[inspectBoxCount][1] = 1.f;
+   inspectBoxN[inspectBoxCount][2] = 0.f;
+   inspectBoxD[inspectBoxCount++] = ceil - cam;
+}
+
 //--------------------------------------------------------------------------------
 static void inspectFaces(LPCSTR sessionDir, LPCSTR outDir, DWORD room, const TLayoutPlan &plan, const DWORD *frameInfo, int frames)
 {
@@ -6163,6 +10515,30 @@ static void inspectFaces(LPCSTR sessionDir, LPCSTR outDir, DWORD room, const TLa
    }
    inspectLever.x = inspectLever.y = inspectLever.z = 0.f; // each room's spin its own lever, pure rotation until the box
    inspectBoxCount = 0;
+
+   /* the lines aligned every frame to one room axis (their mean): the plan found its walls on its own axis, anchored
+      elsewhere in the capture while the gyroscope drifted (101732: the walls rebuilt 6.6 degrees off, the room 3.9 m
+      long for 3.3). The whole set is turned, mod 90, onto the plan's axis */
+   if (inspectVpSolveOn && !isnan(inspectVpAlpha))
+   {
+      float delta = plan.axisDeg*0.01745329f - inspectVpAlpha;
+
+      delta -= 1.5707963f*floorf(delta/1.5707963f + 0.5f);
+
+      float w[3] = { 0.f, -delta, 0.f }; // a turn about the world's up raises the heading by -w_y
+
+      for (int i = 0; i < inspectPanoCount; i++)
+      {
+         float rot[9];
+
+         inspectTurnWorld(inspectPano[i].rot, w, rot);
+         memcpy(inspectPano[i].rot, rot, sizeof(rot));
+         if (inspectPanoHas[inspectPano[i].index])
+            memcpy(inspectPanoRot[inspectPano[i].index], rot, sizeof(rot));
+      }
+      printf("  faces room %lu: the lines' room axis turned %.2f degrees onto the plan's (%.2f)\n", (unsigned long)room,
+             delta*57.2957795f, plan.axisDeg);
+   }
 
    float       a = plan.axisDeg*0.01745329f,
                cam = plan.cameraHeightM > 0.3f ? plan.cameraHeightM : 1.5f,
@@ -6251,33 +10627,8 @@ static void inspectFaces(LPCSTR sessionDir, LPCSTR outDir, DWORD room, const TLa
          break;
       }
 
-   // the room's box from the faces (outward normals), then the lever arm with the rotations (see inspectBoxHit)
-   inspectBoxCount = 0;
-   for (int i = 0; i < walls && inspectBoxCount < inspectBoxMax - 2; i++)
-   {
-      float *bn = inspectBoxN[inspectBoxCount],
-            bl;
-
-      bn[0] = fc[i].across.z;
-      bn[1] = 0.f;
-      bn[2] = -fc[i].across.x;
-      bl = bn[0]*fc[i].origin.x + bn[2]*fc[i].origin.z;
-      if (bl < 0.f)
-      {
-         bn[0] = -bn[0];
-         bn[2] = -bn[2];
-         bl = -bl;
-      }
-      inspectBoxD[inspectBoxCount++] = bl;
-   }
-   inspectBoxN[inspectBoxCount][0] = 0.f; // the floor
-   inspectBoxN[inspectBoxCount][1] = -1.f;
-   inspectBoxN[inspectBoxCount][2] = 0.f;
-   inspectBoxD[inspectBoxCount++] = cam;
-   inspectBoxN[inspectBoxCount][0] = 0.f; // the ceiling
-   inspectBoxN[inspectBoxCount][1] = 1.f;
-   inspectBoxN[inspectBoxCount][2] = 0.f;
-   inspectBoxD[inspectBoxCount++] = ceil - cam;
+   // the room's box from the faces, then the lever arm with the rotations (see inspectBoxHit)
+   inspectBuildBox(fc, walls, cam, ceil);
    if (inspectLeverOn && inspectPanoCount > 1 && inspectLeverScan)
    {
       // the registration's residual with the lever held at each trial, the rotations registered anew (level 1/16)
@@ -6309,16 +10660,36 @@ static void inspectFaces(LPCSTR sessionDir, LPCSTR outDir, DWORD room, const TLa
          memcpy(inspectPano[i].rot, &keep[(size_t)i*9u], sizeof(inspectPano[i].rot));
       inspectLever.x = inspectLever.y = inspectLever.z = 0.f;
    }
-   if (inspectLeverOn && inspectPanoCount > 1)
+   if (inspectVpSolveOn && inspectPanoCount > 1) // the turns held by the lines: the centers from the matched points
+   {
+      inspectPanoCircleSolve(room);
+
+      // the walls again, their crease rays now leaving from the solved centers, and the box they make
+      for (int pass = 0; pass < 2; pass++)
+         if (!inspectCreaseWalls(sessionDir, room, fc, walls, cam, ceil))
+            break;
+      inspectBuildBox(fc, walls, cam, ceil);
+   }
+   else if (inspectLeverOn && inspectPanoCount > 1)
    {
       /* each frame's own center (user, 2026-09-29): the lever came out ~0 (no steady arm) yet the furniture doubles -
          the body sways from shot to shot; three more unknowns per frame, held toward the pivot */
       TAlloc<float> len((size_t)inspectPanoCount);
       float         band[inspectLeanBands][4] = {}; // mean x y z, frames
 
+      memset(inspectBody, 0, sizeof(inspectBody));
+      inspectBodyFit = true; // the body's pairs first, from 1/32: the parallax they make is seen there already
+      inspectPanoGN(room, 2);
+      for (int b = 0; b < inspectBodyBands; b++)
+         printf("  faces room %lu: band %d: the phone %.3f m ahead of the turn's axis, %.3f m above the pivot\n",
+                (unsigned long)room, b, inspectBody[b][0], inspectBody[b][1]);
       inspectShiftFit = true;
       inspectPanoGN(room, 1);
       inspectShiftFit = false;
+      inspectBodyFit = false;
+      for (int b = 0; b < inspectBodyBands; b++)
+         printf("  faces room %lu: band %d, with the sways: the phone %.3f m ahead, %.3f m above\n", (unsigned long)room, b,
+                inspectBody[b][0], inspectBody[b][1]);
       for (int i = 0; i < inspectPanoCount; i++)
       {
          const float *s = inspectPano[i].shift;
@@ -6457,6 +10828,19 @@ static void inspectFaces(LPCSTR sessionDir, LPCSTR outDir, DWORD room, const TLa
    inspectCreaseCheck(sessionDir, outDir, room, fc, walls, ceil);
    if (inspectFaceFramesOn)
       inspectFaceFrames(sessionDir, outDir, room, fc, faces);
+}
+
+//--------------------------------------------------------------------------------
+// The faces on the plan found again from the solved turns when the lines hold them (--vp-solve), else on the plan given
+static void inspectFacesSolved(LPCSTR sessionDir, LPCSTR outDir, DWORD room, const TLayoutPlan &plan, const DWORD *frameInfo,
+                               int frames)
+{
+   static TLayoutPlan replan;
+
+   if (inspectVpSolveOn && inspectReplan(sessionDir, room, frameInfo, frames, plan.ceilingM > 1.f ? plan.ceilingM : 2.8f, replan))
+      inspectFaces(sessionDir, outDir, room, replan, frameInfo, frames);
+   else
+      inspectFaces(sessionDir, outDir, room, plan, frameInfo, frames);
 }
 
 /*--------------------------------------------------------------------------------
@@ -6608,6 +10992,251 @@ static float inspectRectPitch(const TRectMeasure &m, const float *medianElev)
 }
 
 /*--------------------------------------------------------------------------------
+   The gyroscope's correction table (user, 2026-09-30: "images like 79 and 82, once normalized, make a
+   table of the gyroscope's corrections, inherited by the frames without as much anchoring"; "most
+   frames have neighbors beside, above and below"). A frame with its own vertical and a room axis has
+   its true turn from its lines: the vertical onto the world's up, the axis onto the room's (the
+   nearest of refAxisDeg + 90k to the gyroscope's reading); its correction Q = R_lines R_gyro^T, kept as
+   a rotation vector. A frame short of either takes its neighbors' (same station, aims within
+   cInheritAimDeg), weighed by their lines' support, by how close they aim and how close in time.
+  --------------------------------------------------------------------------------*/
+static const float cInheritAimDeg = 40.f,
+                   cInheritAimScaleDeg = 10.f,
+                   cInheritTimeScaleSec = 30.f,
+                   cAxisGateDeg = 12.f;          // a measured horizontal is the room's within this (mod 90)
+
+static float inspectInheritW[inspectMaxFrames][3]; // the correction's rotation vector (world, radians)
+static BYTE  inspectInheritKind[inspectMaxFrames]; // 0 none, 1 its own lines, 2 inherited
+
+/*--------------------------------------------------------------------------------
+   A frame's measured horizontal is the room's only within cAxisGateDeg of the room axis (mod 90):
+   101732's frame 81 looks at the floor, its strongest horizontal was the diagonal tiles' (44 degrees
+   off) and both its views came out square to the tiles, the walls askew
+  --------------------------------------------------------------------------------*/
+static bool inspectAxisOk(const TVanishResult &vr, float refAxisDeg)
+{
+   if (!(vr.flags & (vfAxisA | vfAxisB)) || isnan(vr.roomAxisDeg) || isnan(refAxisDeg))
+      return false;
+
+   float d = vr.roomAxisDeg - refAxisDeg;
+
+   d -= 90.f*floorf(d/90.f + 0.5f);
+   return fabsf(d) <= cAxisGateDeg;
+}
+
+//--------------------------------------------------------------------------------
+// Row-major 3x3 of a pose's rotation (camera to world)
+static void inspectPoseRows(const TMat4 &m, float *R)
+{
+   for (int r = 0; r < 3; r++)
+      for (int c = 0; c < 3; c++)
+         R[3*r + c] = m.m[4*c + r];
+}
+
+//--------------------------------------------------------------------------------
+static void inspectBuildInherit(LPCSTR sessionDir, const TVanishResult *frameVr, const DWORD *frameInfo, int frames,
+                                float refAxisDeg)
+{
+   TSessionReader reader;
+   TRecordView    v;
+   int            index = 0,
+                  own = 0,
+                  inherited = 0;
+   TAlloc<float>  Rg((size_t)inspectMaxFrames*9u);
+   TAlloc<QWORD>  when((size_t)inspectMaxFrames);
+   TAlloc<BYTE>   has((size_t)inspectMaxFrames);
+
+   memset(has(), 0, (size_t)inspectMaxFrames);
+   memset(inspectInheritKind, 0, sizeof(inspectInheritKind));
+   if (isnan(refAxisDeg) || !reader.Open(sessionDir))
+      return;
+   while (reader.Next(v))
+   {
+      TImageRecord img;
+
+      if (v.type != rtImage || !img.Decode(v.payload, v.length))
+         continue;
+
+      int f = index++;
+
+      if (f >= frames || f >= inspectMaxFrames)
+         break;
+      if (inspectIsSuperseded(inspectStamp[f]))
+         continue;
+      inspectPoseRows(img.cameraToWorld, &Rg[(size_t)f*9u]);
+      when[f] = v.stampNs;
+      has[f] = 1;
+   }
+
+   // the anchored frames: their own lines give the true turn
+   for (int f = 0; f < frames && f < inspectMaxFrames; f++)
+   {
+      const TVanishResult &vr = frameVr[f];
+      int                  d = (vr.flags & vfAxisA) ? 1 : 2;
+
+      if (!has[f] || !(vr.flags & vfVertical) || !inspectAxisOk(vr, refAxisDeg)) // a diagonal floor's axis anchors nothing
+         continue;
+
+      const float *R = &Rg[(size_t)f*9u];
+      TVec3        up = vr.dirCam[0],
+                   ax = vr.dirCam[d];
+      float        l = sqrtf(up.x*up.x + up.y*up.y + up.z*up.z);
+
+      up.x /= l;
+      up.y /= l;
+      up.z /= l;
+      if (R[3]*up.x + R[4]*up.y + R[5]*up.z < 0.f) // toward the world's up
+      {
+         up.x = -up.x;
+         up.y = -up.y;
+         up.z = -up.z;
+      }
+
+      float dd = ax.x*up.x + ax.y*up.y + ax.z*up.z;
+
+      ax.x -= dd*up.x;
+      ax.y -= dd*up.y;
+      ax.z -= dd*up.z;
+      l = sqrtf(ax.x*ax.x + ax.y*ax.y + ax.z*ax.z);
+      if (l < 1e-6f)
+         continue;
+      ax.x /= l;
+      ax.y /= l;
+      ax.z /= l;
+
+      // the axis as the gyroscope sees it, onto the nearest room axis
+      float wx = R[0]*ax.x + R[1]*ax.y + R[2]*ax.z,
+            wz = R[6]*ax.x + R[7]*ax.y + R[8]*ax.z,
+            phi = atan2f(wx, -wz)*57.2957795f,
+            k = roundf((phi - refAxisDeg)/90.f),
+            h = (refAxisDeg + 90.f*k)*0.01745329f;
+      TVec3 aw = { sinf(h), 0.f, -cosf(h) },
+            cw = { -aw.z, 0.f, aw.x }, // aw x Y, Y = (0, 1, 0)
+            cc = { ax.y*up.z - ax.z*up.y, ax.z*up.x - ax.x*up.z, ax.x*up.y - ax.y*up.x };
+
+      // R_true = [aw Y cw] [ax up cc]^T; Q = R_true R_gyro^T
+      float Mw[9] = { aw.x, 0.f, cw.x, aw.y, 1.f, cw.y, aw.z, 0.f, cw.z },
+            Mc[9] = { ax.x, up.x, cc.x, ax.y, up.y, cc.y, ax.z, up.z, cc.z },
+            Rt[9],
+            Q[9];
+
+      for (int r = 0; r < 3; r++)
+         for (int c = 0; c < 3; c++)
+            Rt[3*r + c] = Mw[3*r]*Mc[3*c] + Mw[3*r + 1]*Mc[3*c + 1] + Mw[3*r + 2]*Mc[3*c + 2];
+      for (int r = 0; r < 3; r++)
+         for (int c = 0; c < 3; c++)
+            Q[3*r + c] = Rt[3*r]*R[3*c] + Rt[3*r + 1]*R[3*c + 1] + Rt[3*r + 2]*R[3*c + 2];
+
+      float ang = acosf(fmaxf(-1.f, fminf(1.f, 0.5f*(Q[0] + Q[4] + Q[8] - 1.f)))),
+            kk = ang > 1e-6f ? ang/(2.f*sinf(ang)) : 0.5f;
+
+      inspectInheritW[f][0] = kk*(Q[7] - Q[5]);
+      inspectInheritW[f][1] = kk*(Q[2] - Q[6]);
+      inspectInheritW[f][2] = kk*(Q[3] - Q[1]);
+      inspectInheritKind[f] = 1;
+      own++;
+   }
+
+   // the others: their neighbors' corrections, nearest aims and times weighing most
+   for (int f = 0; f < frames && f < inspectMaxFrames; f++)
+   {
+      if (!has[f] || inspectInheritKind[f] == 1)
+         continue;
+
+      const float *R = &Rg[(size_t)f*9u];
+      float        sum[3] = { 0.f, 0.f, 0.f },
+                   wsum = 0.f;
+
+      for (int k = 0; k < frames && k < inspectMaxFrames; k++)
+      {
+         if (inspectInheritKind[k] != 1 || frameInfo[k] != frameInfo[f])
+            continue;
+
+         const float *Rk = &Rg[(size_t)k*9u];
+         float        cosAim = R[2]*Rk[2] + R[5]*Rk[5] + R[8]*Rk[8], // the forwards (-z columns) against each other
+                      aim = acosf(fmaxf(-1.f, fminf(1.f, cosAim)))*57.2957795f;
+
+         if (aim > cInheritAimDeg)
+            continue;
+
+         float dt = (float)(when[f] > when[k] ? when[f] - when[k] : when[k] - when[f])*1e-9f,
+               sup = (float)frameVr[k].support[0],
+               wt = sup/(1.f + (aim/cInheritAimScaleDeg)*(aim/cInheritAimScaleDeg))/(1.f + dt/cInheritTimeScaleSec);
+
+         for (int c = 0; c < 3; c++)
+            sum[c] += wt*inspectInheritW[k][c];
+         wsum += wt;
+      }
+      if (wsum <= 0.f)
+         continue;
+      for (int c = 0; c < 3; c++)
+         inspectInheritW[f][c] = sum[c]/wsum;
+      inspectInheritKind[f] = 2;
+      inherited++;
+   }
+   printf("  correction table: %d frames by their own lines, %d inherited from their neighbors\n", own, inherited);
+}
+
+//--------------------------------------------------------------------------------
+// A frame's measure with the table's turn where it has no lines of its own: its vertical and room axis in camera axes
+static void inspectInheritVanish(const TMat4 &pose, int f, float refAxisDeg, TVanishResult &vr)
+{
+   if (f < 0 || f >= inspectMaxFrames || inspectInheritKind[f] != 2 || isnan(refAxisDeg))
+      return;
+
+   float R[9],
+         E[9],
+         Rt[9];
+
+   inspectPoseRows(pose, R);
+   inspectPanoExp(inspectInheritW[f], E);
+   for (int r = 0; r < 3; r++) // R_true = Q R_gyro
+      for (int c = 0; c < 3; c++)
+         Rt[3*r + c] = E[3*r]*R[c] + E[3*r + 1]*R[3 + c] + E[3*r + 2]*R[6 + c];
+
+   // camera axes of the world's up and of the room axis: R_true^T times them
+   float h = refAxisDeg*0.01745329f;
+   TVec3 aw = { sinf(h), 0.f, -cosf(h) },
+         up = { Rt[3], Rt[4], Rt[5] },
+         ax = { Rt[0]*aw.x + Rt[3]*aw.y + Rt[6]*aw.z, Rt[1]*aw.x + Rt[4]*aw.y + Rt[7]*aw.z,
+                Rt[2]*aw.x + Rt[5]*aw.y + Rt[8]*aw.z };
+
+   /* what the frame measures stays; only what it lacks is inherited. A measured room axis (a crease) keeps the
+      inherited vertical square to it: a horizontal line has no height to climb, so the crease comes out level */
+   int own = !inspectAxisOk(vr, refAxisDeg) ? 0 : ((vr.flags & vfAxisA) ? 1 : ((vr.flags & vfAxisB) ? 2 : 0));
+
+   if (!own) // a measured horizontal off the room's (the tiles' diagonal) is not kept
+      vr.flags &= (BYTE)~(vfAxisA | vfAxisB);
+
+   if (!(vr.flags & vfVertical))
+   {
+      if (own)
+      {
+         TVec3 a = vr.dirCam[own];
+         float la = sqrtf(a.x*a.x + a.y*a.y + a.z*a.z),
+               d = (up.x*a.x + up.y*a.y + up.z*a.z)/(la*la);
+
+         up.x -= d*a.x;
+         up.y -= d*a.y;
+         up.z -= d*a.z;
+
+         float lu = sqrtf(up.x*up.x + up.y*up.y + up.z*up.z);
+
+         up.x /= lu;
+         up.y /= lu;
+         up.z /= lu;
+      }
+      vr.dirCam[0] = up;
+      vr.flags |= vfVertical;
+   }
+   if (!own)
+   {
+      vr.dirCam[1] = ax;
+      vr.flags |= vfAxisA;
+   }
+}
+
+/*--------------------------------------------------------------------------------
    --rectify, second pass: the ceiling creases level every frontal view (user, 2026-09-27: "as linhas
    de teto definem uma trajetória linear que precisa participar da normalização"). The first pass
    measured each frame's crease as its own vertical rotated it; now the view turns about its axis
@@ -6645,6 +11274,19 @@ static void inspectRectifyLevel(LPCSTR sessionDir, LPCSTR outDir, const TVanishR
       medianElev[slot] = n ? v[n/2] : NAN;
    }
 
+   if (inspectRectOwn) // the gyroscope's correction table first: the frames without lines inherit it
+      inspectBuildInherit(sessionDir, frameVr, frameInfo, frames, refAxisDeg);
+   if (inspectRectOwn && outDir) // each view's squareness, before and after the lines turned it
+   {
+      char csvPath[sessionPathMax];
+
+      snprintf(csvPath, sizeof(csvPath), "%s/esquadro.csv", outDir);
+      inspectSquareCsv = fopen(csvPath, "wb");
+      if (inspectSquareCsv)
+         fprintf(inspectSquareCsv, "view,leanBefore,slopeBefore,keystoneVBefore,keystoneHBefore,leanAfter,slopeAfter,"
+                                   "keystoneVAfter,keystoneHAfter,meetXBefore,meetYBefore,meetXAfter,meetYAfter\r\n");
+   }
+
    TSessionReader reader;
    TRecordView    v;
    int            index = 0;
@@ -6665,6 +11307,8 @@ static void inspectRectifyLevel(LPCSTR sessionDir, LPCSTR outDir, const TVanishR
 
       if (inspectIsSuperseded(inspectStamp[f]))
          continue; // a replaced photo: no frontal view
+      img.intr.fx *= inspectIntrScale;
+      img.intr.fy *= inspectIntrScale;
 
       const TRectMeasure &m = inspectRect[f];
       bool                center = frameInfo[f]%inspectStations == 0u;
@@ -6702,11 +11346,30 @@ static void inspectRectifyLevel(LPCSTR sessionDir, LPCSTR outDir, const TVanishR
          }
       }
 
-      inspectRectify(img, frameVr[f], refAxisDeg, outDir, f, roll, pitch, &after, true);
+      /* the frame's own lines only (--rectify-own; user, 2026-09-30: the wall's normal from its horizontals, the plumb
+         from its verticals, the homography about the image center): a measured vertical is not levelled again by the
+         crease - 101732's frame 82 sees no ceiling, took its neighbors' pitch and its verticals converged */
+      TVanishResult own = frameVr[f];
+
+      if (inspectRectOwn) // a frame without lines of its own takes the table's turn
+         inspectInheritVanish(img.cameraToWorld, f, refAxisDeg, own);
+      if (inspectRectOwn && (own.flags & vfVertical))
+      {
+         roll = 0.f;
+         pitch = 0.f;
+      }
+      inspectCornerCenter = center;
+      inspectCornerFrame = f;
+      inspectRectify(img, own, refAxisDeg, outDir, f, roll, pitch, &after, true);
       if (m.ok)
          printf("  level frame %03d wall %d %s: slope %+.4f -> %+.4f, elevation %.2f -> %.2f (median %.2f), roll %+.2f"
                 " pitch %+.2f deg\n", f, m.wall, m.floorLine ? "floor" : "ceiling", m.slope,
                 after.ok ? after.slope : NAN, m.elevDeg, after.ok ? after.elevDeg : NAN, target, roll, pitch);
+   }
+   if (inspectSquareCsv)
+   {
+      fclose(inspectSquareCsv);
+      inspectSquareCsv = NULL;
    }
 }
 
@@ -7444,6 +12107,21 @@ int main(int argc, LPSTR *argv)
          vcfg.minGrad = atoi(argv[++i]);
       else if (!strcmp(argv[i], "--edges"))
          edgeImages = true;
+      else if (!strcmp(argv[i], "--intr-scale") && i + 1 < argc)
+         inspectIntrScale = (float)atof(argv[++i]);
+      else if (!strcmp(argv[i], "--roll-only"))
+         inspectRollOnly = true;
+      else if (!strcmp(argv[i], "--diagonal-floor"))
+         inspectDiagonalFloor = true;
+      else if (!strcmp(argv[i], "--merge"))
+         inspectMergeOn = true;
+      else if (!strcmp(argv[i], "--third"))
+         inspectThirdAxis = true;
+      else if (!strcmp(argv[i], "--rectify-own"))
+      {
+         rectify = true;
+         inspectRectOwn = true;
+      }
       else if (!strcmp(argv[i], "--rectify"))
          rectify = true;
       else if (!strcmp(argv[i], "--doors-all"))
@@ -7485,6 +12163,28 @@ int main(int argc, LPSTR *argv)
       }
       else if (!strcmp(argv[i], "--no-plumb"))
          inspectPlumbOn = false;
+      else if (!strcmp(argv[i], "--pair-scan") && i + 1 < argc && sscanf(argv[i + 1], "%d,%d", &inspectPairA, &inspectPairB) == 2)
+         i++;
+      else if (!strcmp(argv[i], "--circle"))
+         inspectCircleFlat = true;
+      else if (!strcmp(argv[i], "--circle-heights"))
+         inspectCircleHeights = true;
+      else if (!strcmp(argv[i], "--vp-solve"))
+         inspectVpSolveOn = true;
+      else if (!strcmp(argv[i], "--pair-debug"))
+         inspectPairDebug = true;
+      else if (!strcmp(argv[i], "--pairs"))
+         inspectPairsOn = true;
+      else if (!strcmp(argv[i], "--dt-scan"))
+         inspectDtScan = true;
+      else if (!strcmp(argv[i], "--pose-dt") && i + 1 < argc)
+         inspectPoseDtSec = (float)atof(argv[++i]);
+      else if (!strcmp(argv[i], "--no-focal"))
+         inspectFocalOn = false;
+      else if (!strcmp(argv[i], "--no-fixed-pattern"))
+         inspectPanoFixedOn = false;
+      else if (!strcmp(argv[i], "--pano-top") && i + 1 < argc)
+         inspectPanoTop = atoi(argv[++i]);
       else if (!strcmp(argv[i], "--no-lever"))
          inspectLeverOn = false;
       else if (!strcmp(argv[i], "--lever-scan"))
@@ -7606,6 +12306,8 @@ int main(int argc, LPSTR *argv)
 
          if (!img.Decode(v.payload, v.length))
             continue;
+         img.intr.fx *= inspectIntrScale;
+         img.intr.fy *= inspectIntrScale;
          if (!images)
             printf("lens: %lux%lu fx %.1f fy %.1f cx %.1f cy %.1f distortion %.4f %.4f %.4f %.4f %.4f\n",
                    (unsigned long)img.width, (unsigned long)img.height, img.intr.fx, img.intr.fy, img.intr.cx,
@@ -7678,7 +12380,7 @@ int main(int argc, LPSTR *argv)
                   if (panorama && registered)
                      inspectPanorama(argv[1], argv[2], statRoom, frameInfo(), images, true);
                   if (faces && solvedRoom)
-                     inspectFaces(argv[1], argv[2], statRoom, plan, frameInfo(), images);
+                     inspectFacesSolved(argv[1], argv[2], statRoom, plan, frameInfo(), images);
                }
                if (floorViews)
                   inspectFloorViews(argv[1], argv[2], statRoom, plan, solvedRoom,
@@ -7812,14 +12514,17 @@ int main(int argc, LPSTR *argv)
          if (panorama && registered)
             inspectPanorama(argv[1], argv[2], statRoom, frameInfo(), images, true);
          if (faces && solvedRoom)
-            inspectFaces(argv[1], argv[2], statRoom, plan, frameInfo(), images);
+            inspectFacesSolved(argv[1], argv[2], statRoom, plan, frameInfo(), images);
       }
       if (floorViews)
          inspectFloorViews(argv[1], argv[2], statRoom, plan, solvedRoom, solvedRoom ? plan.axisDeg : layout.AnchorDeg(),
                            frameVr(), frameInfo(), images, spinRadiusM);
+      inspectCornerPlan = solvedRoom ? &plan : NULL;
       if (rectify)
          inspectRectifyLevel(argv[1], argv[2], frameVr(), frameInfo(), images,
                              axis.HasReference() ? axis.ReferenceDeg() : NAN);
+      if (rectify && inspectMergeOn)
+         inspectMergeWrite(argv[2]);
       inspectAxisPrint("session", allStats);
    }
 #ifdef _WIN32

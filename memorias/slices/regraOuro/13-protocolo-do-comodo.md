@@ -30,3 +30,10 @@ não haver cômodos rotacionados; os pontos de fuga reancoram entre cômodos (ei
 Ordem das faixas (usuário, 2026-09-26): "se começar pelas linhas do teto, você converge mais rapidamente para os
 pontos de fuga, já que nem sempre o piso tem essas linhas visíveis por conta dos móveis". O giro central guia
 primeiro a faixa de cima (vincos do teto), depois desce até o piso: o consenso do eixo nasce cedo e firme.
+
+ZIGUEZAGUE NO GIRO CENTRAL (usuário, 2026-09-30): em vez de um 360 por camada, coluna após coluna em serpentina:
+coluna par teto -> horizonte -> piso, ímpar piso -> horizonte -> teto, 36 colunas (10 graus) no sentido horário a
+partir da primeira foto. A linha do teto serve de baliza em toda coluna, intercalada com a do piso, e dá o horizonte.
+Todo vizinho fica a segundos (o giroscópio deriva em minutos: 162740 mostrou o desacordo crescendo com o intervalo),
+o tronco só gira entre colunas e o punho dentro delas. As células 3 x 36 ficam LIVRES: qualquer pose firme preenche
+ou refina a sua; a serpentina só indica a próxima.
